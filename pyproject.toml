@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robometanorm"
+version = "0.1.0"
+description = "机器人数据集规范化建议工具"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+depth = ["numpy>=1.23", "opencv-python>=4.5"]
+
+[project.scripts]
+robometanorm = "robometanorm.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

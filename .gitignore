@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+
+数据转换标准.pdf
+P1：相机规范化凝练方案.pdf
+RoboMetaNorm 项目开发框架.pdf
+
+collect_data/
