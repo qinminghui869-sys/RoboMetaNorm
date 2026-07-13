@@ -91,6 +91,18 @@ class OpenAICompatibleVlmClassifier:
         self, system_prompt: str, user_prompt: str, image_paths: Sequence[Path]
     ) -> CameraSemantics | None:
         """发送文本和抽帧图；仅对临时网络或服务端错误重试。"""
+        response_payload = self.request_json(system_prompt, user_prompt, image_paths)
+        if response_payload is None:
+            return None
+        try:
+            return parse_vlm_semantics(response_payload)
+        except ValueError as response_error:
+            return self._fail(f"相机 VLM 语义不合法: {response_error}")
+
+    def request_json(
+        self, system_prompt: str, user_prompt: str, image_paths: Sequence[Path]
+    ) -> Mapping[str, object] | None:
+        """发送通用多模态请求并返回未绑定业务 schema 的 JSON 对象。"""
         content: list[dict[str, object]] = [{"type": "text", "text": user_prompt}]
         for image_path in image_paths:
             encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
@@ -115,7 +127,7 @@ class OpenAICompatibleVlmClassifier:
             payload["enable_thinking"] = False
         return self._request_with_retry(payload)
 
-    def _request_with_retry(self, payload: Mapping[str, object]) -> CameraSemantics | None:
+    def _request_with_retry(self, payload: Mapping[str, object]) -> Mapping[str, object] | None:
         """执行请求并对 429、5xx 与网络异常进行指数退避。"""
         url = self.endpoint if self.endpoint.endswith("/chat/completions") else f"{self.endpoint}/chat/completions"
         headers = {"Content-Type": "application/json"}
@@ -133,7 +145,7 @@ class OpenAICompatibleVlmClassifier:
                     response_payload = json.loads(response.read().decode("utf-8"))
                 content_value = response_payload["choices"][0]["message"]["content"]
                 self.last_error = None
-                return parse_vlm_semantics(_load_json_content(content_value))
+                return _load_json_content(content_value)
             except error.HTTPError as request_error:
                 if not self._should_retry(request_error.code, attempt):
                     return self._fail(f"HTTP {request_error.code}: {request_error.reason}")

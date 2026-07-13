@@ -71,3 +71,4 @@ class DatasetResult:
     machine_field_count: int
     source_info: dict[str, object] | None
     camera_review_count: int = 0
+    machine_review_count: int = 0

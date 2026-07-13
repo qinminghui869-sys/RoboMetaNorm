@@ -17,6 +17,7 @@ from robometanorm.domain.models import (
     PreconditionReport,
 )
 from robometanorm.camera.models import CameraReviewCandidate, CameraReviewItem
+from robometanorm.machine.models import MachineReviewItem
 from robometanorm.writers.json_writer import write_normalization_files
 
 
@@ -107,6 +108,46 @@ class JsonWriterTest(unittest.TestCase):
         self.assertEqual(
             review["camera_review_items"][0]["human_decision"],
             {"status": "pending", "selected_target_key": None},
+        )
+
+    def test_writes_p2_machine_review_items_and_promotes_status_to_review(self) -> None:
+        machine_review = MachineReviewItem(
+            source_feature="observation.state.hand",
+            source_slice=(7, 10),
+            category="UNKNOWN_UNIT",
+            severity="confirmation",
+            declared_names=("left_hand_joint_0",),
+            vlm_result={"semantic_type": "hand_joint", "confidence": 0.8},
+            candidates=("left_hand_joint_0_rad",),
+            required_action="确认物理单位后再添加 _rad。",
+        )
+
+        write_normalization_files(
+            self.candidate,
+            self.info,
+            self.report,
+            machine_review_items=(machine_review,),
+            phase="P2",
+        )
+
+        review = json.loads(
+            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(review["generator"]["phase"], "P2")
+        self.assertEqual(review["status"], "REVIEW")
+        self.assertTrue(review["review_required"])
+        self.assertEqual(
+            review["machine_review_items"][0]["source_slice"], [7, 10]
+        )
+        self.assertEqual(
+            review["machine_review_items"][0]["human_decision"],
+            {
+                "status": "pending",
+                "selected_semantic": None,
+                "comment": None,
+            },
         )
 
 

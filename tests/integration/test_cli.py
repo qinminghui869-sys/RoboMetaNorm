@@ -12,6 +12,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.cli.main import main
@@ -109,6 +112,71 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(classifier.max_retries, 3)
         self.assertEqual(classifier.retry_backoff_seconds, 0.5)
         self.assertEqual(classifier.max_tokens, 2048)
+
+    def test_normalize_applies_safe_p2_machine_names_from_parquet(self) -> None:
+        info = {
+            "fps": 20,
+            "features": {
+                "action": self._head_quaternion_feature(),
+                "observation.state": self._head_quaternion_feature(),
+                "observation.images.image_left": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                },
+            },
+        }
+        (self.dataset_path / "meta" / "info.json").write_text(
+            json.dumps(info), encoding="utf-8"
+        )
+        pq.write_table(
+            pa.table(
+                {
+                    "action": [[0.0, 0.0, 0.0, 1.0]],
+                    "observation.state": [[0.0, 0.0, 0.0, 1.0]],
+                }
+            ),
+            self.dataset_path / "data" / "episode_000000.parquet",
+        )
+
+        self._run("normalize", "--root", str(self.root))
+
+        normalized = json.loads(
+            (self.dataset_path / "meta" / "info_norm.json").read_text(encoding="utf-8")
+        )
+        review = json.loads(
+            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        expected_names = [
+            "head_orient_quat_x",
+            "head_orient_quat_y",
+            "head_orient_quat_z",
+            "head_orient_quat_w",
+        ]
+        self.assertEqual(normalized["features"]["action"]["names"], expected_names)
+        self.assertEqual(
+            normalized["features"]["observation.state"]["names"], expected_names
+        )
+        self.assertEqual(review["generator"]["phase"], "P2")
+        self.assertIn("machine_review_items", review)
+        self.assertEqual(
+            json.loads((self.dataset_path / "meta" / "info.json").read_text(encoding="utf-8")),
+            info,
+        )
+
+    @staticmethod
+    def _head_quaternion_feature() -> dict[str, object]:
+        return {
+            "dtype": "float32",
+            "shape": [4],
+            "names": [
+                "head_rotation_quat_x",
+                "head_rotation_quat_y",
+                "head_rotation_quat_z",
+                "head_rotation_quat_w",
+            ],
+        }
 
     @staticmethod
     def _run(*arguments: str) -> str:

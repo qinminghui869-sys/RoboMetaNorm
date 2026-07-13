@@ -10,6 +10,7 @@ from pathlib import Path
 from robometanorm.application.pipeline import normalize_datasets, scan_datasets
 from robometanorm.camera.vlm_classifier import OpenAICompatibleVlmClassifier, VlmClassifier
 from robometanorm.domain.models import DatasetResult, LayoutType
+from robometanorm.machine.vlm_semantic_resolver import OpenAICompatibleMachineVlmResolver
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -21,10 +22,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "scan":
             results = scan_datasets(arguments.root, layout)
         else:
+            vlm_classifier = _build_vlm_classifier(arguments, parser)
             results = normalize_datasets(
                 arguments.root,
                 layout,
-                vlm_classifier=_build_vlm_classifier(arguments, parser),
+                vlm_classifier=vlm_classifier,
+                machine_vlm_resolver=_build_machine_vlm_resolver(vlm_classifier),
                 confidence_threshold=arguments.confidence_threshold,
             )
     except ValueError as error:
@@ -113,6 +116,15 @@ def _build_vlm_classifier(
     )
 
 
+def _build_machine_vlm_resolver(
+    vlm_classifier: VlmClassifier | None,
+) -> OpenAICompatibleMachineVlmResolver | None:
+    """机器字段复用相同 VLM 连接配置，但始终只请求语义 JSON。"""
+    if isinstance(vlm_classifier, OpenAICompatibleVlmClassifier):
+        return OpenAICompatibleMachineVlmResolver(vlm_classifier)
+    return None
+
+
 def _format_summary(results: Sequence[DatasetResult]) -> str:
     """使用标准库输出框架约定的执行汇总表。"""
     headers = ["Dataset", "Status", "Cameras", "Machine Fields", "Reviews"]
@@ -122,7 +134,11 @@ def _format_summary(results: Sequence[DatasetResult]) -> str:
             result.status.value,
             str(result.camera_count),
             str(result.machine_field_count),
-            str(len(result.review_items) + result.camera_review_count),
+            str(
+                len(result.review_items)
+                + result.camera_review_count
+                + result.machine_review_count
+            ),
         ]
         for result in results
     ]

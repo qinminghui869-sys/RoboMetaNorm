@@ -12,6 +12,7 @@ import tempfile
 from robometanorm import __version__
 from robometanorm.camera.models import CameraReviewItem
 from robometanorm.domain.models import DatasetCandidate, DatasetStatus, PreconditionReport
+from robometanorm.machine.models import MachineReviewItem
 
 
 def write_normalization_files(
@@ -20,11 +21,18 @@ def write_normalization_files(
     report: PreconditionReport,
     *,
     camera_review_items: Sequence[CameraReviewItem] = (),
+    machine_review_items: Sequence[MachineReviewItem] = (),
     phase: str = "P0",
 ) -> None:
-    """写入 P0/P1 规范建议和人工复核文件。"""
+    """写入 P0/P1/P2 规范建议和人工复核文件。"""
     output_info = deepcopy(dict(normalized_info))
-    review = _build_review(candidate, report, camera_review_items, phase)
+    review = _build_review(
+        candidate,
+        report,
+        camera_review_items,
+        machine_review_items,
+        phase,
+    )
     _validate_payloads(output_info, review)
     _write_pair_atomically(
         candidate.info_path.parent,
@@ -39,6 +47,7 @@ def _build_review(
     candidate: DatasetCandidate,
     report: PreconditionReport,
     camera_review_items: Sequence[CameraReviewItem],
+    machine_review_items: Sequence[MachineReviewItem],
     phase: str,
 ) -> dict[str, object]:
     """将领域复核项转换为公开 JSON 结构。"""
@@ -53,8 +62,12 @@ def _build_review(
             "name": candidate.dataset_name,
             "layout_type": candidate.layout_type.value,
         },
-        "status": _status_with_camera_reviews(report.status, camera_review_items).value,
-        "review_required": bool(report.review_items or camera_review_items),
+        "status": _status_with_reviews(
+            report.status, camera_review_items, machine_review_items
+        ).value,
+        "review_required": bool(
+            report.review_items or camera_review_items or machine_review_items
+        ),
         "review_items": [
             {
                 "review_id": item.review_id,
@@ -82,14 +95,34 @@ def _build_review(
             }
             for item in camera_review_items
         ],
+        "machine_review_items": [
+            {
+                "source_feature": item.source_feature,
+                "source_slice": list(item.source_slice) if item.source_slice else None,
+                "category": item.category,
+                "severity": item.severity,
+                "declared_names": list(item.declared_names),
+                "vlm_result": item.vlm_result,
+                "candidates": list(item.candidates),
+                "required_action": item.required_action,
+                "human_decision": {
+                    "status": "pending",
+                    "selected_semantic": None,
+                    "comment": None,
+                },
+            }
+            for item in machine_review_items
+        ],
     }
 
 
-def _status_with_camera_reviews(
-    status: DatasetStatus, camera_review_items: Sequence[CameraReviewItem]
+def _status_with_reviews(
+    status: DatasetStatus,
+    camera_review_items: Sequence[CameraReviewItem],
+    machine_review_items: Sequence[MachineReviewItem],
 ) -> DatasetStatus:
-    """相机复核项不会降低既有 BLOCKED 或 ERROR 状态。"""
-    if camera_review_items and status is DatasetStatus.PASS:
+    """P1/P2 复核项不会降低既有 BLOCKED 或 ERROR 状态。"""
+    if (camera_review_items or machine_review_items) and status is DatasetStatus.PASS:
         return DatasetStatus.REVIEW
     return status
 

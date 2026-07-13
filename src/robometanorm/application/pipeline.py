@@ -18,6 +18,9 @@ from robometanorm.domain.models import (
     PreconditionReport,
     ReviewItem,
 )
+from robometanorm.machine.normalizer import normalize_machine_fields
+from robometanorm.machine.parquet_profiler import profile_parquets
+from robometanorm.machine.vlm_semantic_resolver import MachineVlmResolver
 from robometanorm.writers.json_writer import write_normalization_files
 
 
@@ -49,9 +52,10 @@ def normalize_datasets(
     layout: LayoutType = LayoutType.AUTO,
     *,
     vlm_classifier: VlmClassifier | None = None,
+    machine_vlm_resolver: MachineVlmResolver | None = None,
     confidence_threshold: float = 0.85,
 ) -> list[DatasetResult]:
-    """执行 P1 相机规范建议并生成两个输出文件。"""
+    """执行 P1/P2 规范建议并生成两个输出文件。"""
     results = scan_datasets(root, layout)
     for index, result in enumerate(results):
         if result.source_info is None:
@@ -63,7 +67,18 @@ def normalize_datasets(
                 vlm_classifier=vlm_classifier,
                 confidence_threshold=confidence_threshold,
             )
-            status = _status_after_camera_reviews(result.status, camera_result.camera_review_items)
+            parquet_profile = _profile_first_parquet(result.candidate)
+            machine_result = normalize_machine_fields(
+                camera_result.normalized_info,
+                parquet_profile,
+                vlm_resolver=machine_vlm_resolver,
+                dataset_name=result.candidate.dataset_name,
+            )
+            status = _status_after_reviews(
+                result.status,
+                camera_result.camera_review_items,
+                machine_result.machine_review_items,
+            )
             report = PreconditionReport(
                 status=status,
                 review_items=result.review_items,
@@ -72,24 +87,40 @@ def normalize_datasets(
             )
             write_normalization_files(
                 result.candidate,
-                camera_result.normalized_info,
+                machine_result.normalized_info,
                 report,
                 camera_review_items=camera_result.camera_review_items,
-                phase="P1",
+                machine_review_items=machine_result.machine_review_items,
+                phase="P2",
             )
             results[index] = replace(
                 result,
                 status=status,
                 camera_review_count=len(camera_result.camera_review_items),
+                machine_review_count=len(machine_result.machine_review_items),
             )
         except (OSError, RuntimeError, ValueError) as error:
             results[index] = _error_result(result.candidate, error)
     return results
 
 
-def _status_after_camera_reviews(status: DatasetStatus, camera_review_items: tuple[object, ...]) -> DatasetStatus:
-    """相机复核只会将 PASS 提升为 REVIEW，不覆盖更高优先级状态。"""
-    if camera_review_items and status is DatasetStatus.PASS:
+def _profile_first_parquet(candidate: DatasetCandidate):
+    """读取受限样本并比较各 Episode 布局，不改写任何源数据。"""
+    if candidate.data_path is None:
+        return None
+    parquet_paths = sorted(candidate.data_path.rglob("*.parquet"))
+    if not parquet_paths:
+        return None
+    return profile_parquets(parquet_paths)
+
+
+def _status_after_reviews(
+    status: DatasetStatus,
+    camera_review_items: tuple[object, ...],
+    machine_review_items: tuple[object, ...],
+) -> DatasetStatus:
+    """相机或机器复核只会将 PASS 提升为 REVIEW。"""
+    if (camera_review_items or machine_review_items) and status is DatasetStatus.PASS:
         return DatasetStatus.REVIEW
     return status
 

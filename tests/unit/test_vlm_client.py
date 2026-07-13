@@ -92,6 +92,17 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
         self.assertEqual(request_body["max_tokens"], 1024)
         self.assertFalse(request_body["enable_thinking"])
 
+    def test_exposes_validated_json_transport_for_non_camera_semantics(self) -> None:
+        response = _Response(
+            {"choices": [{"message": {"content": "前缀 {\"semantic_type\": \"unknown\"} 后缀"}}]}
+        )
+        client = OpenAICompatibleVlmClassifier("http://localhost/v1", "test-vlm", "test-key")
+
+        with patch("robometanorm.camera.vlm_classifier.request.urlopen", return_value=response):
+            payload = client.request_json("system", "user", ())
+
+        self.assertEqual(payload, {"semantic_type": "unknown"})
+
 
 if __name__ == "__main__":
     unittest.main()
