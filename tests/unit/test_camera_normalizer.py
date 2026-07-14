@@ -8,11 +8,30 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
+from robometanorm.camera.media import MediaInfo
 from robometanorm.camera.normalizer import normalize_cameras
 from robometanorm.domain.models import DatasetCandidate, LayoutType
+
+
+class _InvalidSemanticsClassifier:
+    """模拟业务 schema 不合法的相机 VLM 返回。"""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.last_error = "相机 VLM 语义不合法: VLM 方位词不合法"
+        self.last_error_code = "VLM_SEMANTICS_INVALID"
+        self.last_error_evidence = {
+            "field": "direction_tokens",
+            "value": ["high"],
+        }
+
+    def classify(self, system_prompt: str, user_prompt: str, image_paths: object) -> None:
+        self.call_count += 1
+        return None
 
 
 class CameraNormalizerTest(unittest.TestCase):
@@ -98,6 +117,69 @@ class CameraNormalizerTest(unittest.TestCase):
         self.assertEqual(
             {item.reason_code for item in result.camera_review_items},
             {"TARGET_NAME_COLLISION"},
+        )
+
+    def test_schema_invalid_vlm_response_skips_second_stage_and_records_evidence(self) -> None:
+        source_key = "observation.images.camera_1"
+        candidate = self._candidate_with_media(source_key)
+        classifier = _InvalidSemanticsClassifier()
+        media = MediaInfo("h264", 30.0, 640, 480, 2.0, 60, "yuv420p")
+
+        with (
+            patch("robometanorm.camera.normalizer.probe_media", return_value=media),
+            patch("robometanorm.camera.normalizer.extract_rgb_frames", return_value=()),
+        ):
+            result = normalize_cameras(
+                candidate,
+                self._info({source_key: {"dtype": "video", "shape": [480, 640, 3]}}),
+                vlm_classifier=classifier,
+            )
+
+        self.assertEqual(classifier.call_count, 1)
+        review = next(
+            item
+            for item in result.camera_review_items
+            if item.reason_code == "VLM_SEMANTICS_INVALID"
+        )
+        self.assertEqual(review.evidence["field"], "direction_tokens")
+        self.assertEqual(review.evidence["value"], ["high"])
+        self.assertNotIn(
+            "VLM_UNAVAILABLE", {item.reason_code for item in result.camera_review_items}
+        )
+
+    def test_reports_unresolved_media_key_mismatch_once(self) -> None:
+        source_key = "observation.images.external_image"
+        candidate = self._candidate_with_media("observation.images.image_top")
+        classifier = _InvalidSemanticsClassifier()
+
+        result = normalize_cameras(
+            candidate,
+            self._info({source_key: {"dtype": "video", "shape": [480, 640, 3]}}),
+            vlm_classifier=classifier,
+        )
+
+        self.assertEqual(classifier.call_count, 0)
+        self.assertEqual(len(result.camera_review_items), 1)
+        review = result.camera_review_items[0]
+        self.assertEqual(review.reason_code, "MEDIA_KEY_MISMATCH")
+        self.assertEqual(
+            review.evidence["available_media_keys"],
+            ["observation.images.image_top"],
+        )
+
+    def _candidate_with_media(self, media_key: str) -> DatasetCandidate:
+        media_directory = self.dataset_path / "videos" / media_key
+        media_directory.mkdir(parents=True, exist_ok=True)
+        (media_directory / "episode_000000.mp4").touch()
+        return DatasetCandidate(
+            dataset_name="dataset_001",
+            task_name=None,
+            source_path=self.dataset_path,
+            layout_type=LayoutType.FLAT,
+            info_path=self.info_path,
+            data_path=self.dataset_path / "data",
+            video_path=self.dataset_path / "videos",
+            depth_path=None,
         )
 
     @staticmethod

@@ -14,6 +14,10 @@ from robometanorm.episode_sampling import select_representative_episodes
 
 
 MEDIA_SUFFIXES = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
+_SAFE_MEDIA_KEY_ALIASES = {
+    "observation.images.left_image": "observation.images.image_left",
+    "observation.images.right_image": "observation.images.image_right",
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,10 @@ def discover_camera_features(info: Mapping[str, object]) -> dict[str, Mapping[st
 def find_camera_media(candidate: DatasetCandidate, source_key: str) -> tuple[Path, ...]:
     """按视频目录名匹配源字段，返回首、末 Episode 文件。"""
     roots = [path for path in (candidate.video_path, candidate.depth_path) if path is not None]
+    accepted_keys = {source_key}
+    alias = _SAFE_MEDIA_KEY_ALIASES.get(source_key)
+    if alias is not None:
+        accepted_keys.add(alias)
     files = [
         path
         for root in roots
@@ -51,9 +59,24 @@ def find_camera_media(candidate: DatasetCandidate, source_key: str) -> tuple[Pat
         for path in root.rglob("*")
         if path.is_file()
         and path.suffix.lower() in MEDIA_SUFFIXES
-        and source_key in path.parts
+        and any(key in path.parts for key in accepted_keys)
     ]
     return select_representative_episodes(files)
+
+
+def discover_camera_media_keys(candidate: DatasetCandidate) -> tuple[str, ...]:
+    """列出实际视频路径中的相机字段目录，用于诊断元数据键不一致。"""
+    roots = [path for path in (candidate.video_path, candidate.depth_path) if path is not None]
+    keys = {
+        part
+        for root in roots
+        if root.is_dir()
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES
+        for part in path.parts
+        if part.startswith("observation.images.")
+    }
+    return tuple(sorted(keys))
 
 
 def probe_media(media_path: Path) -> MediaInfo:

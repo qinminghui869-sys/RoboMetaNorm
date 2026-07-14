@@ -9,6 +9,7 @@ import tempfile
 
 from robometanorm.camera.media import (
     MediaInfo,
+    discover_camera_media_keys,
     discover_camera_features,
     extract_rgb_frames,
     find_camera_media,
@@ -76,7 +77,9 @@ def normalize_cameras(
 
     review_items.extend(_validate_media(candidate, source_info, camera_features))
     _replace_feature_keys(normalized_info, proposals)
-    return CameraNormalizationResult(normalized_info, tuple(review_items))
+    return CameraNormalizationResult(
+        normalized_info, tuple(_deduplicate_reviews(review_items))
+    )
 
 
 def _replace_feature_keys(
@@ -113,7 +116,7 @@ def _resolve_unknown_camera(
         return None, _review(source_key, "UNKNOWN_CAMERA_NAME")
     media_files = find_camera_media(candidate, source_key)
     if not media_files:
-        return None, _review(source_key, "MEDIA_NOT_FOUND")
+        return None, _missing_media_review(candidate, source_key)
     try:
         media = probe_media(media_files[0])
         semantics = _classify_with_two_stages(
@@ -138,10 +141,29 @@ def _resolve_unknown_camera(
         )
         if target_key is not None:
             candidates = (CameraReviewCandidate(target_key, semantics.confidence),)
+    if semantics is None:
+        error_code = getattr(vlm_classifier, "last_error_code", None)
+        evidence = dict(getattr(vlm_classifier, "last_error_evidence", {}) or {})
+        error_message = getattr(vlm_classifier, "last_error", None)
+        if isinstance(error_message, str):
+            evidence["message"] = error_message
+        reason_code = (
+            "VLM_SEMANTICS_INVALID"
+            if error_code == "VLM_SEMANTICS_INVALID"
+            else "VLM_UNAVAILABLE"
+        )
+    else:
+        reason_code = (
+            "VLM_SEMANTICS_INSUFFICIENT"
+            if not candidates
+            else "VLM_LOW_CONFIDENCE_OR_AMBIGUOUS"
+        )
+        evidence = {}
     return None, _review(
         source_key,
-        "VLM_LOW_CONFIDENCE_OR_AMBIGUOUS" if semantics else "VLM_UNAVAILABLE",
+        reason_code,
         candidates=candidates,
+        evidence=evidence,
     )
 
 
@@ -173,6 +195,8 @@ def _classify_with_two_stages(
         semantics = vlm_classifier.classify(system_prompt, user_prompt, first_frames)
         if _semantics_is_decisive(semantics):
             return semantics
+        if getattr(vlm_classifier, "last_error_code", None) == "VLM_SEMANTICS_INVALID":
+            return None
 
         selected_media = _select_second_stage_episodes(media_files)
         second_frames: list[Path] = []
@@ -194,6 +218,10 @@ def _semantics_is_decisive(semantics: CameraSemantics | None) -> bool:
         and semantics.confidence >= 0.85
         and not semantics.ambiguous
         and not semantics.need_human_review
+        and build_camera_key(
+            semantics.direction_tokens, semantics.body_part, semantics.modality
+        )
+        is not None
     )
 
 
@@ -240,7 +268,7 @@ def _validate_media(
     for source_key, feature in camera_features.items():
         media_files = find_camera_media(candidate, source_key)
         if not media_files:
-            review_items.append(_review(source_key, "MEDIA_NOT_FOUND"))
+            review_items.append(_missing_media_review(candidate, source_key))
             continue
         try:
             media = probe_media(media_files[0])
@@ -287,6 +315,28 @@ def _review(
 ) -> CameraReviewItem:
     """创建统一的 P1 相机复核项。"""
     return CameraReviewItem(source_key, reason_code, candidates, evidence or {})
+
+
+def _missing_media_review(
+    candidate: DatasetCandidate, source_key: str
+) -> CameraReviewItem:
+    """区分媒体缺失与元数据、目录字段键不一致。"""
+    available_keys = discover_camera_media_keys(candidate)
+    if available_keys:
+        return _review(
+            source_key,
+            "MEDIA_KEY_MISMATCH",
+            evidence={"available_media_keys": list(available_keys)},
+        )
+    return _review(source_key, "MEDIA_NOT_FOUND")
+
+
+def _deduplicate_reviews(items: Sequence[CameraReviewItem]) -> list[CameraReviewItem]:
+    """同一相机字段的同类复核只保留首条。"""
+    unique: dict[tuple[str, str], CameraReviewItem] = {}
+    for item in items:
+        unique.setdefault((item.source_key, item.reason_code), item)
+    return list(unique.values())
 
 
 def _string_or_none(value: object) -> str | None:

@@ -129,6 +129,35 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
 
         self.assertEqual(payload, {"semantic_type": "unknown"})
 
+    def test_exposes_camera_schema_error_code_and_invalid_field(self) -> None:
+        client = OpenAICompatibleVlmClassifier(
+            "http://localhost/v1", "test-vlm", "test-key"
+        )
+        response_payload = {
+            "modality": "rgb",
+            "mount_type": "fixed",
+            "direction_tokens": ["high"],
+            "body_part": None,
+            "is_primary": False,
+            "confidence": 0.9,
+            "ambiguous": False,
+            "alternatives": [],
+            "need_human_review": False,
+        }
+
+        with (
+            patch.object(client, "request_json", return_value=response_payload),
+            patch("robometanorm.camera.vlm.logger.warning"),
+        ):
+            semantics = client.classify("system", "user", ())
+
+        self.assertIsNone(semantics)
+        self.assertEqual(client.last_error_code, "VLM_SEMANTICS_INVALID")
+        self.assertEqual(
+            client.last_error_evidence,
+            {"field": "direction_tokens", "value": ["high"]},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

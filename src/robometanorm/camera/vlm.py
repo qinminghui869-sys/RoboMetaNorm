@@ -20,10 +20,17 @@ from robometanorm.camera.naming import BODY_PART_TOKENS, EXTERNAL_DIRECTION_TOKE
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """你是机器人数据集相机语义分类器。
+SYSTEM_PROMPT = f"""你是机器人数据集相机语义分类器。
 根据字段元数据和视频采样图判断模态、安装类型、方位、本体部位、主摄像头与歧义。
 left/right 表示安装位置而非画面物体位置；wrist 表示末端执行器附近且随机械臂运动。
-证据不足时使用 unknown 或 ambiguous=true。不得输出最终标准字段名，只输出合法 JSON。"""
+严格返回一个 JSON 对象，不得输出最终标准字段名：
+- modality 仅允许 rgb、depth、unknown。
+- mount_type 是描述性字符串或 null，不参与字段命名。
+- direction_tokens 仅允许 {", ".join(sorted(EXTERNAL_DIRECTION_TOKENS))}；未知时返回空数组 []。
+- body_part 仅允许 {", ".join(sorted(BODY_PART_TOKENS))}；未知时返回 null。
+- is_primary、ambiguous、need_human_review 必须是布尔值。
+- confidence 必须是 0 到 1 的数字，alternatives 必须是字符串数组。
+证据不足时设置 ambiguous=true 或 need_human_review=true。"""
 
 
 def build_vlm_prompt(
@@ -65,7 +72,7 @@ class CameraSemantics:
     """VLM 返回的语义属性，不包含最终字段名。"""
 
     modality: str
-    mount_type: str
+    mount_type: str | None
     direction_tokens: tuple[str, ...]
     body_part: str | None
     is_primary: bool
@@ -73,6 +80,15 @@ class CameraSemantics:
     ambiguous: bool
     alternatives: tuple[str, ...]
     need_human_review: bool
+
+
+class CameraSemanticsValidationError(ValueError):
+    """携带非法字段和值的相机 VLM schema 错误。"""
+
+    def __init__(self, message: str, *, field: str, value: object) -> None:
+        super().__init__(message)
+        self.field = field
+        self.value = value
 
 
 class VlmClassifier(Protocol):
@@ -126,6 +142,8 @@ class OpenAICompatibleVlmClassifier:
         self.retry_backoff_seconds = retry_backoff_seconds
         self.max_tokens = max_tokens
         self.last_error: str | None = None
+        self.last_error_code: str | None = None
+        self.last_error_evidence: dict[str, object] = {}
 
     def classify(
         self, system_prompt: str, user_prompt: str, image_paths: Sequence[Path]
@@ -136,8 +154,15 @@ class OpenAICompatibleVlmClassifier:
             return None
         try:
             return parse_vlm_semantics(response_payload)
-        except ValueError as response_error:
-            return self._fail(f"相机 VLM 语义不合法: {response_error}")
+        except CameraSemanticsValidationError as response_error:
+            return self._fail(
+                f"相机 VLM 语义不合法: {response_error}",
+                code="VLM_SEMANTICS_INVALID",
+                evidence={
+                    "field": response_error.field,
+                    "value": response_error.value,
+                },
+            )
 
     def request_json(
         self, system_prompt: str, user_prompt: str, image_paths: Sequence[Path]
@@ -190,6 +215,8 @@ class OpenAICompatibleVlmClassifier:
                     response_payload = json.loads(response.read().decode("utf-8"))
                 content_value = response_payload["choices"][0]["message"]["content"]
                 self.last_error = None
+                self.last_error_code = None
+                self.last_error_evidence = {}
                 return _load_json_content(content_value)
             except error.HTTPError as request_error:
                 if not self._should_retry(request_error.code, attempt):
@@ -212,9 +239,17 @@ class OpenAICompatibleVlmClassifier:
         if delay:
             time.sleep(delay)
 
-    def _fail(self, message: str) -> None:
+    def _fail(
+        self,
+        message: str,
+        *,
+        code: str = "VLM_UNAVAILABLE",
+        evidence: Mapping[str, object] | None = None,
+    ) -> None:
         """保留失败原因，供调用方记录为人工复核证据。"""
         self.last_error = message
+        self.last_error_code = code
+        self.last_error_evidence = dict(evidence or {})
         logger.warning("VLM 分类失败（模型 %s）: %s", self.model, message)
         return None
 
@@ -222,32 +257,68 @@ class OpenAICompatibleVlmClassifier:
 def parse_vlm_semantics(payload: Mapping[str, object]) -> CameraSemantics:
     """校验模型输出仅包含 P1 允许的语义属性。"""
     if "target_key" in payload:
-        raise ValueError("VLM 不得输出最终字段名")
+        raise CameraSemanticsValidationError(
+            "VLM 不得输出最终字段名",
+            field="target_key",
+            value=payload.get("target_key"),
+        )
     modality = payload.get("modality")
     mount_type = payload.get("mount_type")
     direction_tokens = payload.get("direction_tokens")
     body_part = payload.get("body_part")
     confidence = payload.get("confidence")
-    if modality not in {"rgb", "depth", "unknown"}:
-        raise ValueError("VLM 模态不合法")
-    if not isinstance(direction_tokens, list) or not all(
+    if not isinstance(modality, str) or modality not in {"rgb", "depth", "unknown"}:
+        raise CameraSemanticsValidationError(
+            "VLM 模态不合法", field="modality", value=modality
+        )
+    if direction_tokens == ["unknown"]:
+        direction_tokens = []
+    elif not isinstance(direction_tokens, list) or not all(
         isinstance(token, str) and token in EXTERNAL_DIRECTION_TOKENS
         for token in direction_tokens
     ):
-        raise ValueError("VLM 方位词不合法")
-    if body_part not in BODY_PART_TOKENS and body_part is not None:
-        raise ValueError("VLM 本体部位不合法")
-    if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
-        raise ValueError("VLM 置信度不合法")
+        raise CameraSemanticsValidationError(
+            "VLM 方位词不合法",
+            field="direction_tokens",
+            value=direction_tokens,
+        )
+    if body_part == "unknown":
+        body_part = None
+    if body_part is not None and (
+        not isinstance(body_part, str) or body_part not in BODY_PART_TOKENS
+    ):
+        raise CameraSemanticsValidationError(
+            "VLM 本体部位不合法", field="body_part", value=body_part
+        )
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        raise CameraSemanticsValidationError(
+            "VLM 置信度不合法", field="confidence", value=confidence
+        )
     boolean_fields = ("is_primary", "ambiguous", "need_human_review")
-    if not all(isinstance(payload.get(field), bool) for field in boolean_fields):
-        raise ValueError("VLM 布尔字段不合法")
+    invalid_boolean = next(
+        (field for field in boolean_fields if not isinstance(payload.get(field), bool)),
+        None,
+    )
+    if invalid_boolean is not None:
+        raise CameraSemanticsValidationError(
+            "VLM 布尔字段不合法",
+            field=invalid_boolean,
+            value=payload.get(invalid_boolean),
+        )
     alternatives = payload.get("alternatives")
-    if not isinstance(alternatives, list) or not all(isinstance(item, str) for item in alternatives):
-        raise ValueError("VLM 备选项不合法")
+    if not isinstance(alternatives, list) or not all(
+        isinstance(item, str) for item in alternatives
+    ):
+        raise CameraSemanticsValidationError(
+            "VLM 备选项不合法", field="alternatives", value=alternatives
+        )
     return CameraSemantics(
         modality=modality,
-        mount_type=mount_type,
+        mount_type=mount_type if isinstance(mount_type, str) else None,
         direction_tokens=tuple(direction_tokens),
         body_part=body_part,
         is_primary=payload["is_primary"],

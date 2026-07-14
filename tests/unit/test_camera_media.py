@@ -19,7 +19,11 @@ from robometanorm.camera.media import (
     second_stage_ratios,
 )
 from robometanorm.camera.normalizer import _select_second_stage_episodes
-from robometanorm.camera.vlm import build_vlm_prompt, parse_vlm_semantics
+from robometanorm.camera.vlm import (
+    CameraSemanticsValidationError,
+    build_vlm_prompt,
+    parse_vlm_semantics,
+)
 from robometanorm.domain.models import DatasetCandidate, LayoutType
 
 
@@ -57,6 +61,35 @@ class CameraMediaTest(unittest.TestCase):
 
             self.assertEqual(
                 find_camera_media(candidate, "observation.images.camera_1"),
+                (episodes[0], episodes[-1]),
+            )
+
+    def test_matches_only_safe_left_right_media_key_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            dataset_path = Path(temporary_directory)
+            media_directory = (
+                dataset_path / "videos" / "observation.images.image_left"
+            )
+            media_directory.mkdir(parents=True)
+            episodes = tuple(
+                media_directory / f"episode_{index:06d}.mp4"
+                for index in range(3)
+            )
+            for episode in episodes:
+                episode.touch()
+            candidate = DatasetCandidate(
+                dataset_name="dataset",
+                task_name=None,
+                source_path=dataset_path,
+                layout_type=LayoutType.FLAT,
+                info_path=dataset_path / "meta" / "info.json",
+                data_path=None,
+                video_path=dataset_path / "videos",
+                depth_path=None,
+            )
+
+            self.assertEqual(
+                find_camera_media(candidate, "observation.images.left_image"),
                 (episodes[0], episodes[-1]),
             )
 
@@ -119,9 +152,39 @@ class CameraMediaTest(unittest.TestCase):
         )
 
         self.assertNotIn("target_key", system_prompt + user_prompt)
+        self.assertIn("direction_tokens 仅允许", system_prompt)
+        self.assertIn("未知时返回空数组 []", system_prompt)
+        self.assertIn("body_part 仅允许", system_prompt)
+        self.assertIn("未知时返回 null", system_prompt)
         self.assertEqual(semantics.body_part, "wrist")
         with self.assertRaises(ValueError):
             parse_vlm_semantics({"target_key": "observation.images.cam_left_rgb"})
+
+    def test_normalizes_safe_unknown_sentinels_but_rejects_unknown_tokens(self) -> None:
+        payload = {
+            "modality": "rgb",
+            "mount_type": "fixed",
+            "direction_tokens": ["unknown"],
+            "body_part": "unknown",
+            "is_primary": False,
+            "confidence": 0.61,
+            "ambiguous": True,
+            "alternatives": [],
+            "need_human_review": True,
+        }
+
+        semantics = parse_vlm_semantics(payload)
+
+        self.assertEqual(semantics.direction_tokens, ())
+        self.assertIsNone(semantics.body_part)
+        invalid_payload = {**payload, "direction_tokens": ["high"]}
+        with self.assertRaises(CameraSemanticsValidationError) as caught:
+            parse_vlm_semantics(invalid_payload)
+        self.assertEqual(caught.exception.field, "direction_tokens")
+        self.assertEqual(caught.exception.value, ["high"])
+        with self.assertRaises(CameraSemanticsValidationError) as caught:
+            parse_vlm_semantics({**payload, "modality": ["rgb"]})
+        self.assertEqual(caught.exception.field, "modality")
 
     def test_vlm_mount_type_does_not_restrict_semantic_parsing(self) -> None:
         semantics = parse_vlm_semantics(
