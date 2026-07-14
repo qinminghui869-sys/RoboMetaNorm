@@ -164,19 +164,33 @@ class CliIntegrationTest(unittest.TestCase):
             info,
         )
 
-    def test_normalize_reports_episode_progress_then_cache_hit(self) -> None:
-        self._write_two_dimensional_parquet("episode_000000.parquet", 0.0)
-        self._write_two_dimensional_parquet("episode_000001.parquet", 1.0)
+    def test_normalize_profiles_first_and_last_episode_then_hits_cache(self) -> None:
+        for index in range(4):
+            self._write_two_dimensional_parquet(
+                f"episode_{index:06d}.parquet", float(index)
+            )
 
         _, first_stderr = self._run_captured(
             "normalize", "--root", str(self.root)
+        )
+        middle_path = self.dataset_path / "data" / "episode_000001.parquet"
+        stat = middle_path.stat()
+        os.utime(
+            middle_path,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
         )
         _, second_stderr = self._run_captured(
             "normalize", "--root", str(self.root)
         )
 
-        self.assertIn("正在分析 episode 1/2", first_stderr)
-        self.assertIn("正在分析 episode 2/2", first_stderr)
+        self.assertIn(
+            "正在分析 episode 1/2: episode_000000.parquet", first_stderr
+        )
+        self.assertIn(
+            "正在分析 episode 2/2: episode_000003.parquet", first_stderr
+        )
+        self.assertNotIn("episode_000001.parquet", first_stderr)
+        self.assertNotIn("episode_000002.parquet", first_stderr)
         self.assertIn("已加载 Parquet 画像缓存，共 2 episodes", second_stderr)
 
     def _write_two_dimensional_parquet(self, filename: str, offset: float) -> None:

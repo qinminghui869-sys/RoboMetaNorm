@@ -19,6 +19,7 @@ from robometanorm.domain.models import (
     PreconditionReport,
     ReviewItem,
 )
+from robometanorm.episode_sampling import select_representative_episodes
 from robometanorm.machine.normalizer import normalize_machine_fields
 from robometanorm.machine.models import ProfileProgress
 from robometanorm.machine.profile_cache import load_or_profile_parquets
@@ -116,7 +117,9 @@ def _profile_dataset_parquets(
     """读取受限样本并比较各 Episode 布局，不改写任何源数据。"""
     if candidate.data_path is None:
         return None
-    parquet_paths = sorted(candidate.data_path.rglob("*.parquet"))
+    parquet_paths = select_representative_episodes(
+        tuple(candidate.data_path.rglob("*.parquet"))
+    )
     if not parquet_paths:
         return None
     return load_or_profile_parquets(
