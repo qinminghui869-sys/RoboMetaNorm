@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.camera.media import MediaInfo
+from robometanorm.camera.models import CameraMount, RobotCameraTopology
 from robometanorm.camera.normalizer import normalize_cameras
 from robometanorm.camera.vlm import CameraSemantics
 from robometanorm.domain.models import DatasetCandidate, LayoutType
@@ -36,27 +37,39 @@ class _InvalidSemanticsClassifier:
         return None
 
 
-class _ConfidentClassifier:
-    """模拟给出高置信位置但没有机器人拓扑依据的 VLM。"""
+class _FixedClassifier:
+    """按提示词中的源字段返回固定本地画面语义。"""
 
-    def __init__(self) -> None:
+    def __init__(self, semantics: dict[str, CameraSemantics]) -> None:
+        self.semantics = semantics
         self.call_count = 0
+        self.last_error = None
+        self.last_error_code = None
+        self.last_error_evidence: dict[str, object] = {}
 
     def classify(
         self, system_prompt: str, user_prompt: str, image_paths: object
-    ) -> CameraSemantics:
+    ) -> CameraSemantics | None:
         self.call_count += 1
-        return CameraSemantics(
-            modality="rgb",
-            mount_type=None,
-            direction_tokens=("top", "side"),
-            body_part=None,
-            is_primary=False,
-            confidence=0.99,
-            ambiguous=False,
-            alternatives=(),
-            need_human_review=False,
+        source_line = next(
+            line for line in user_prompt.splitlines() if line.startswith("source_key: ")
         )
+        return self.semantics.get(source_line.removeprefix("source_key: "))
+
+
+class _FixedTopologyResolver:
+    """返回固定拓扑并记录解析次数。"""
+
+    def __init__(self, topology: RobotCameraTopology | None) -> None:
+        self.topology = topology
+        self.call_count = 0
+        self.last_error = None
+        self.last_error_code = None
+        self.last_error_evidence: dict[str, object] = {}
+
+    def resolve(self, robot_id: str) -> RobotCameraTopology | None:
+        self.call_count += 1
+        return self.topology
 
 
 class CameraNormalizerTest(unittest.TestCase):
@@ -83,7 +96,7 @@ class CameraNormalizerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_replaces_deterministic_camera_keys_and_preserves_feature_values(self) -> None:
+    def test_does_not_rename_ambiguous_source_tokens_without_evidence(self) -> None:
         source_info = self._info(
             {
                 "observation.images.image_left": {
@@ -102,16 +115,15 @@ class CameraNormalizerTest(unittest.TestCase):
         result = normalize_cameras(self.candidate, source_info)
 
         features = result.normalized_info["features"]
-        self.assertNotIn("observation.images.image_left", features)
-        self.assertEqual(
-            features["observation.images.cam_left_rgb"]["shape"], [480, 640, 3]
-        )
-        self.assertEqual(features["observation.images.cam_left_rgb"]["codec"], "av1")
-        self.assertEqual(
-            features["observation.images.cam_top_depth"]["codec"], "ffv1"
-        )
+        self.assertIn("observation.images.image_left", features)
+        self.assertIn("observation.images.image_top_depth", features)
+        self.assertEqual(features["observation.images.image_left"]["codec"], "av1")
+        self.assertEqual(features["observation.images.image_top_depth"]["codec"], "ffv1")
         self.assertEqual(result.normalized_info["fps"], 30)
-        self.assertEqual(result.camera_review_items, ())
+        self.assertEqual(
+            {item.evidence["inference_level"] for item in result.camera_review_items},
+            {"UNRESOLVED"},
+        )
         self.assertEqual(source_info, original_info)
 
     def test_keeps_unknown_camera_and_creates_review_item(self) -> None:
@@ -122,13 +134,15 @@ class CameraNormalizerTest(unittest.TestCase):
 
         self.assertIn("observation.images.camera_1", result.normalized_info["features"])
         self.assertEqual(len(result.camera_review_items), 1)
-        self.assertEqual(result.camera_review_items[0].reason_code, "UNKNOWN_CAMERA_NAME")
+        self.assertEqual(result.camera_review_items[0].reason_code, "CAMERA_NAME_UNRESOLVED")
+        self.assertEqual(result.camera_review_items[0].evidence["inference_level"], "UNRESOLVED")
         self.assertEqual(result.camera_review_items[0].source_key, "observation.images.camera_1")
 
-    def test_keeps_unverified_airbot_camera_despite_confident_vlm(self) -> None:
-        source_key = "observation.images.cam_third_view"
+    def test_confirms_airbot_head_camera_from_topology_and_local_frames(self) -> None:
+        source_key = "observation.images.cam_high_rgb"
         candidate = self._candidate_with_media(source_key)
-        classifier = _ConfidentClassifier()
+        classifier = _FixedClassifier({source_key: self._head_semantics()})
+        resolver = _FixedTopologyResolver(self._airbot_topology())
         identity = RobotIdentity(
             "airbot_mmk2", "info.robot_type", "Airbot_MMK2"
         )
@@ -148,30 +162,25 @@ class CameraNormalizerTest(unittest.TestCase):
                 ),
                 robot_identity=identity,
                 vlm_classifier=classifier,
+                topology_resolver=resolver,
             )
 
-        feature = result.normalized_info["features"][source_key]
+        features = result.normalized_info["features"]
+        self.assertNotIn(source_key, features)
+        feature = features["observation.images.cam_head_rgb"]
         self.assertEqual(feature["codec"], "av1")
         self.assertNotIn(
-            "observation.images.cam_top_side_rgb",
-            result.normalized_info["features"],
+            "CAMERA_NAME_INFERRED",
+            {item.reason_code for item in result.camera_review_items},
         )
-        review = next(
-            item
-            for item in result.camera_review_items
-            if item.reason_code == "ROBOT_CAMERA_MAPPING_UNKNOWN"
-        )
-        self.assertEqual(review.source_key, source_key)
-        self.assertEqual(
-            review.candidates[0].target_key,
-            "observation.images.cam_top_side_rgb",
-        )
-        self.assertEqual(review.evidence["robot_id"], "airbot_mmk2")
+        self.assertEqual(resolver.call_count, 1)
 
-    def test_keeps_unknown_camera_for_identified_robot_without_registry(self) -> None:
-        source_key = "observation.images.external_camera"
+    def test_image_left_can_be_inferred_as_an_external_camera(self) -> None:
+        source_key = "observation.images.image_left"
         candidate = self._candidate_with_media(source_key)
-        classifier = _ConfidentClassifier()
+        classifier = _FixedClassifier(
+            {source_key: self._external_left_semantics()}
+        )
         media = MediaInfo("av1", 30.0, 640, 480, 2.0, 60, "yuv420p")
 
         with (
@@ -186,23 +195,52 @@ class CameraNormalizerTest(unittest.TestCase):
                 self._info(
                     {source_key: {"dtype": "video", "shape": [480, 640, 3]}}
                 ),
-                robot_identity=RobotIdentity(
-                    "franka", "common_record.machine_id", "CFvFyRtw8T1_franka"
-                ),
                 vlm_classifier=classifier,
             )
 
-        self.assertIn(source_key, result.normalized_info["features"])
-        self.assertNotIn(
-            "observation.images.cam_top_side_rgb",
-            result.normalized_info["features"],
+        self.assertIn(
+            "observation.images.cam_left_rgb", result.normalized_info["features"]
         )
         review = next(
             item
             for item in result.camera_review_items
-            if item.reason_code == "ROBOT_CAMERA_MAPPING_UNKNOWN"
+            if item.reason_code == "CAMERA_NAME_INFERRED"
         )
-        self.assertEqual(review.evidence["robot_id"], "franka")
+        self.assertEqual(review.evidence["inference_level"], "INFERRED")
+        self.assertEqual(review.evidence["local_semantics"]["mount_type"], "external")
+
+    def test_image_left_can_be_confirmed_as_a_left_wrist_camera(self) -> None:
+        source_key = "observation.images.image_left"
+        candidate = self._candidate_with_media(source_key)
+        classifier = _FixedClassifier({source_key: self._left_wrist_semantics()})
+        topology = RobotCameraTopology(
+            "test_robot",
+            (CameraMount("on_robot", ("left",), "wrist"),),
+            0.97,
+            False,
+        )
+        media = MediaInfo("av1", 30.0, 640, 480, 2.0, 60, "yuv420p")
+
+        with (
+            patch("robometanorm.camera.normalizer.probe_media", return_value=media),
+            patch("robometanorm.camera.normalizer.extract_rgb_frames", return_value=()),
+        ):
+            result = normalize_cameras(
+                candidate,
+                self._info({source_key: {"dtype": "video", "shape": [480, 640, 3]}}),
+                robot_identity=RobotIdentity("test_robot", "info.robot_type", "test_robot"),
+                vlm_classifier=classifier,
+                topology_resolver=_FixedTopologyResolver(topology),
+            )
+
+        self.assertIn(
+            "observation.images.cam_left_wrist_rgb",
+            result.normalized_info["features"],
+        )
+        self.assertNotIn(
+            "CAMERA_NAME_INFERRED",
+            {item.reason_code for item in result.camera_review_items},
+        )
 
     def test_applies_codec_to_unresolved_rgb_without_vlm(self) -> None:
         source_key = "observation.images.cam_high_rgb"
@@ -222,20 +260,129 @@ class CameraNormalizerTest(unittest.TestCase):
             result.normalized_info["features"][source_key]["codec"], "av1"
         )
         self.assertEqual(
-            result.camera_review_items[0].reason_code,
-            "ROBOT_CAMERA_MAPPING_UNKNOWN",
+            result.camera_review_items[0].reason_code, "CAMERA_NAME_UNRESOLVED"
         )
 
-    def test_keeps_all_sources_when_target_names_collide(self) -> None:
+    def test_topology_alone_does_not_rename_a_camera(self) -> None:
+        source_key = "observation.images.cam_high_rgb"
+
+        result = normalize_cameras(
+            self.candidate,
+            self._info({source_key: {"dtype": "video", "shape": [480, 640, 3]}}),
+            robot_identity=RobotIdentity("airbot_mmk2", "info.robot_type", "Airbot_MMK2"),
+            topology_resolver=_FixedTopologyResolver(self._airbot_topology()),
+        )
+
+        self.assertIn(source_key, result.normalized_info["features"])
+        self.assertEqual(result.camera_review_items[0].evidence["inference_level"], "UNRESOLVED")
+
+    def test_skips_topology_lookup_when_all_camera_names_are_standard(self) -> None:
+        resolver = _FixedTopologyResolver(self._airbot_topology())
+
         result = normalize_cameras(
             self.candidate,
             self._info(
                 {
-                    "observation.images.image_left": {"dtype": "video"},
-                    "observation.images.camera_left": {"dtype": "video"},
+                    "observation.images.cam_left_wrist_rgb": {
+                        "dtype": "video",
+                        "shape": [480, 640, 3],
+                    }
                 }
             ),
+            robot_identity=RobotIdentity(
+                "airbot_mmk2", "info.robot_type", "Airbot_MMK2"
+            ),
+            topology_resolver=resolver,
         )
+
+        self.assertEqual(resolver.call_count, 0)
+        self.assertIn(
+            "observation.images.cam_left_wrist_rgb",
+            result.normalized_info["features"],
+        )
+
+    def test_does_not_break_a_tie_between_identical_weak_hints(self) -> None:
+        source_keys = (
+            "observation.images.image_left",
+            "observation.images.camera_left",
+        )
+        topology = RobotCameraTopology(
+            "test_robot",
+            (
+                CameraMount("on_robot", ("left",), "wrist"),
+                CameraMount("on_robot", ("right",), "wrist"),
+            ),
+            0.96,
+            False,
+        )
+
+        result = normalize_cameras(
+            self.candidate,
+            self._info(
+                {
+                    source_key: {"dtype": "video", "shape": [480, 640, 3]}
+                    for source_key in source_keys
+                }
+            ),
+            robot_identity=RobotIdentity(
+                "test_robot", "info.robot_type", "test_robot"
+            ),
+            topology_resolver=_FixedTopologyResolver(topology),
+        )
+
+        self.assertTrue(
+            set(source_keys).issubset(result.normalized_info["features"])
+        )
+        self.assertEqual(
+            {
+                item.evidence["inference_level"]
+                for item in result.camera_review_items
+            },
+            {"UNRESOLVED"},
+        )
+
+    def test_infers_the_only_remaining_topology_slot_from_other_cameras(self) -> None:
+        source_key = "observation.images.cam_high_rgb"
+        features = {
+            source_key: {"dtype": "video", "shape": [480, 640, 3]},
+            "observation.images.cam_left_wrist_rgb": {"dtype": "video", "shape": [480, 640, 3]},
+            "observation.images.cam_right_wrist_rgb": {"dtype": "video", "shape": [480, 640, 3]},
+        }
+
+        result = normalize_cameras(
+            self.candidate,
+            self._info(features),
+            robot_identity=RobotIdentity("airbot_mmk2", "info.robot_type", "Airbot_MMK2"),
+            topology_resolver=_FixedTopologyResolver(self._airbot_topology()),
+        )
+
+        self.assertIn("observation.images.cam_head_rgb", result.normalized_info["features"])
+        review = next(
+            item for item in result.camera_review_items if item.reason_code == "CAMERA_NAME_INFERRED"
+        )
+        self.assertEqual(review.source_key, source_key)
+        self.assertEqual(review.evidence["inference_level"], "INFERRED")
+        self.assertEqual(review.evidence["reason"], "unique_remaining_topology_slot")
+
+    def test_keeps_all_sources_when_target_names_collide(self) -> None:
+        source_keys = (
+            "observation.images.image_left",
+            "observation.images.camera_left",
+        )
+        candidate = self._candidate_with_media(*source_keys)
+        classifier = _FixedClassifier(
+            {source_key: self._external_left_semantics() for source_key in source_keys}
+        )
+        media = MediaInfo("av1", 30.0, 640, 480, 2.0, 60, "yuv420p")
+        with (
+            patch("robometanorm.camera.normalizer.probe_media", return_value=media),
+            patch("robometanorm.camera.normalizer.extract_rgb_frames", return_value=()),
+        ):
+            result = normalize_cameras(
+                candidate,
+                self._info({source_key: {"dtype": "video"} for source_key in source_keys}),
+                vlm_classifier=classifier,
+            )
 
         features = result.normalized_info["features"]
         self.assertIn("observation.images.image_left", features)
@@ -293,10 +440,11 @@ class CameraNormalizerTest(unittest.TestCase):
             ["observation.images.image_top"],
         )
 
-    def _candidate_with_media(self, media_key: str) -> DatasetCandidate:
-        media_directory = self.dataset_path / "videos" / media_key
-        media_directory.mkdir(parents=True, exist_ok=True)
-        (media_directory / "episode_000000.mp4").touch()
+    def _candidate_with_media(self, *media_keys: str) -> DatasetCandidate:
+        for media_key in media_keys:
+            media_directory = self.dataset_path / "videos" / media_key
+            media_directory.mkdir(parents=True, exist_ok=True)
+            (media_directory / "episode_000000.mp4").touch()
         return DatasetCandidate(
             dataset_name="dataset_001",
             task_name=None,
@@ -311,6 +459,37 @@ class CameraNormalizerTest(unittest.TestCase):
     @staticmethod
     def _info(features: dict[str, object]) -> dict[str, object]:
         return {"fps": 30, "features": copy.deepcopy(features)}
+
+    @staticmethod
+    def _head_semantics() -> CameraSemantics:
+        return CameraSemantics(
+            "rgb", "on_robot", (), "head", True, 0.97, False, (), False
+        )
+
+    @staticmethod
+    def _left_wrist_semantics() -> CameraSemantics:
+        return CameraSemantics(
+            "rgb", "on_robot", ("left",), "wrist", False, 0.97, False, (), False
+        )
+
+    @staticmethod
+    def _external_left_semantics() -> CameraSemantics:
+        return CameraSemantics(
+            "rgb", "external", ("left",), None, False, 0.96, False, (), False
+        )
+
+    @staticmethod
+    def _airbot_topology() -> RobotCameraTopology:
+        return RobotCameraTopology(
+            "airbot_mmk2",
+            (
+                CameraMount("on_robot", (), "head"),
+                CameraMount("on_robot", ("left",), "wrist"),
+                CameraMount("on_robot", ("right",), "wrist"),
+            ),
+            0.96,
+            False,
+        )
 
 
 if __name__ == "__main__":

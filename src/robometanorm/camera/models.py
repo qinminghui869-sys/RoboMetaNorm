@@ -6,6 +6,25 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class CameraMount:
+    """相机安装类别、方位与本体部位。"""
+
+    mount_type: str
+    direction_tokens: tuple[str, ...]
+    body_part: str | None
+
+
+@dataclass(frozen=True)
+class RobotCameraTopology:
+    """联网查询并通过严格 schema 校验的机器人本体相机拓扑。"""
+
+    robot_id: str
+    camera_mounts: tuple[CameraMount, ...]
+    confidence: float
+    ambiguous: bool
+
+
+@dataclass(frozen=True)
 class CameraNameProposal:
     """由确定性规则得到的相机目标名称建议。"""
 
@@ -14,6 +33,7 @@ class CameraNameProposal:
     modality: str
     method: str
     confidence: float = 1.0
+    inference_level: str = "CONFIRMED"
 
 
 @dataclass(frozen=True)

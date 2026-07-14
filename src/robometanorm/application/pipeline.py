@@ -13,6 +13,7 @@ from robometanorm.adapters.filesystem import discover_datasets
 from robometanorm.application.preconditions import check_preconditions
 from robometanorm.camera.normalizer import normalize_cameras
 from robometanorm.camera.media import extract_rgb_frame_at, find_camera_media
+from robometanorm.camera.topology import RobotCameraTopologyResolver
 from robometanorm.camera.vlm import VlmClassifier
 from robometanorm.domain.models import (
     DatasetCandidate,
@@ -76,6 +77,7 @@ def normalize_datasets(
     layout: LayoutType = LayoutType.AUTO,
     *,
     vlm_classifier: VlmClassifier | None = None,
+    camera_topology_resolver: RobotCameraTopologyResolver | None = None,
     machine_vlm_resolver: MachineVlmResolver | None = None,
     gripper_direction_resolver: GripperDirectionResolver | None = None,
     confidence_threshold: float = 0.85,
@@ -96,6 +98,7 @@ def normalize_datasets(
                 result.source_info,
                 robot_identity=robot_identity,
                 vlm_classifier=vlm_classifier,
+                topology_resolver=camera_topology_resolver,
                 confidence_threshold=confidence_threshold,
             )
             parquet_paths = _representative_parquet_paths(result.candidate)

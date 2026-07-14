@@ -162,7 +162,7 @@ class CameraMediaTest(unittest.TestCase):
         semantics = parse_vlm_semantics(
             {
                 "modality": "rgb",
-                "mount_type": "body",
+                "mount_type": "on_robot",
                 "direction_tokens": ["left"],
                 "body_part": "wrist",
                 "is_primary": False,
@@ -185,7 +185,7 @@ class CameraMediaTest(unittest.TestCase):
     def test_normalizes_safe_unknown_sentinels_but_rejects_unknown_tokens(self) -> None:
         payload = {
             "modality": "rgb",
-            "mount_type": "fixed",
+            "mount_type": "external",
             "direction_tokens": ["unknown"],
             "body_part": "unknown",
             "is_primary": False,
@@ -208,22 +208,44 @@ class CameraMediaTest(unittest.TestCase):
             parse_vlm_semantics({**payload, "modality": ["rgb"]})
         self.assertEqual(caught.exception.field, "modality")
 
-    def test_vlm_mount_type_does_not_restrict_semantic_parsing(self) -> None:
-        semantics = parse_vlm_semantics(
-            {
-                "modality": "rgb",
-                "mount_type": "fixed",
-                "direction_tokens": ["left"],
-                "body_part": None,
-                "is_primary": False,
-                "confidence": 0.94,
-                "ambiguous": False,
-                "alternatives": [],
-                "need_human_review": False,
-            }
-        )
+    def test_vlm_mount_type_uses_the_embedded_camera_standard(self) -> None:
+        payload = {
+            "modality": "rgb",
+            "mount_type": "external",
+            "direction_tokens": ["left"],
+            "body_part": None,
+            "is_primary": False,
+            "confidence": 0.94,
+            "ambiguous": False,
+            "alternatives": [],
+            "need_human_review": False,
+        }
 
-        self.assertEqual(semantics.mount_type, "fixed")
+        semantics = parse_vlm_semantics(payload)
+
+        self.assertEqual(semantics.mount_type, "external")
+        with self.assertRaises(CameraSemanticsValidationError) as caught:
+            parse_vlm_semantics({**payload, "mount_type": "fixed"})
+        self.assertEqual(caught.exception.field, "mount_type")
+        with self.assertRaises(CameraSemanticsValidationError) as caught:
+            parse_vlm_semantics(
+                {
+                    **payload,
+                    "mount_type": "external",
+                    "body_part": "wrist",
+                }
+            )
+        self.assertEqual(caught.exception.field, "body_part")
+        with self.assertRaises(CameraSemanticsValidationError) as caught:
+            parse_vlm_semantics(
+                {
+                    **payload,
+                    "mount_type": "on_robot",
+                    "direction_tokens": ["env"],
+                    "body_part": "head",
+                }
+            )
+        self.assertEqual(caught.exception.field, "direction_tokens")
 
 
 if __name__ == "__main__":

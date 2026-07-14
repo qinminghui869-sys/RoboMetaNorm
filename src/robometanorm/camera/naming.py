@@ -4,52 +4,25 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
-import re
 
-from robometanorm.camera.models import CameraNameProposal
+from robometanorm.camera.models import CameraMount, CameraNameProposal
 
 
-CAMERA_NAME_MAP = {
-    "observation.images.image_left": "observation.images.cam_left_rgb",
-    "observation.images.image_right": "observation.images.cam_right_rgb",
-    "observation.images.image_top": "observation.images.cam_top_rgb",
-    "observation.images.image_wrist": "observation.images.cam_wrist_rgb",
-    "observation.images.image_wrist_left": "observation.images.cam_left_wrist_rgb",
-    "observation.images.image_wrist_right": "observation.images.cam_right_wrist_rgb",
-    "observation.images.image_top_depth": "observation.images.cam_top_depth",
-    "observation.images.image_left_depth": "observation.images.cam_left_depth",
-    "observation.images.image_right_depth": "observation.images.cam_right_depth",
-    "observation.images.image_wrist_depth": "observation.images.cam_wrist_depth",
+_DUAL_WRIST_CAMERA_ALIASES = {
+    "observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb",
+    "observation.images.cam_right_wrist_rgb": "observation.images.cam_right_wrist_rgb",
 }
 
 ROBOT_CAMERA_NAME_MAPS = {
-    "airbot_mmk2": {
-        "observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb",
-        "observation.images.cam_right_wrist_rgb": "observation.images.cam_right_wrist_rgb",
-    },
-    "agilex_cobot_magic": {
-        "observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb",
-        "observation.images.cam_right_wrist_rgb": "observation.images.cam_right_wrist_rgb",
-    },
+    "airbot_mmk2": _DUAL_WRIST_CAMERA_ALIASES,
+    "agilex_cobot_magic": _DUAL_WRIST_CAMERA_ALIASES,
     "galaxea": {
         "observation.images.image_top_left": "observation.images.cam_top_left_rgb",
         "observation.images.image_top_right": "observation.images.cam_top_right_rgb",
         "observation.images.image_wrist_left": "observation.images.cam_left_wrist_rgb",
         "observation.images.image_wrist_right": "observation.images.cam_right_wrist_rgb",
     },
-    "galaxea_r1_lite": {
-        "observation.images.image_top_left": "observation.images.cam_top_left_rgb",
-        "observation.images.image_top_right": "observation.images.cam_top_right_rgb",
-        "observation.images.image_wrist_left": "observation.images.cam_left_wrist_rgb",
-        "observation.images.image_wrist_right": "observation.images.cam_right_wrist_rgb",
-    },
     "galbot": {
-        "observation.images.image_head_right": "observation.images.cam_right_head_rgb",
-        "observation.images.image_head_left": "observation.images.cam_left_head_rgb",
-        "observation.images.image_arm_right": "observation.images.cam_right_arm_rgb",
-        "observation.images.image_arm_left": "observation.images.cam_left_arm_rgb",
-    },
-    "galbot_g1": {
         "observation.images.image_head_right": "observation.images.cam_right_head_rgb",
         "observation.images.image_head_left": "observation.images.cam_left_head_rgb",
         "observation.images.image_arm_right": "observation.images.cam_right_arm_rgb",
@@ -69,71 +42,115 @@ ROBOT_CAMERA_NAME_MAPS = {
     },
 }
 
-EXTERNAL_DIRECTION_TOKENS = frozenset(
-    {"front", "rear", "left", "right", "upper", "lower", "middle", "top", "side", "global", "env"}
+_ROBOT_CAMERA_MAP_ALIASES = {
+    "galaxea_r1_lite": "galaxea",
+    "galbot_g1": "galbot",
+}
+
+MOUNT_TYPES = frozenset({"on_robot", "external"})
+ON_ROBOT_DIRECTION_TOKENS = frozenset(
+    {"front", "rear", "left", "right", "upper", "lower", "middle"}
 )
+EXTERNAL_DIRECTION_TOKENS = frozenset(
+    {"front", "rear", "left", "right", "upper", "lower", "top", "side", "global", "env"}
+)
+DIRECTION_TOKENS = ON_ROBOT_DIRECTION_TOKENS | EXTERNAL_DIRECTION_TOKENS | {"ego"}
 BODY_PART_TOKENS = frozenset(
-    {"wrist", "head", "chest", "arm", "leg", "torso", "fisheye", "ego"}
+    {"wrist", "head", "chest", "arm", "leg", "torso", "fisheye"}
 )
 _TOKEN_GROUPS = (
     ("front", "rear"),
     ("upper", "lower", "middle", "top"),
     ("left", "right", "side"),
+    ("global", "env"),
 )
 
 
 def build_camera_key(
-    direction_tokens: Iterable[str], body_part: str | None, modality: str
+    mount_type: str,
+    direction_tokens: Iterable[str],
+    body_part: str | None,
+    modality: str,
 ) -> str | None:
-    """用前后、垂直、左右、本体部位、模态的顺序生成字段名。"""
+    """按内置的本体/外部相机规范生成字段名。"""
     tokens = set(direction_tokens)
-    if modality not in {"rgb", "depth"}:
+    if mount_type not in MOUNT_TYPES or modality not in {"rgb", "depth"}:
         return None
-    if not tokens.issubset(EXTERNAL_DIRECTION_TOKENS):
-        return None
-    if body_part is not None and body_part not in BODY_PART_TOKENS:
+    if mount_type == "on_robot":
+        if tokens == {"ego"} and body_part is None:
+            return f"observation.images.cam_ego_{modality}"
+        if (
+            body_part not in BODY_PART_TOKENS
+            or not tokens.issubset(ON_ROBOT_DIRECTION_TOKENS)
+        ):
+            return None
+    elif body_part is not None or not tokens or not tokens.issubset(
+        EXTERNAL_DIRECTION_TOKENS
+    ):
         return None
 
+    ordered_tokens = _ordered_direction_tokens(tokens)
+    if ordered_tokens is None:
+        return None
+    if body_part:
+        ordered_tokens.append(body_part)
+    return "observation.images.cam_" + "_".join([*ordered_tokens, modality])
+
+
+def propose_camera_name(source_key: str) -> CameraNameProposal | None:
+    """仅确认已经严格符合内置规范的相机字段。"""
+    parsed = parse_standard_camera_key(source_key)
+    if parsed is None:
+        return None
+    _, modality = parsed
+    return CameraNameProposal(
+        source_key=source_key,
+        target_key=source_key,
+        modality=modality,
+        method="standard",
+    )
+
+
+def parse_standard_camera_key(source_key: str) -> tuple[CameraMount, str] | None:
+    """解析严格符合规范的字段，含糊或非法名称返回空。"""
+    prefix = "observation.images.cam_"
+    if not source_key.startswith(prefix):
+        return None
+    tokens = source_key[len(prefix) :].split("_")
+    if len(tokens) < 2 or tokens[-1] not in {"rgb", "depth"}:
+        return None
+    modality = tokens[-1]
+    position_tokens = tokens[:-1]
+    if position_tokens == ["ego"]:
+        mount = CameraMount("on_robot", ("ego",), None)
+    elif position_tokens[-1] in BODY_PART_TOKENS:
+        mount = CameraMount(
+            "on_robot", tuple(position_tokens[:-1]), position_tokens[-1]
+        )
+    else:
+        mount = CameraMount("external", tuple(position_tokens), None)
+    if (
+        build_camera_key(
+            mount.mount_type,
+            mount.direction_tokens,
+            mount.body_part,
+            modality,
+        )
+        != source_key
+    ):
+        return None
+    return mount, modality
+
+
+def _ordered_direction_tokens(tokens: set[str]) -> list[str] | None:
+    """按前后、垂直、左右、全局语义稳定排序。"""
     ordered_tokens: list[str] = []
     for group in _TOKEN_GROUPS:
         selected = [token for token in group if token in tokens]
         if len(selected) > 1:
             return None
         ordered_tokens.extend(selected)
-    if body_part:
-        ordered_tokens.append(body_part)
-    if not ordered_tokens:
-        return None
-    return "observation.images.cam_" + "_".join([*ordered_tokens, modality])
-
-
-def propose_camera_name(source_key: str) -> CameraNameProposal | None:
-    """为相机源字段生成确定性目标名，无法判断时返回空。"""
-    target_key = CAMERA_NAME_MAP.get(source_key)
-    if target_key:
-        return CameraNameProposal(
-            source_key=source_key,
-            target_key=target_key,
-            modality=_modality_from_target(target_key),
-            method="exact",
-        )
-
-    field_name = source_key.rsplit(".", maxsplit=1)[-1].lower()
-    tokens = [token for token in re.split(r"[^a-z0-9]+", field_name) if token]
-    direction_tokens = [token for token in tokens if token in EXTERNAL_DIRECTION_TOKENS]
-    body_parts = [token for token in tokens if token in BODY_PART_TOKENS]
-    if len(set(body_parts)) > 1:
-        return None
-    modality = "depth" if "depth" in tokens else "rgb"
-    target_key = build_camera_key(direction_tokens, body_parts[0] if body_parts else None, modality)
-    if target_key is None:
-        return None
-    return CameraNameProposal(
-        source_key=source_key,
-        target_key=target_key,
-        modality=modality,
-        method="regex",
-    )
+    return ordered_tokens if len(ordered_tokens) == len(tokens) else None
 
 
 def propose_robot_camera_name(
@@ -142,7 +159,8 @@ def propose_robot_camera_name(
     """从已验证的机器人级别名生成相机名称。"""
     if robot_id is None:
         return None
-    target_key = ROBOT_CAMERA_NAME_MAPS.get(robot_id, {}).get(source_key)
+    mapping_id = _ROBOT_CAMERA_MAP_ALIASES.get(robot_id, robot_id)
+    target_key = ROBOT_CAMERA_NAME_MAPS.get(mapping_id, {}).get(source_key)
     if target_key is None:
         return None
     return CameraNameProposal(

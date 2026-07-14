@@ -47,12 +47,30 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
                 "http://localhost/v1", "test", None, api_key_env="P1_VLM_KEY"
             )
             fallback = OpenAICompatibleVlmClassifier(
-                "http://localhost/v1", "test", None, api_key_env="MISSING_KEY"
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "test",
+                None,
             )
 
         self.assertEqual(explicit.api_key, "explicit")
         self.assertEqual(configured.api_key, "configured")
         self.assertEqual(fallback.api_key, "dashscope")
+
+    def test_dashscope_endpoint_never_falls_back_to_openai_api_key(self) -> None:
+        with patch.dict(
+            os.environ, {"OPENAI_API_KEY": "openai-secret"}, clear=True
+        ):
+            dashscope = OpenAICompatibleVlmClassifier(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "qwen3.7-plus",
+                None,
+            )
+            openai = OpenAICompatibleVlmClassifier(
+                "https://api.openai.com/v1", "test-model", None
+            )
+
+        self.assertEqual(dashscope.api_key, "")
+        self.assertEqual(openai.api_key, "openai-secret")
 
     def test_retries_transient_http_error_and_extracts_embedded_json(self) -> None:
         response = _Response(
@@ -61,7 +79,7 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
                     {
                         "message": {
                             "content": "识别结果：\n```json\n"
-                            '{"modality":"rgb","mount_type":"body",'
+                            '{"modality":"rgb","mount_type":"on_robot",'
                             '"direction_tokens":["left"],"body_part":"wrist",'
                             '"is_primary":false,"confidence":0.94,"ambiguous":false,'
                             '"alternatives":[],"need_human_review":false}\n```'
@@ -135,7 +153,7 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
         )
         response_payload = {
             "modality": "rgb",
-            "mount_type": "fixed",
+            "mount_type": "external",
             "direction_tokens": ["high"],
             "body_part": None,
             "is_primary": False,
@@ -157,6 +175,66 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
             client.last_error_evidence,
             {"field": "direction_tokens", "value": ["high"]},
         )
+
+    def test_missing_api_key_fails_without_sending_a_request(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            client = OpenAICompatibleVlmClassifier(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "qwen3.7-plus",
+                None,
+                api_key_env="DASHSCOPE_API_KEY",
+            )
+
+        with (
+            patch("robometanorm.camera.vlm.request.urlopen") as urlopen,
+            patch("robometanorm.camera.vlm.logger.warning"),
+        ):
+            payload = client.request_json("system", "user", ())
+
+        self.assertIsNone(payload)
+        self.assertEqual(client.last_error_code, "VLM_CONFIG_MISSING")
+        self.assertEqual(
+            client.last_error_evidence,
+            {"api_key_env": "DASHSCOPE_API_KEY"},
+        )
+        urlopen.assert_not_called()
+
+    def test_requests_web_search_through_the_responses_api(self) -> None:
+        response = _Response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": '结果：{"robot_id":"airbot_mmk2","camera_mounts":[],"confidence":0.4,"ambiguous":true}',
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        client = OpenAICompatibleVlmClassifier(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "qwen3.7-plus",
+            "test-key",
+        )
+
+        with patch(
+            "robometanorm.camera.vlm.request.urlopen", return_value=response
+        ) as urlopen:
+            payload = client.request_web_json("system", "user")
+
+        self.assertEqual(payload["robot_id"], "airbot_mmk2")
+        http_request = urlopen.call_args.args[0]
+        self.assertEqual(
+            http_request.full_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+        )
+        request_body = json.loads(http_request.data.decode("utf-8"))
+        self.assertEqual(request_body["tools"], [{"type": "web_search"}])
+        self.assertEqual(request_body["model"], "qwen3.7-plus")
 
 
 if __name__ == "__main__":

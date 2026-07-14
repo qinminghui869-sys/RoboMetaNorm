@@ -72,9 +72,9 @@ class CliIntegrationTest(unittest.TestCase):
         source = json.loads(
             (self.dataset_path / "meta" / "info.json").read_text(encoding="utf-8")
         )
-        normalized_feature = normalized["features"]["observation.images.cam_left_rgb"]
+        normalized_feature = normalized["features"]["observation.images.image_left"]
         self.assertEqual(normalized_feature["codec"], "av1")
-        self.assertNotIn("observation.images.image_left", normalized["features"])
+        self.assertNotIn("observation.images.cam_left_rgb", normalized["features"])
         self.assertEqual(source, self.source_info)
 
     def test_airbot_keeps_unverified_camera_names_and_records_identity(self) -> None:
@@ -144,7 +144,7 @@ class CliIntegrationTest(unittest.TestCase):
         unresolved = {
             item["source_key"]
             for item in review["camera_review_items"]
-            if item["reason_code"] == "ROBOT_CAMERA_MAPPING_UNKNOWN"
+            if item["evidence"].get("inference_level") == "UNRESOLVED"
         }
         self.assertEqual(
             unresolved,
@@ -154,7 +154,22 @@ class CliIntegrationTest(unittest.TestCase):
             },
         )
 
-    def test_normalize_creates_vlm_classifier_only_when_endpoint_is_configured(self) -> None:
+    def test_normalize_uses_default_vlm_and_topology_resolver(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("robometanorm.cli.main.normalize_datasets", return_value=[]) as normalize:
+                self._run("normalize", "--root", str(self.root))
+
+        classifier = normalize.call_args.kwargs["vlm_classifier"]
+        self.assertIsInstance(classifier, OpenAICompatibleVlmClassifier)
+        self.assertEqual(
+            classifier.endpoint,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        self.assertEqual(classifier.model, "qwen3.7-plus")
+        self.assertEqual(classifier.api_key_env, "DASHSCOPE_API_KEY")
+        self.assertIsNotNone(normalize.call_args.kwargs["camera_topology_resolver"])
+
+    def test_normalize_allows_explicit_vlm_overrides(self) -> None:
         with patch.dict(os.environ, {"P1_TEST_VLM_KEY": "test-key"}):
             with patch("robometanorm.cli.main.normalize_datasets", return_value=[]) as normalize:
                 self._run(
@@ -186,6 +201,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertEqual(classifier.max_retries, 3)
         self.assertEqual(classifier.retry_backoff_seconds, 0.5)
         self.assertEqual(classifier.max_tokens, 2048)
+        self.assertIsNotNone(normalize.call_args.kwargs["camera_topology_resolver"])
 
     def test_normalize_applies_safe_p2_machine_names_from_parquet(self) -> None:
         info = {

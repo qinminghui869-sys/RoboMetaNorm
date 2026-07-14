@@ -236,14 +236,7 @@ class MachineVlmResolver(Protocol):
     """可替换的机器字段语义解析器。"""
 
     def resolve(self, evidence: Mapping[str, object]) -> MachineSemantics | None:
-        """返回机器语义；禁用时返回空，启用但失败时抛出脱敏异常。"""
-
-
-class DisabledMachineVlmResolver:
-    """默认不调用外部 VLM。"""
-
-    def resolve(self, evidence: Mapping[str, object]) -> MachineSemantics | None:
-        return None
+        """返回机器语义；无法判断时返回空，传输失败时抛出脱敏异常。"""
 
 
 class GripperDirectionResolver(Protocol):

@@ -9,6 +9,10 @@ from pathlib import Path
 import sys
 
 from robometanorm.application.pipeline import normalize_datasets, scan_datasets
+from robometanorm.camera.topology import (
+    OpenAICompatibleRobotCameraTopologyResolver,
+    RobotCameraTopologyResolver,
+)
 from robometanorm.camera.vlm import OpenAICompatibleVlmClassifier, VlmClassifier
 from robometanorm.domain.models import DatasetResult, LayoutType
 from robometanorm.machine.vlm import (
@@ -16,6 +20,11 @@ from robometanorm.machine.vlm import (
     OpenAICompatibleMachineVlmResolver,
 )
 from robometanorm.machine.models import ProfileProgress
+
+
+DEFAULT_VLM_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_VLM_MODEL = "qwen3.7-plus"
+DEFAULT_VLM_API_KEY_ENV = "DASHSCOPE_API_KEY"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -32,6 +41,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.root,
                 layout,
                 vlm_classifier=vlm_classifier,
+                camera_topology_resolver=_build_camera_topology_resolver(
+                    vlm_classifier
+                ),
                 machine_vlm_resolver=_build_machine_vlm_resolver(vlm_classifier),
                 gripper_direction_resolver=_build_gripper_direction_resolver(
                     vlm_classifier
@@ -62,13 +74,18 @@ def _build_parser() -> argparse.ArgumentParser:
         if command == "normalize":
             command_parser.add_argument(
                 "--vlm-endpoint",
-                help="可选的 OpenAI-compatible VLM 服务地址；未提供时不调用 VLM",
+                default=DEFAULT_VLM_ENDPOINT,
+                help=f"OpenAI-compatible VLM 服务地址，默认 {DEFAULT_VLM_ENDPOINT}",
             )
-            command_parser.add_argument("--vlm-model", help="VLM 模型名称")
+            command_parser.add_argument(
+                "--vlm-model",
+                default=DEFAULT_VLM_MODEL,
+                help=f"VLM 模型名称，默认 {DEFAULT_VLM_MODEL}",
+            )
             command_parser.add_argument(
                 "--vlm-api-key-env",
-                default="OPENAI_API_KEY",
-                help="保存 VLM API Key 的环境变量名，默认 OPENAI_API_KEY",
+                default=DEFAULT_VLM_API_KEY_ENV,
+                help=f"保存 VLM API Key 的环境变量名，默认 {DEFAULT_VLM_API_KEY_ENV}",
             )
             command_parser.add_argument(
                 "--confidence-threshold",
@@ -105,12 +122,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _build_vlm_classifier(
     arguments: argparse.Namespace, parser: argparse.ArgumentParser
-) -> VlmClassifier | None:
-    """仅在 endpoint 和 model 同时提供时启用外部 VLM。"""
-    if not arguments.vlm_endpoint and not arguments.vlm_model:
-        return None
-    if not arguments.vlm_endpoint or not arguments.vlm_model:
-        parser.error("--vlm-endpoint 与 --vlm-model 必须同时提供")
+) -> OpenAICompatibleVlmClassifier:
+    """使用默认值或命令行覆盖构建共享 VLM 客户端。"""
     if not 0 <= arguments.confidence_threshold <= 1:
         parser.error("--confidence-threshold 必须在 0 到 1 之间")
     return OpenAICompatibleVlmClassifier(
@@ -123,6 +136,15 @@ def _build_vlm_classifier(
         retry_backoff_seconds=arguments.vlm_retry_backoff_seconds,
         max_tokens=arguments.vlm_max_tokens,
     )
+
+
+def _build_camera_topology_resolver(
+    vlm_classifier: VlmClassifier | None,
+) -> RobotCameraTopologyResolver | None:
+    """复用共享客户端，通过 Responses API 联网查询机器人拓扑。"""
+    if isinstance(vlm_classifier, OpenAICompatibleVlmClassifier):
+        return OpenAICompatibleRobotCameraTopologyResolver(vlm_classifier)
+    return None
 
 
 def _build_machine_vlm_resolver(
