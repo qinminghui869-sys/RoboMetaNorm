@@ -8,7 +8,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.camera.naming import find_colliding_sources, propose_camera_name
+from robometanorm.camera.naming import (
+    find_colliding_sources,
+    propose_camera_name,
+    propose_robot_camera_name,
+)
 
 
 class CameraNamingTest(unittest.TestCase):
@@ -31,6 +35,23 @@ class CameraNamingTest(unittest.TestCase):
             "observation.images.cam_front_left_head_rgb",
         )
         self.assertEqual(proposal.method, "regex")
+
+    def test_uses_verified_robot_camera_mapping_before_global_rules(self) -> None:
+        proposal = propose_robot_camera_name(
+            "airbot_mmk2", "observation.images.cam_left_wrist_rgb"
+        )
+
+        self.assertEqual(
+            proposal.target_key, "observation.images.cam_left_wrist_rgb"
+        )
+        self.assertEqual(proposal.method, "robot")
+
+    def test_does_not_invent_unverified_airbot_camera_mapping(self) -> None:
+        proposal = propose_robot_camera_name(
+            "airbot_mmk2", "observation.images.cam_third_view"
+        )
+
+        self.assertIsNone(proposal)
 
     def test_marks_all_sources_that_resolve_to_same_target_as_collision(self) -> None:
         left_image = propose_camera_name("observation.images.image_left")

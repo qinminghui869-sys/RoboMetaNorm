@@ -36,18 +36,25 @@ from robometanorm.machine.vlm import (
     MachineVlmResolver,
     can_apply_semantics,
 )
+from robometanorm.robot_identity import RobotIdentity, robot_identity_payload
 
 
 def normalize_machine_fields(
     source_info: Mapping[str, object],
     parquet_profile: ParquetProfile | None,
     *,
+    robot_identity: RobotIdentity | None = None,
     vlm_resolver: MachineVlmResolver | None = None,
     dataset_name: str | None = None,
     gripper_directions: Mapping[str, GripperDirectionEvidence] | None = None,
 ) -> MachineNormalizationResult:
     """只为维度、表示形式和单位均可确认的字段生成名称建议。"""
     normalized_info = deepcopy(dict(source_info))
+    robot_type_evidence: object = (
+        robot_identity_payload(robot_identity)
+        if robot_identity is not None
+        else source_info.get("robot_type") or source_info.get("root_type")
+    )
     source_features = discover_machine_features(source_info)
     out_of_scope = _find_out_of_scope_field(source_features)
     if out_of_scope is not None:
@@ -85,7 +92,7 @@ def normalize_machine_fields(
             equal_action_state=equal_action_state,
             vlm_resolver=vlm_resolver,
             dataset_name=dataset_name,
-            robot_type=source_info.get("robot_type"),
+            robot_type=robot_type_evidence,
             gripper_directions=gripper_directions,
         )
         child_normalized_names[feature_name] = normalized_names
@@ -114,7 +121,7 @@ def normalize_machine_fields(
             equal_action_state=equal_action_state,
             vlm_resolver=vlm_resolver,
             dataset_name=dataset_name,
-            robot_type=source_info.get("robot_type"),
+            robot_type=robot_type_evidence,
             gripper_directions=gripper_directions,
         )
         review_items.extend(field_reviews)
@@ -161,7 +168,7 @@ def normalize_machine_fields(
                 equal_action_state=equal_action_state,
                 vlm_resolver=vlm_resolver,
                 dataset_name=dataset_name,
-                robot_type=source_info.get("robot_type"),
+                robot_type=robot_type_evidence,
                 gripper_directions=gripper_directions,
             )
             review_items.extend(field_reviews)
@@ -750,9 +757,12 @@ def _build_vlm_evidence(
         "triplet_grouping_possible": vector_profile.triplet_grouping_possible,
         "quaternion_norm_valid": vector_profile.quaternion_norm_valid,
     }
+    identity = dict(robot_type) if isinstance(robot_type, Mapping) else None
+    canonical_id = identity.get("canonical_id") if identity is not None else robot_type
     return {
         "dataset_name": dataset_name,
-        "robot_type": robot_type if isinstance(robot_type, str) else None,
+        "robot_type": canonical_id if isinstance(canonical_id, str) else None,
+        "robot_identity": identity,
         "parent_feature": "observation.state" if feature_name.startswith("observation.state.") else feature_name,
         "source_feature": feature_name,
         "source_slice": list(source_slice) if source_slice else None,

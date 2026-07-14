@@ -77,6 +77,83 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertNotIn("observation.images.image_left", normalized["features"])
         self.assertEqual(source, self.source_info)
 
+    def test_airbot_keeps_unverified_camera_names_and_records_identity(self) -> None:
+        info = {
+            "robot_type": "Airbot_MMK2",
+            "fps": 20,
+            "features": {
+                "action": {
+                    "dtype": "float32",
+                    "shape": [2],
+                    "names": ["left_hand_joint_1_rad", "right_hand_joint_1_rad"],
+                },
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": [2],
+                    "names": ["left_hand_joint_1_rad", "right_hand_joint_1_rad"],
+                },
+                "observation.images.cam_high_rgb": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                },
+                "observation.images.cam_left_wrist_rgb": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                },
+                "observation.images.cam_right_wrist_rgb": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                },
+                "observation.images.cam_third_view": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                },
+            },
+        }
+        (self.dataset_path / "meta" / "info.json").write_text(
+            json.dumps(info), encoding="utf-8"
+        )
+        (self.dataset_path / "meta" / "common_record.json").write_text(
+            json.dumps({"machine_id": "sample_galbot_g1"}), encoding="utf-8"
+        )
+
+        self._run("normalize", "--root", str(self.root))
+
+        normalized = json.loads(
+            (self.dataset_path / "meta" / "info_norm.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        review = json.loads(
+            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        features = normalized["features"]
+        self.assertIn("observation.images.cam_high_rgb", features)
+        self.assertIn("observation.images.cam_third_view", features)
+        self.assertNotIn("observation.images.cam_front_top_rgb", features)
+        self.assertNotIn("observation.images.cam_top_side_rgb", features)
+        self.assertEqual(features["observation.images.cam_high_rgb"]["codec"], "av1")
+        self.assertEqual(features["observation.images.cam_third_view"]["codec"], "av1")
+        self.assertEqual(review["robot_identity"]["canonical_id"], "airbot_mmk2")
+        self.assertIn(
+            "ROBOT_IDENTITY_CONFLICT",
+            {item["category"] for item in review["review_items"]},
+        )
+        unresolved = {
+            item["source_key"]
+            for item in review["camera_review_items"]
+            if item["reason_code"] == "ROBOT_CAMERA_MAPPING_UNKNOWN"
+        }
+        self.assertEqual(
+            unresolved,
+            {
+                "observation.images.cam_high_rgb",
+                "observation.images.cam_third_view",
+            },
+        )
+
     def test_normalize_creates_vlm_classifier_only_when_endpoint_is_configured(self) -> None:
         with patch.dict(os.environ, {"P1_TEST_VLM_KEY": "test-key"}):
             with patch("robometanorm.cli.main.normalize_datasets", return_value=[]) as normalize:

@@ -40,6 +40,11 @@ from robometanorm.machine.rules import (
     is_out_of_scope_machine_field,
 )
 from robometanorm.machine.vlm import GripperDirectionResolver, MachineVlmResolver
+from robometanorm.robot_identity import (
+    RobotIdentity,
+    resolve_robot_identity,
+    robot_identity_payload,
+)
 from robometanorm.writers.json_writer import write_normalization_files
 
 
@@ -82,9 +87,14 @@ def normalize_datasets(
         if result.source_info is None:
             continue
         try:
+            robot_identity = resolve_robot_identity(
+                result.candidate.info_path.parent, result.source_info
+            )
+            identity_reviews = _robot_identity_reviews(robot_identity)
             camera_result = normalize_cameras(
                 result.candidate,
                 result.source_info,
+                robot_identity=robot_identity,
                 vlm_classifier=vlm_classifier,
                 confidence_threshold=confidence_threshold,
             )
@@ -110,6 +120,7 @@ def normalize_datasets(
             machine_result = normalize_machine_fields(
                 camera_result.normalized_info,
                 parquet_profile,
+                robot_identity=robot_identity,
                 vlm_resolver=machine_vlm_resolver,
                 dataset_name=result.candidate.dataset_name,
                 gripper_directions=gripper_directions,
@@ -118,10 +129,11 @@ def normalize_datasets(
                 result.status,
                 camera_result.camera_review_items,
                 machine_result.machine_review_items,
+                identity_reviews,
             )
             report = PreconditionReport(
                 status=status,
-                review_items=result.review_items,
+                review_items=(*result.review_items, *identity_reviews),
                 camera_count=result.camera_count,
                 machine_field_count=result.machine_field_count,
             )
@@ -134,11 +146,13 @@ def normalize_datasets(
                 gripper_transform_proposals=(
                     machine_result.gripper_transform_proposals
                 ),
+                robot_identity=robot_identity,
                 phase="P2",
             )
             results[index] = replace(
                 result,
                 status=status,
+                review_items=report.review_items,
                 camera_review_count=len(camera_result.camera_review_items),
                 machine_review_count=len(machine_result.machine_review_items),
             )
@@ -394,11 +408,32 @@ def _status_after_reviews(
     status: DatasetStatus,
     camera_review_items: tuple[object, ...],
     machine_review_items: tuple[object, ...],
+    identity_review_items: tuple[ReviewItem, ...] = (),
 ) -> DatasetStatus:
-    """相机或机器复核只会将 PASS 提升为 REVIEW。"""
-    if (camera_review_items or machine_review_items) and status is DatasetStatus.PASS:
+    """规范化复核只会将 PASS 提升为 REVIEW。"""
+    if (
+        camera_review_items or machine_review_items or identity_review_items
+    ) and status is DatasetStatus.PASS:
         return DatasetStatus.REVIEW
     return status
+
+
+def _robot_identity_reviews(
+    identity: RobotIdentity,
+) -> tuple[ReviewItem, ...]:
+    """将机器人身份冲突转换为通用人工复核项。"""
+    if not identity.conflicts:
+        return ()
+    return (
+        ReviewItem(
+            review_id="robot_identity_conflict",
+            category="ROBOT_IDENTITY_CONFLICT",
+            severity="confirmation",
+            reason="机器人身份元数据来源不一致，已按证据优先级选择。",
+            evidence=robot_identity_payload(identity),
+            required_action="核对机器人型号并确认采用的身份是否正确。",
+        ),
+    )
 
 
 def _read_info(candidate: DatasetCandidate) -> dict[str, object]:

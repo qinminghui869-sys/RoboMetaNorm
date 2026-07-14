@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
+import re
 import tempfile
 
 from robometanorm.camera.media import (
@@ -27,16 +28,19 @@ from robometanorm.camera.naming import (
     build_camera_key,
     find_colliding_sources,
     propose_camera_name,
+    propose_robot_camera_name,
 )
 from robometanorm.camera.vlm import CameraSemantics, VlmClassifier, build_vlm_prompt
 from robometanorm.domain.models import DatasetCandidate
 from robometanorm.episode_sampling import select_representative_episodes
+from robometanorm.robot_identity import RobotIdentity
 
 
 def normalize_cameras(
     candidate: DatasetCandidate,
     source_info: Mapping[str, object],
     *,
+    robot_identity: RobotIdentity | None = None,
     vlm_classifier: VlmClassifier | None = None,
     confidence_threshold: float = 0.85,
 ) -> CameraNormalizationResult:
@@ -45,9 +49,12 @@ def normalize_cameras(
     camera_features = discover_camera_features(source_info)
     proposals: dict[str, CameraNameProposal] = {}
     review_items: list[CameraReviewItem] = []
+    robot_id = robot_identity.canonical_id if robot_identity is not None else None
 
     for source_key, feature in camera_features.items():
-        proposal = propose_camera_name(source_key)
+        proposal = propose_robot_camera_name(robot_id, source_key)
+        if proposal is None:
+            proposal = propose_camera_name(source_key)
         if proposal is None:
             proposal, review_item = _resolve_unknown_camera(
                 candidate,
@@ -55,6 +62,7 @@ def normalize_cameras(
                 source_key,
                 feature,
                 tuple(camera_features),
+                robot_id,
                 vlm_classifier,
                 confidence_threshold,
             )
@@ -93,7 +101,19 @@ def _replace_feature_keys(
     for source_key, feature in features.items():
         proposal = proposals.get(str(source_key))
         if proposal is None:
-            normalized_features[str(source_key)] = feature
+            normalized_feature = (
+                dict(feature) if isinstance(feature, Mapping) else feature
+            )
+            modality = (
+                _infer_camera_modality(str(source_key), feature)
+                if isinstance(feature, Mapping)
+                else None
+            )
+            if isinstance(normalized_feature, dict) and modality is not None:
+                normalized_feature["codec"] = (
+                    "ffv1" if modality == "depth" else "av1"
+                )
+            normalized_features[str(source_key)] = normalized_feature
             continue
         normalized_feature = dict(feature) if isinstance(feature, Mapping) else feature
         if isinstance(normalized_feature, dict):
@@ -102,17 +122,51 @@ def _replace_feature_keys(
     normalized_info["features"] = normalized_features
 
 
+def _infer_camera_modality(
+    source_key: str, feature: Mapping[str, object]
+) -> str | None:
+    """在不判断安装位置的前提下保守推断相机模态。"""
+    info = feature.get("info")
+    video_info = info.get("video") if isinstance(info, Mapping) else None
+    if isinstance(video_info, Mapping):
+        is_depth_map = video_info.get("is_depth_map")
+        if is_depth_map is True:
+            return "depth"
+        if is_depth_map is False:
+            return "rgb"
+    tokens = set(re.findall(r"[a-z0-9]+", source_key.lower()))
+    if "depth" in tokens:
+        return "depth"
+    shape = feature.get("shape")
+    if (
+        isinstance(shape, Sequence)
+        and not isinstance(shape, (str, bytes))
+        and shape
+        and shape[-1] == 3
+    ):
+        return "rgb"
+    return None
+
+
 def _resolve_unknown_camera(
     candidate: DatasetCandidate,
     source_info: Mapping[str, object],
     source_key: str,
     feature: Mapping[str, object],
     other_camera_keys: Sequence[str],
+    robot_id: str | None,
     vlm_classifier: VlmClassifier | None,
     confidence_threshold: float,
 ) -> tuple[CameraNameProposal | None, CameraReviewItem | None]:
     """对未知字段按需抽帧请求 VLM；默认只写入复核。"""
+    robot_identity_known = robot_id is not None
     if vlm_classifier is None:
+        if robot_identity_known:
+            return None, _review(
+                source_key,
+                "ROBOT_CAMERA_MAPPING_UNKNOWN",
+                evidence={"robot_id": robot_id},
+            )
         return None, _review(source_key, "UNKNOWN_CAMERA_NAME")
     media_files = find_camera_media(candidate, source_key)
     if not media_files:
@@ -125,6 +179,7 @@ def _resolve_unknown_camera(
             source_key,
             feature,
             other_camera_keys,
+            robot_id,
             media_files,
             media,
             vlm_classifier,
@@ -133,6 +188,15 @@ def _resolve_unknown_camera(
         return None, _review(source_key, "MEDIA_UNREADABLE", evidence={"message": str(error)})
     proposal = _proposal_from_semantics(source_key, semantics, confidence_threshold)
     if proposal is not None:
+        if robot_identity_known:
+            return None, _review(
+                source_key,
+                "ROBOT_CAMERA_MAPPING_UNKNOWN",
+                candidates=(
+                    CameraReviewCandidate(proposal.target_key, proposal.confidence),
+                ),
+                evidence={"robot_id": robot_id},
+            )
         return proposal, None
     candidates: tuple[CameraReviewCandidate, ...] = ()
     if semantics is not None:
@@ -173,6 +237,7 @@ def _classify_with_two_stages(
     source_key: str,
     feature: Mapping[str, object],
     other_camera_keys: Sequence[str],
+    robot_id: str | None,
     media_files: Sequence[Path],
     media: MediaInfo,
     vlm_classifier: VlmClassifier,
@@ -180,7 +245,11 @@ def _classify_with_two_stages(
     """先少量抽帧，结果不足时按 P1 第二阶段加密抽帧。"""
     system_prompt, user_prompt = build_vlm_prompt(
         dataset_name=candidate.dataset_name,
-        robot_type=_string_or_none(source_info.get("robot_type")),
+        robot_type=(
+            robot_id
+            or _string_or_none(source_info.get("robot_type"))
+            or _string_or_none(source_info.get("root_type"))
+        ),
         source_key=source_key,
         feature=feature,
         declared_fps=source_info.get("fps"),

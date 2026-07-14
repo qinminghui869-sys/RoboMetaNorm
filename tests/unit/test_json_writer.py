@@ -21,6 +21,7 @@ from robometanorm.machine.models import (
     GripperTransformProposal,
     MachineReviewItem,
 )
+from robometanorm.robot_identity import RobotIdentity, RobotIdentityEvidence
 from robometanorm.writers.json_writer import write_normalization_files
 
 
@@ -111,6 +112,36 @@ class JsonWriterTest(unittest.TestCase):
         self.assertEqual(
             review["camera_review_items"][0]["human_decision"],
             {"status": "pending", "selected_target_key": None},
+        )
+
+    def test_writes_traceable_robot_identity_summary(self) -> None:
+        identity = RobotIdentity(
+            canonical_id="airbot_mmk2",
+            selected_source="info.robot_type",
+            selected_value="Airbot_MMK2",
+            evidence=(
+                RobotIdentityEvidence(
+                    "info.robot_type", "Airbot_MMK2", "airbot_mmk2"
+                ),
+            ),
+        )
+
+        write_normalization_files(
+            self.candidate,
+            self.info,
+            self.report,
+            robot_identity=identity,
+        )
+
+        review = json.loads(
+            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(review["robot_identity"]["canonical_id"], "airbot_mmk2")
+        self.assertEqual(
+            review["robot_identity"]["evidence"][0]["source"],
+            "info.robot_type",
         )
 
     def test_writes_p2_machine_review_items_and_promotes_status_to_review(self) -> None:

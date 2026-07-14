@@ -59,6 +59,7 @@ UNITS = frozenset({"m", "rad", "none", "unknown"})
 SYSTEM_PROMPT = """你是机器人数据集机器字段语义分类器。
 本规范只覆盖机械臂末端为夹爪的机器字段。
 灵巧手、手指关节和手部关键点不在覆盖范围；相关区段必须使用 semantic_type=unknown、standardizable=not_covered 和 need_human_review=true。
+robot_identity 是机器人平台结构的强证据，但不能覆盖实际向量维度、单位和 Parquet 数值事实。
 结构和 Parquet 数值事实优先于原始名称；名称仅为弱提示。
 不得猜测单位，不得把四元数写成欧拉角，不得默认 wrist 是 EEF，也不得把三维关键点写成关节角。
 证据不足的区段必须使用 unknown 或 need_human_review=true，不能省略任何维度。
@@ -138,6 +139,7 @@ def build_machine_prompt(evidence: Mapping[str, object]) -> tuple[str, str]:
             "请判断以下机器字段的真实语义，并只返回 JSON。",
             f"dataset_name: {evidence.get('dataset_name')}",
             f"robot_type: {evidence.get('robot_type')}",
+            f"robot_identity: {json.dumps(evidence.get('robot_identity'), ensure_ascii=False)}",
             f"parent_feature: {evidence.get('parent_feature')}",
             f"source_feature: {evidence.get('source_feature')}",
             f"source_slice: {evidence.get('source_slice')}",

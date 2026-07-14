@@ -14,7 +14,9 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.camera.media import MediaInfo
 from robometanorm.camera.normalizer import normalize_cameras
+from robometanorm.camera.vlm import CameraSemantics
 from robometanorm.domain.models import DatasetCandidate, LayoutType
+from robometanorm.robot_identity import RobotIdentity
 
 
 class _InvalidSemanticsClassifier:
@@ -32,6 +34,29 @@ class _InvalidSemanticsClassifier:
     def classify(self, system_prompt: str, user_prompt: str, image_paths: object) -> None:
         self.call_count += 1
         return None
+
+
+class _ConfidentClassifier:
+    """模拟给出高置信位置但没有机器人拓扑依据的 VLM。"""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def classify(
+        self, system_prompt: str, user_prompt: str, image_paths: object
+    ) -> CameraSemantics:
+        self.call_count += 1
+        return CameraSemantics(
+            modality="rgb",
+            mount_type=None,
+            direction_tokens=("top", "side"),
+            body_part=None,
+            is_primary=False,
+            confidence=0.99,
+            ambiguous=False,
+            alternatives=(),
+            need_human_review=False,
+        )
 
 
 class CameraNormalizerTest(unittest.TestCase):
@@ -99,6 +124,107 @@ class CameraNormalizerTest(unittest.TestCase):
         self.assertEqual(len(result.camera_review_items), 1)
         self.assertEqual(result.camera_review_items[0].reason_code, "UNKNOWN_CAMERA_NAME")
         self.assertEqual(result.camera_review_items[0].source_key, "observation.images.camera_1")
+
+    def test_keeps_unverified_airbot_camera_despite_confident_vlm(self) -> None:
+        source_key = "observation.images.cam_third_view"
+        candidate = self._candidate_with_media(source_key)
+        classifier = _ConfidentClassifier()
+        identity = RobotIdentity(
+            "airbot_mmk2", "info.robot_type", "Airbot_MMK2"
+        )
+        media = MediaInfo("av1", 30.0, 640, 480, 2.0, 60, "yuv420p")
+
+        with (
+            patch("robometanorm.camera.normalizer.probe_media", return_value=media),
+            patch(
+                "robometanorm.camera.normalizer.extract_rgb_frames",
+                return_value=(),
+            ),
+        ):
+            result = normalize_cameras(
+                candidate,
+                self._info(
+                    {source_key: {"dtype": "video", "shape": [480, 640, 3]}}
+                ),
+                robot_identity=identity,
+                vlm_classifier=classifier,
+            )
+
+        feature = result.normalized_info["features"][source_key]
+        self.assertEqual(feature["codec"], "av1")
+        self.assertNotIn(
+            "observation.images.cam_top_side_rgb",
+            result.normalized_info["features"],
+        )
+        review = next(
+            item
+            for item in result.camera_review_items
+            if item.reason_code == "ROBOT_CAMERA_MAPPING_UNKNOWN"
+        )
+        self.assertEqual(review.source_key, source_key)
+        self.assertEqual(
+            review.candidates[0].target_key,
+            "observation.images.cam_top_side_rgb",
+        )
+        self.assertEqual(review.evidence["robot_id"], "airbot_mmk2")
+
+    def test_keeps_unknown_camera_for_identified_robot_without_registry(self) -> None:
+        source_key = "observation.images.external_camera"
+        candidate = self._candidate_with_media(source_key)
+        classifier = _ConfidentClassifier()
+        media = MediaInfo("av1", 30.0, 640, 480, 2.0, 60, "yuv420p")
+
+        with (
+            patch("robometanorm.camera.normalizer.probe_media", return_value=media),
+            patch(
+                "robometanorm.camera.normalizer.extract_rgb_frames",
+                return_value=(),
+            ),
+        ):
+            result = normalize_cameras(
+                candidate,
+                self._info(
+                    {source_key: {"dtype": "video", "shape": [480, 640, 3]}}
+                ),
+                robot_identity=RobotIdentity(
+                    "franka", "common_record.machine_id", "CFvFyRtw8T1_franka"
+                ),
+                vlm_classifier=classifier,
+            )
+
+        self.assertIn(source_key, result.normalized_info["features"])
+        self.assertNotIn(
+            "observation.images.cam_top_side_rgb",
+            result.normalized_info["features"],
+        )
+        review = next(
+            item
+            for item in result.camera_review_items
+            if item.reason_code == "ROBOT_CAMERA_MAPPING_UNKNOWN"
+        )
+        self.assertEqual(review.evidence["robot_id"], "franka")
+
+    def test_applies_codec_to_unresolved_rgb_without_vlm(self) -> None:
+        source_key = "observation.images.cam_high_rgb"
+
+        result = normalize_cameras(
+            self.candidate,
+            self._info(
+                {source_key: {"dtype": "video", "shape": [480, 640, 3]}}
+            ),
+            robot_identity=RobotIdentity(
+                "airbot_mmk2", "info.robot_type", "Airbot_MMK2"
+            ),
+        )
+
+        self.assertIn(source_key, result.normalized_info["features"])
+        self.assertEqual(
+            result.normalized_info["features"][source_key]["codec"], "av1"
+        )
+        self.assertEqual(
+            result.camera_review_items[0].reason_code,
+            "ROBOT_CAMERA_MAPPING_UNKNOWN",
+        )
 
     def test_keeps_all_sources_when_target_names_collide(self) -> None:
         result = normalize_cameras(

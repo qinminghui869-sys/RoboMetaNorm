@@ -173,6 +173,19 @@ class MachineVlmTest(unittest.TestCase):
         self.assertIn('"local_slice": [\n        3,\n        7\n      ]', prompt)
         self.assertIn("不得输出最终标准字段名", prompt)
 
+    def test_prompt_includes_structured_robot_identity_evidence(self) -> None:
+        evidence = self._evidence(6)
+        evidence["robot_identity"] = {
+            "canonical_id": "airbot_mmk2",
+            "selected_source": "info.robot_type",
+            "conflicts": [],
+        }
+
+        _, user_prompt = build_machine_prompt(evidence)
+
+        self.assertIn('"canonical_id": "airbot_mmk2"', user_prompt)
+        self.assertIn('"selected_source": "info.robot_type"', user_prompt)
+
     def test_prompt_limits_machine_scope_to_gripper_end_effectors(self) -> None:
         system_prompt, user_prompt = build_machine_prompt(self._evidence(6))
 

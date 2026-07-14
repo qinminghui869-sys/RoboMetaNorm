@@ -23,6 +23,11 @@ from robometanorm.machine.vlm import (
     MachineSemantics,
     MachineVlmResolutionError,
 )
+from robometanorm.robot_identity import (
+    RobotIdentity,
+    RobotIdentityConflict,
+    RobotIdentityEvidence,
+)
 
 
 class _FixedMachineResolver:
@@ -44,6 +49,18 @@ class _CountingMachineResolver(_FixedMachineResolver):
 
     def resolve(self, evidence: dict[str, object]) -> MachineSemantics:
         self.call_count += 1
+        return super().resolve(evidence)
+
+
+class _RecordingMachineResolver(_CountingMachineResolver):
+    """记录传入机器语义分类器的结构化证据。"""
+
+    def __init__(self, semantics: MachineSemantics):
+        super().__init__(semantics)
+        self.evidence: list[dict[str, object]] = []
+
+    def resolve(self, evidence: dict[str, object]) -> MachineSemantics:
+        self.evidence.append(evidence)
         return super().resolve(evidence)
 
 
@@ -397,6 +414,58 @@ class MachineNormalizerTest(unittest.TestCase):
             expected,
         )
         self.assertEqual(resolver.call_count, 1)
+
+    def test_passes_traceable_robot_identity_as_machine_evidence(self) -> None:
+        source_info = self._info(
+            {"observation.state.raw": self._feature(["raw_0"])}
+        )
+        resolver = _RecordingMachineResolver(self._unknown_semantics(1))
+        identity = RobotIdentity(
+            canonical_id="airbot_mmk2",
+            selected_source="info.robot_type",
+            selected_value="Airbot_MMK2",
+            evidence=(
+                RobotIdentityEvidence(
+                    "info.robot_type", "Airbot_MMK2", "airbot_mmk2"
+                ),
+            ),
+            conflicts=(
+                RobotIdentityConflict(
+                    "common_record.machine_id", "x_galbot", "galbot"
+                ),
+            ),
+        )
+
+        normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.raw": 1}),
+            vlm_resolver=resolver,
+            robot_identity=identity,
+        )
+
+        evidence = resolver.evidence[0]
+        self.assertEqual(evidence["robot_type"], "airbot_mmk2")
+        robot_identity = evidence["robot_identity"]
+        self.assertEqual(robot_identity["selected_source"], "info.robot_type")
+        self.assertEqual(
+            robot_identity["conflicts"][0]["canonical_id"], "galbot"
+        )
+
+    def test_uses_root_type_when_direct_call_has_null_robot_type(self) -> None:
+        source_info = self._info(
+            {"observation.state.raw": self._feature(["raw_0"])}
+        )
+        source_info["robot_type"] = None
+        source_info["root_type"] = "Galbot_G1"
+        resolver = _RecordingMachineResolver(self._unknown_semantics(1))
+
+        normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.raw": 1}),
+            vlm_resolver=resolver,
+        )
+
+        self.assertEqual(resolver.evidence[0]["robot_type"], "Galbot_G1")
 
     def test_keeps_names_when_episode_layout_is_inconsistent(self) -> None:
         names = [

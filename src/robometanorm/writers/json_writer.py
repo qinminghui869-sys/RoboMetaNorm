@@ -13,6 +13,7 @@ from robometanorm import __version__
 from robometanorm.camera.models import CameraReviewItem
 from robometanorm.domain.models import DatasetCandidate, DatasetStatus, PreconditionReport
 from robometanorm.machine.models import GripperTransformProposal, MachineReviewItem
+from robometanorm.robot_identity import RobotIdentity, robot_identity_payload
 
 
 def write_normalization_files(
@@ -23,6 +24,7 @@ def write_normalization_files(
     camera_review_items: Sequence[CameraReviewItem] = (),
     machine_review_items: Sequence[MachineReviewItem] = (),
     gripper_transform_proposals: Sequence[GripperTransformProposal] = (),
+    robot_identity: RobotIdentity | None = None,
     phase: str = "P0",
 ) -> None:
     """写入 P0/P1/P2 规范建议和人工复核文件。"""
@@ -33,6 +35,7 @@ def write_normalization_files(
         camera_review_items,
         machine_review_items,
         gripper_transform_proposals,
+        robot_identity,
         phase,
     )
     _validate_payloads(output_info, review)
@@ -51,6 +54,7 @@ def _build_review(
     camera_review_items: Sequence[CameraReviewItem],
     machine_review_items: Sequence[MachineReviewItem],
     gripper_transform_proposals: Sequence[GripperTransformProposal],
+    robot_identity: RobotIdentity | None,
     phase: str,
 ) -> dict[str, object]:
     """将领域复核项转换为公开 JSON 结构。"""
@@ -65,6 +69,11 @@ def _build_review(
             "name": candidate.dataset_name,
             "layout_type": candidate.layout_type.value,
         },
+        "robot_identity": (
+            robot_identity_payload(robot_identity)
+            if robot_identity is not None
+            else None
+        ),
         "status": _status_with_reviews(
             report.status, camera_review_items, machine_review_items
         ).value,
