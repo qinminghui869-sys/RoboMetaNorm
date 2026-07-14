@@ -32,8 +32,6 @@ class CliIntegrationTest(unittest.TestCase):
         (self.dataset_path / "data").mkdir()
         (self.dataset_path / "videos" / "front").mkdir(parents=True)
         (self.dataset_path / "videos" / "front" / "episode_000000.mp4").touch()
-        (self.dataset_path / "collector.py").touch()
-        (self.dataset_path / "convert_to_lerobot.py").touch()
         info = {
             "fps": 20,
             "features": {

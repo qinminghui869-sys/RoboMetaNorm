@@ -14,7 +14,6 @@ from robometanorm.domain.models import (
 
 
 MEDIA_SUFFIXES = {".avi", ".bmp", ".jpeg", ".jpg", ".mkv", ".mov", ".mp4", ".png", ".webp"}
-SCRIPT_SUFFIXES = {".py", ".sh"}
 
 
 def check_preconditions(
@@ -30,24 +29,16 @@ def check_preconditions(
     has_rgb_media = _has_media_file(candidate)
 
     if not has_rgb_media:
-        review_items.append(_review("missing_rgb", "block", "未发现 RGB 视频或图片文件。"))
+        review_items.append(_review("missing_rgb", "未发现 RGB 视频或图片文件。"))
     if not has_action:
-        review_items.append(_review("missing_action", "block", "元数据缺少 action 字段。"))
+        review_items.append(_review("missing_action", "元数据缺少 action 字段。"))
     if not has_observation:
         review_items.append(
-            _review("missing_observation", "block", "元数据缺少 observation 字段。")
+            _review("missing_observation", "元数据缺少 observation 字段。")
         )
     if camera_count == 0:
         review_items.append(
-            _review("camera_primary", "block", "未发现可作为主摄像头的视觉特征。")
-        )
-    if not _contains_named_script(candidate.source_path, ("collect", "record", "capture")):
-        review_items.append(
-            _review("missing_collection_program", "warning", "未发现数据采集落盘程序。")
-        )
-    if not _contains_named_script(candidate.source_path, ("lerobot", "convert")):
-        review_items.append(
-            _review("missing_conversion_script", "warning", "未发现已有 LeRobot 转换脚本。")
+            _review("camera_primary", "未发现可作为主摄像头的视觉特征。")
         )
 
     return PreconditionReport(
@@ -86,22 +77,12 @@ def _contains_file(root: Path, suffixes: set[str]) -> bool:
     )
 
 
-def _contains_named_script(root: Path, keywords: tuple[str, ...]) -> bool:
-    """以脚本名提供的采集或转换证据作为 P0 依据。"""
-    return any(
-        path.is_file()
-        and path.suffix.lower() in SCRIPT_SUFFIXES
-        and any(keyword in path.name.lower() for keyword in keywords)
-        for path in root.rglob("*")
-    )
-
-
-def _review(category: str, severity: str, reason: str) -> ReviewItem:
+def _review(category: str, reason: str) -> ReviewItem:
     """生成统一结构的基础复核项。"""
     return ReviewItem(
         review_id=category,
         category=category,
-        severity=severity,
+        severity="block",
         reason=reason,
         evidence={},
         required_action="补充证据或确认该数据集是否可继续转换。",
@@ -110,11 +91,7 @@ def _review(category: str, severity: str, reason: str) -> ReviewItem:
 
 def _status_from(review_items: Sequence[ReviewItem]) -> DatasetStatus:
     """按 P0 状态优先级汇总复核项。"""
-    if any(item.severity == "block" for item in review_items):
-        return DatasetStatus.BLOCKED
-    if review_items:
-        return DatasetStatus.REVIEW
-    return DatasetStatus.PASS
+    return DatasetStatus.BLOCKED if review_items else DatasetStatus.PASS
 
 
 def _machine_field_count(features: Mapping[str, object]) -> int:

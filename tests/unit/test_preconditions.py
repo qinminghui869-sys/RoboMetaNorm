@@ -24,8 +24,6 @@ class PreconditionsTest(unittest.TestCase):
         (self.dataset_path / "data").mkdir()
         (self.dataset_path / "videos" / "front").mkdir(parents=True)
         (self.dataset_path / "videos" / "front" / "episode_000000.mp4").touch()
-        (self.dataset_path / "collector.py").touch()
-        (self.dataset_path / "convert_to_lerobot.py").touch()
         self.candidate = DatasetCandidate(
             dataset_name="dataset_001",
             task_name=None,
@@ -45,6 +43,15 @@ class PreconditionsTest(unittest.TestCase):
 
         self.assertEqual(report.status, DatasetStatus.PASS)
         self.assertEqual(report.camera_count, 1)
+        self.assertEqual(report.review_items, ())
+
+    def test_does_not_require_collection_or_conversion_scripts(self) -> None:
+        self.assertFalse(any(self.dataset_path.rglob("*.py")))
+        self.assertFalse(any(self.dataset_path.rglob("*.sh")))
+
+        report = check_preconditions(self.candidate, self._complete_info())
+
+        self.assertEqual(report.status, DatasetStatus.PASS)
         self.assertEqual(report.review_items, ())
 
     def test_blocks_when_action_feature_is_missing(self) -> None:
