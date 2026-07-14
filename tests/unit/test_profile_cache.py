@@ -17,8 +17,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.machine.models import ParquetProfile, ProfileProgress
-from robometanorm.machine.parquet_profiler import profile_parquets
-from robometanorm.machine.profile_cache import load_or_profile_parquets
+from robometanorm.machine.profiling import load_or_profile_parquets, profile_parquets
 
 
 class ProfileCacheTest(unittest.TestCase):
@@ -42,7 +41,7 @@ class ProfileCacheTest(unittest.TestCase):
         first = self._load(events)
 
         with patch(
-            "robometanorm.machine.profile_cache.profile_parquets"
+            "robometanorm.machine.profiling.profile_parquets"
         ) as profiler:
             second = self._load(events)
 
@@ -66,7 +65,7 @@ class ProfileCacheTest(unittest.TestCase):
         )
 
         with patch(
-            "robometanorm.machine.profile_cache.profile_parquets",
+            "robometanorm.machine.profiling.profile_parquets",
             wraps=profile_parquets,
         ) as profiler:
             self._load()
@@ -79,7 +78,7 @@ class ProfileCacheTest(unittest.TestCase):
         metadata_path.write_text("not json", encoding="utf-8")
 
         with patch(
-            "robometanorm.machine.profile_cache.profile_parquets",
+            "robometanorm.machine.profiling.profile_parquets",
             wraps=profile_parquets,
         ) as profiler:
             result = self._load()
@@ -92,7 +91,7 @@ class ProfileCacheTest(unittest.TestCase):
         events: list[ProfileProgress] = []
 
         with patch(
-            "robometanorm.machine.profile_cache._write",
+            "robometanorm.machine.profiling._write",
             side_effect=RuntimeError("cache serializer failed"),
         ):
             result = self._load(events)
@@ -114,7 +113,7 @@ class ProfileCacheTest(unittest.TestCase):
             )
 
         with patch(
-            "robometanorm.machine.profile_cache.profile_parquets",
+            "robometanorm.machine.profiling.profile_parquets",
             wraps=profile_parquets,
         ) as profiler:
             result = self._load()
@@ -128,7 +127,7 @@ class ProfileCacheTest(unittest.TestCase):
         samples_path.write_bytes(b"")
 
         with patch(
-            "robometanorm.machine.profile_cache.profile_parquets",
+            "robometanorm.machine.profiling.profile_parquets",
             wraps=profile_parquets,
         ) as profiler:
             result = self._load()

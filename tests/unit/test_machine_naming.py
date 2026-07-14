@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.machine.name_builder import (
+from robometanorm.machine.rules import (
     build_confirmed_machine_name,
     build_names_from_semantics,
 )

@@ -11,7 +11,7 @@ import sys
 from robometanorm.application.pipeline import normalize_datasets, scan_datasets
 from robometanorm.camera.vlm import OpenAICompatibleVlmClassifier, VlmClassifier
 from robometanorm.domain.models import DatasetResult, LayoutType
-from robometanorm.machine.vlm_semantic_resolver import OpenAICompatibleMachineVlmResolver
+from robometanorm.machine.vlm import OpenAICompatibleMachineVlmResolver
 from robometanorm.machine.models import ProfileProgress
 
 

@@ -6,26 +6,25 @@ from collections.abc import Mapping
 from copy import deepcopy
 import re
 
-from robometanorm.machine.deduplicator import action_equals_state
-from robometanorm.machine.discovery import PARENT_MACHINE_FEATURES, discover_machine_features
-from robometanorm.machine.layout_resolver import resolve_child_slices
 from robometanorm.machine.models import (
     MachineNormalizationResult,
     MachineReviewItem,
     ParquetProfile,
     VectorProfile,
 )
-from robometanorm.machine.name_builder import (
+from robometanorm.machine.rules import (
+    PARENT_MACHINE_FEATURES,
+    action_equals_state,
     build_confirmed_machine_name,
     build_names_from_semantics,
-)
-from robometanorm.machine.rule_validator import (
     declared_names,
     declared_vector_length,
+    discover_machine_features,
     is_dexterous_hand_field,
+    resolve_child_slices,
     risk_categories,
 )
-from robometanorm.machine.vlm_semantic_resolver import (
+from robometanorm.machine.vlm import (
     MachineSemantics,
     MachineVlmResolver,
     can_apply_semantics,

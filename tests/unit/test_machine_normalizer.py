@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.machine.models import ParquetProfile, VectorProfile
 from robometanorm.machine.normalizer import normalize_machine_fields
-from robometanorm.machine.vlm_semantic_resolver import (
+from robometanorm.machine.vlm import (
     MachineSemanticSegment,
     MachineSemantics,
     MachineVlmResolutionError,

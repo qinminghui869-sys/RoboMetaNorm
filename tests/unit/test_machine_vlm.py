@@ -8,10 +8,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.machine.name_builder import build_names_from_semantics
-from robometanorm.machine.prompt_builder import build_machine_prompt
-from robometanorm.machine.vlm_semantic_resolver import (
+from robometanorm.machine.rules import build_names_from_semantics
+from robometanorm.machine.vlm import (
     OpenAICompatibleMachineVlmResolver,
+    build_machine_prompt,
     can_apply_semantics,
     parse_machine_semantics,
 )

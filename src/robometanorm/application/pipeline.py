@@ -22,8 +22,8 @@ from robometanorm.domain.models import (
 from robometanorm.episode_sampling import select_representative_episodes
 from robometanorm.machine.normalizer import normalize_machine_fields
 from robometanorm.machine.models import ProfileProgress
-from robometanorm.machine.profile_cache import load_or_profile_parquets
-from robometanorm.machine.vlm_semantic_resolver import MachineVlmResolver
+from robometanorm.machine.profiling import load_or_profile_parquets
+from robometanorm.machine.vlm import MachineVlmResolver
 from robometanorm.writers.json_writer import write_normalization_files
 
 

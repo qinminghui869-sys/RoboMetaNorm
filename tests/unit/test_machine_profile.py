@@ -13,8 +13,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.machine.layout_resolver import resolve_child_slices
-from robometanorm.machine.parquet_profiler import profile_parquet, profile_parquets
+from robometanorm.machine.rules import resolve_child_slices
+from robometanorm.machine.profiling import profile_parquet, profile_parquets
 
 
 class MachineParquetProfileTest(unittest.TestCase):
