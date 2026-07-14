@@ -3,6 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import re
+
+
+_DEXTEROUS_HAND_TOKEN = re.compile(
+    r"(?<![a-z0-9])(?:dexterous|hand|finger)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def is_dexterous_hand_field(
+    source_feature: str, names: Sequence[str]
+) -> bool:
+    """判断机器字段是否明确属于夹爪末端规范之外的灵巧手字段。"""
+    return any(
+        _DEXTEROUS_HAND_TOKEN.search(value) is not None
+        for value in (source_feature, *names)
+    )
 
 
 def declared_vector_length(feature: Mapping[str, object]) -> int | None:
@@ -35,8 +52,6 @@ def risk_categories(names: Sequence[str]) -> set[str]:
         categories.add("SKELETON_STANDARD_UNDEFINED")
     if any("gripper" in name for name in lowered):
         categories.update({"GRIPPER_RANGE_UNKNOWN", "GRIPPER_DIRECTION_UNKNOWN"})
-    if any("finger" in name or "hand" in name for name in lowered):
-        categories.add("UNKNOWN_HAND_REPRESENTATION")
     if any("pose" in name or "position" in name for name in lowered):
         categories.add("UNKNOWN_UNIT")
     if any("joint" in name and not name.endswith("_rad") for name in lowered):

@@ -122,8 +122,13 @@ class OpenAICompatibleVlmClassifier:
                 {"role": "user", "content": content},
             ],
         }
-        # DashScope/DeepSeek 兼容端点沿用参考客户端的关闭思考配置。
-        if any(provider in self.endpoint.lower() for provider in ("dashscope", "deepseek")):
+        endpoint = self.endpoint.lower()
+        if "dashscope" in endpoint:
+            payload["enable_thinking"] = False
+            payload["response_format"] = {"type": "json_object"}
+            # DashScope JSON Mode 不限制输出 token，避免截断未闭合的 JSON。
+            payload.pop("max_tokens", None)
+        elif "deepseek" in endpoint:
             payload["enable_thinking"] = False
         return self._request_with_retry(payload)
 

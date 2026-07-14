@@ -89,8 +89,34 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 2)
         self.assertEqual(semantics.body_part, "wrist")
         request_body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
-        self.assertEqual(request_body["max_tokens"], 1024)
         self.assertFalse(request_body["enable_thinking"])
+        self.assertEqual(
+            request_body.get("response_format"), {"type": "json_object"}
+        )
+        self.assertNotIn("max_tokens", request_body)
+
+    def test_keeps_standard_token_limit_for_non_dashscope_endpoint(self) -> None:
+        response = _Response(
+            {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        )
+        client = OpenAICompatibleVlmClassifier(
+            "https://api.openai.com/v1",
+            "test-vlm",
+            "test-key",
+            max_tokens=2048,
+        )
+
+        with patch(
+            "robometanorm.camera.vlm_classifier.request.urlopen",
+            return_value=response,
+        ) as urlopen:
+            payload = client.request_json("return JSON", "user", ())
+
+        self.assertEqual(payload, {"ok": True})
+        request_body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(request_body["max_tokens"], 2048)
+        self.assertNotIn("enable_thinking", request_body)
+        self.assertNotIn("response_format", request_body)
 
     def test_exposes_validated_json_transport_for_non_camera_semantics(self) -> None:
         response = _Response(

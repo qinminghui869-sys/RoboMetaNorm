@@ -112,14 +112,15 @@ class JsonWriterTest(unittest.TestCase):
 
     def test_writes_p2_machine_review_items_and_promotes_status_to_review(self) -> None:
         machine_review = MachineReviewItem(
-            source_feature="observation.state.hand",
+            source_feature="observation.state.arm",
             source_slice=(7, 10),
             category="UNKNOWN_UNIT",
             severity="confirmation",
-            declared_names=("left_hand_joint_0",),
-            vlm_result={"semantic_type": "hand_joint", "confidence": 0.8},
-            candidates=("left_hand_joint_0_rad",),
+            declared_names=("left_arm_joint_0",),
+            vlm_result={"semantic_type": "arm_joint", "confidence": 0.8},
+            candidates=("left_arm_joint_0_rad",),
             required_action="确认物理单位后再添加 _rad。",
+            vlm_error="segments[0].unit 不合法",
         )
 
         write_normalization_files(
@@ -148,6 +149,10 @@ class JsonWriterTest(unittest.TestCase):
                 "selected_semantic": None,
                 "comment": None,
             },
+        )
+        self.assertEqual(
+            review["machine_review_items"][0]["vlm_error"],
+            "segments[0].unit 不合法",
         )
 
 

@@ -2,9 +2,12 @@ __pycache__/
 *.py[cod]
 .coverage
 .pytest_cache/
+.cache/
 
 数据转换标准.pdf
 P1：相机规范化凝练方案.pdf
+P2：机器字段规范化方案.pdf
 RoboMetaNorm 项目开发框架.pdf
+RoboMetaNorm_MVP实现方案.md
 
 collect_data/

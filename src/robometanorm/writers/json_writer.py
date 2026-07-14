@@ -103,6 +103,7 @@ def _build_review(
                 "severity": item.severity,
                 "declared_names": list(item.declared_names),
                 "vlm_result": item.vlm_result,
+                "vlm_error": item.vlm_error,
                 "candidates": list(item.candidates),
                 "required_action": item.required_action,
                 "human_decision": {

@@ -31,7 +31,7 @@ class MachineParquetProfileTest(unittest.TestCase):
                     [13.0, 14.0, 15.0, 22.0, 23.0],
                 ],
                 "observation.state.head": [[10.0, 11.0], [13.0, 14.0]],
-                "observation.state.finger": [[12.0, 20.0, 21.0], [15.0, 22.0, 23.0]],
+                "observation.state.arm": [[12.0, 20.0, 21.0], [15.0, 22.0, 23.0]],
                 "diagnostic": [[1.0, math.nan, 3.0], [4.0, 5.0, 6.0]],
             }
         )
@@ -46,22 +46,22 @@ class MachineParquetProfileTest(unittest.TestCase):
             profile.samples["observation.state"],
             {
                 "observation.state.head": profile.samples["observation.state.head"],
-                "observation.state.finger": profile.samples["observation.state.finger"],
+                "observation.state.arm": profile.samples["observation.state.arm"],
             },
         )
 
         action = profile.columns["action"]
-        finger = profile.columns["diagnostic"]
+        diagnostic = profile.columns["diagnostic"]
         self.assertEqual(profile.row_count, 2)
         self.assertEqual(action.vector_length, 5)
         self.assertEqual(action.min_value, 10.0)
         self.assertEqual(action.max_value, 23.0)
         self.assertAlmostEqual(action.mean_abs_diff, 2.6)
         self.assertFalse(action.triplet_grouping_possible)
-        self.assertEqual(finger.vector_length, 3)
-        self.assertAlmostEqual(finger.nan_ratio, 1 / 6)
+        self.assertEqual(diagnostic.vector_length, 3)
+        self.assertAlmostEqual(diagnostic.nan_ratio, 1 / 6)
         self.assertEqual(slices["observation.state.head"], (0, 2))
-        self.assertEqual(slices["observation.state.finger"], (2, 5))
+        self.assertEqual(slices["observation.state.arm"], (2, 5))
 
     def test_marks_columns_with_inconsistent_episode_layouts(self) -> None:
         second_path = Path(self.temp_dir.name) / "episode_001.parquet"
@@ -79,6 +79,25 @@ class MachineParquetProfileTest(unittest.TestCase):
 
         self.assertEqual(profile.episode_count, 2)
         self.assertIn("action", profile.inconsistent_columns)
+
+    def test_emits_one_progress_event_per_episode(self) -> None:
+        second_path = Path(self.temp_dir.name) / "episode_001.parquet"
+        second_path.write_bytes(self.parquet_path.read_bytes())
+        events: list[object] = []
+
+        profile = profile_parquets(
+            (self.parquet_path, second_path),
+            sample_rows=16,
+            progress=events.append,
+        )
+
+        self.assertEqual(profile.episode_count, 2)
+        self.assertEqual(
+            [(event.current, event.total) for event in events], [(1, 2), (2, 2)]
+        )
+        self.assertEqual(
+            [event.path for event in events], [self.parquet_path, second_path]
+        )
 
 
 if __name__ == "__main__":

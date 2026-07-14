@@ -3,8 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class ProfileProgress:
+    """Parquet 画像阶段向应用层报告的结构化进度。"""
+
+    kind: str
+    current: int
+    total: int
+    path: Path | None = None
+    message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +67,7 @@ class MachineReviewItem:
     vlm_result: dict[str, object] | None
     candidates: tuple[str, ...]
     required_action: str
+    vlm_error: str | None = None
 
 
 @dataclass(frozen=True)

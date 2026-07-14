@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+import re
 
 from robometanorm.machine.deduplicator import action_equals_state
 from robometanorm.machine.discovery import PARENT_MACHINE_FEATURES, discover_machine_features
@@ -18,7 +19,12 @@ from robometanorm.machine.name_builder import (
     build_confirmed_machine_name,
     build_names_from_semantics,
 )
-from robometanorm.machine.rule_validator import declared_names, declared_vector_length, risk_categories
+from robometanorm.machine.rule_validator import (
+    declared_names,
+    declared_vector_length,
+    is_dexterous_hand_field,
+    risk_categories,
+)
 from robometanorm.machine.vlm_semantic_resolver import (
     MachineSemantics,
     MachineVlmResolver,
@@ -209,20 +215,7 @@ def _normalize_feature_names(
                 source_slice=source_slice,
             )
         ]
-    if len(names) != declared_length:
-        if len(names) < declared_length:
-            return _normalize_grouped_feature_names(
-                feature_name,
-                feature,
-                names,
-                declared_length,
-                vector_profile,
-                source_slice=source_slice,
-                equal_action_state=equal_action_state,
-                vlm_resolver=vlm_resolver,
-                dataset_name=dataset_name,
-                robot_type=robot_type,
-            )
+    if len(names) > declared_length:
         return None, [
             _review(
                 feature_name,
@@ -232,7 +225,9 @@ def _normalize_feature_names(
                 source_slice=source_slice,
             )
         ]
-    if _feature_layout_inconsistent(feature_name, profile):
+    if len(names) == declared_length and _feature_layout_inconsistent(
+        feature_name, profile
+    ):
         return None, [
             _review(
                 feature_name,
@@ -242,14 +237,37 @@ def _normalize_feature_names(
                 source_slice=source_slice,
             )
         ]
+    if is_dexterous_hand_field(feature_name, names):
+        return None, [
+            _review(
+                feature_name,
+                "UNCLASSIFIED_MACHINE_FIELD",
+                tuple(names),
+                _required_action("UNCLASSIFIED_MACHINE_FIELD"),
+                source_slice=source_slice,
+            )
+        ]
+    if len(names) < declared_length:
+        return _normalize_grouped_feature_names(
+            feature_name,
+            feature,
+            names,
+            declared_length,
+            vector_profile,
+            source_slice=source_slice,
+            equal_action_state=equal_action_state,
+            vlm_resolver=vlm_resolver,
+            dataset_name=dataset_name,
+            robot_type=robot_type,
+        )
 
     normalized_names = [build_confirmed_machine_name(name) or name for name in names]
     categories = risk_categories(names)
     names_are_confirmed = all(build_confirmed_machine_name(name) is not None for name in names)
     semantics: MachineSemantics | None = None
-    resolver_failed = False
+    resolver_error: str | None = None
     if vlm_resolver is not None and (categories or not names_are_confirmed):
-        semantics, resolver_failed = _resolve_vlm_semantics(
+        semantics, resolver_error = _resolve_vlm_semantics(
             vlm_resolver,
             _build_vlm_evidence(
                 dataset_name,
@@ -267,7 +285,7 @@ def _normalize_feature_names(
     candidates: tuple[str, ...] = ()
     if semantics is not None:
         categories.update(_semantics_review_categories(semantics))
-        target_candidates = tuple(build_names_from_semantics(semantics, declared_length) or ())
+        target_candidates = _target_names_from_semantics(semantics)
         candidates = _review_candidates(semantics, target_candidates)
         if _can_apply_vlm_names(semantics, feature, categories, target_candidates):
             normalized_names = list(target_candidates)
@@ -275,7 +293,7 @@ def _normalize_feature_names(
             names_are_confirmed = True
         elif not categories:
             categories.add("VLM_SEMANTICS_REVIEW")
-    elif resolver_failed:
+    elif resolver_error is not None:
         categories.add("VLM_RESOLUTION_FAILED")
 
     if not names_are_confirmed and not categories:
@@ -290,6 +308,9 @@ def _normalize_feature_names(
             source_slice=source_slice,
             vlm_result=vlm_result,
             candidates=candidates,
+            vlm_error=(
+                resolver_error if category == "VLM_RESOLUTION_FAILED" else None
+            ),
         )
         for category in sorted(categories)
     ]
@@ -311,9 +332,9 @@ def _normalize_grouped_feature_names(
 ) -> tuple[list[str] | None, list[MachineReviewItem]]:
     """分组名称不假定逐维顺序，仅允许 VLM 加规则共同确认后展开。"""
     semantics: MachineSemantics | None = None
-    resolver_failed = False
+    resolver_error: str | None = None
     if vlm_resolver is not None:
-        semantics, resolver_failed = _resolve_vlm_semantics(
+        semantics, resolver_error = _resolve_vlm_semantics(
             vlm_resolver,
             _build_vlm_evidence(
                 dataset_name,
@@ -326,11 +347,7 @@ def _normalize_grouped_feature_names(
                 equal_action_state,
             ),
         )
-    target_candidates = (
-        tuple(build_names_from_semantics(semantics, vector_length) or ())
-        if semantics
-        else ()
-    )
+    target_candidates = _target_names_from_semantics(semantics) if semantics else ()
     candidates = _review_candidates(semantics, target_candidates) if semantics else ()
     semantic_categories = _semantics_review_categories(semantics) if semantics else set()
     if semantics is not None and _can_apply_vlm_names(
@@ -340,7 +357,7 @@ def _normalize_grouped_feature_names(
 
     categories = ["NAMES_ORDER_MISMATCH"]
     categories.extend(sorted(semantic_categories))
-    if resolver_failed:
+    if resolver_error is not None:
         categories.append("VLM_RESOLUTION_FAILED")
     vlm_result = _semantics_to_dict(semantics) if semantics else None
     return None, [
@@ -352,6 +369,9 @@ def _normalize_grouped_feature_names(
             source_slice=source_slice,
             vlm_result=vlm_result,
             candidates=candidates,
+            vlm_error=(
+                resolver_error if category == "VLM_RESOLUTION_FAILED" else None
+            ),
         )
         for category in categories
     ]
@@ -360,16 +380,22 @@ def _normalize_grouped_feature_names(
 def _semantics_review_categories(semantics: MachineSemantics) -> set[str]:
     """将 VLM 给出的风险语义转为不可自动写入的复核类别。"""
     categories: set[str] = set()
-    if semantics.declared_name_status == "misleading":
-        categories.add("DECLARED_NAME_CONFLICT")
-    if semantics.required_transform == "quaternion_to_euler":
-        categories.add("QUATERNION_REQUIRES_EULER_CONVERSION")
-    if (
-        semantics.semantic_type
-        in {"arm_joint", "hand_joint", "gripper_open", "eef_position", "eef_rotation_euler"}
-        and semantics.side == "unknown"
-    ):
-        categories.add("UNKNOWN_LEFT_RIGHT")
+    for segment in semantics.segments:
+        if segment.declared_name_status == "misleading":
+            categories.add("DECLARED_NAME_CONFLICT")
+        if segment.required_transform == "quaternion_to_euler":
+            categories.add("QUATERNION_REQUIRES_EULER_CONVERSION")
+        if (
+            segment.semantic_type
+            in {
+                "arm_joint",
+                "gripper_open",
+                "eef_position",
+                "eef_rotation_euler",
+            }
+            and segment.side == "unknown"
+        ):
+            categories.add("UNKNOWN_LEFT_RIGHT")
     return categories
 
 
@@ -379,13 +405,29 @@ def _review_candidates(
     """优先展示可生成的标准名，否则展示 VLM 的受限语义候选。"""
     if target_candidates:
         return target_candidates
-    candidates = [semantics.semantic_type]
-    candidates.extend(
-        alternative["semantic_type"]
-        for alternative in semantics.alternatives
-        if isinstance(alternative.get("semantic_type"), str)
-    )
+    candidates: list[str] = []
+    for segment in semantics.segments:
+        candidates.append(segment.semantic_type)
+        candidates.extend(
+            alternative["semantic_type"]
+            for alternative in segment.alternatives
+            if isinstance(alternative.get("semantic_type"), str)
+        )
     return tuple(dict.fromkeys(candidates))
+
+
+def _target_names_from_semantics(
+    semantics: MachineSemantics,
+) -> tuple[str, ...]:
+    """按局部切片顺序拼接每个可支持区段的目标名称。"""
+    names: list[str] = []
+    for segment in semantics.segments:
+        start, end = segment.local_slice
+        built = build_names_from_semantics(segment, end - start)
+        if built is None:
+            return ()
+        names.extend(built)
+    return tuple(names)
 
 
 def _feature_layout_inconsistent(feature_name: str, profile: ParquetProfile) -> bool:
@@ -444,12 +486,24 @@ def _build_vlm_evidence(
 
 def _resolve_vlm_semantics(
     resolver: MachineVlmResolver, evidence: Mapping[str, object]
-) -> tuple[MachineSemantics | None, bool]:
+) -> tuple[MachineSemantics | None, str | None]:
     """VLM 失败仅转为复核，不影响其余字段处理。"""
     try:
-        return resolver.resolve(evidence), False
-    except Exception:
-        return None, True
+        return resolver.resolve(evidence), None
+    except Exception as error:
+        return None, _sanitize_vlm_error(error)
+
+
+def _sanitize_vlm_error(error: Exception) -> str:
+    """保留可审核的协议错误，但移除 Authorization 和 API Key。"""
+    message = " ".join(str(error).split())
+    message = re.sub(
+        r"(?i)authorization\s*:\s*bearer\s+[^;\s]+;?\s*",
+        "",
+        message,
+    )
+    message = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "sk-[REDACTED]", message)
+    return (message or type(error).__name__)[:1000]
 
 
 def _can_apply_vlm_names(
@@ -463,26 +517,37 @@ def _can_apply_vlm_names(
         return False
     if not can_apply_semantics(semantics, len(candidates)):
         return False
-    if semantics.semantic_type == "head_orientation_quaternion":
-        return True
-    # 有量纲字段必须由元数据显式确认单位，VLM 不能单独补全单位。
     declared_unit = feature.get("unit", feature.get("units"))
-    return declared_unit == semantics.unit and semantics.unit != "unknown"
+    for segment in semantics.segments:
+        if segment.semantic_type == "head_orientation_quaternion":
+            continue
+        # 有量纲字段必须由元数据显式确认单位，VLM 不能单独补全单位。
+        if segment.unit in {"unknown", "none"} or declared_unit != segment.unit:
+            return False
+    return True
 
 
 def _semantics_to_dict(semantics: MachineSemantics) -> dict[str, object]:
     """将受限 VLM 语义写入复核文件，保留审计证据。"""
     return {
-        "semantic_type": semantics.semantic_type,
-        "side": semantics.side,
-        "body_part": semantics.body_part,
-        "representation": semantics.representation,
-        "unit": semantics.unit,
-        "declared_name_status": semantics.declared_name_status,
-        "standardizable": semantics.standardizable,
-        "required_transform": semantics.required_transform,
-        "confidence": semantics.confidence,
-        "alternatives": list(semantics.alternatives),
+        "segments": [
+            {
+                "local_slice": list(segment.local_slice),
+                "semantic_type": segment.semantic_type,
+                "side": segment.side,
+                "body_part": segment.body_part,
+                "representation": segment.representation,
+                "unit": segment.unit,
+                "declared_name_status": segment.declared_name_status,
+                "standardizable": segment.standardizable,
+                "required_transform": segment.required_transform,
+                "confidence": segment.confidence,
+                "alternatives": list(segment.alternatives),
+                "need_human_review": segment.need_human_review,
+                "reason": segment.reason,
+            }
+            for segment in semantics.segments
+        ],
         "need_human_review": semantics.need_human_review,
         "reason": semantics.reason,
     }
@@ -506,6 +571,7 @@ def _review(
     source_slice: tuple[int, int] | None = None,
     vlm_result: dict[str, object] | None = None,
     candidates: tuple[str, ...] = (),
+    vlm_error: str | None = None,
 ) -> MachineReviewItem:
     """创建 P2 机器字段人工复核项。"""
     return MachineReviewItem(
@@ -517,6 +583,7 @@ def _review(
         vlm_result=vlm_result,
         candidates=candidates,
         required_action=required_action,
+        vlm_error=vlm_error,
     )
 
 
@@ -527,7 +594,6 @@ def _required_action(category: str) -> str:
         "SKELETON_STANDARD_UNDEFINED": "确认骨架或关键点字段的后续标准。",
         "GRIPPER_RANGE_UNKNOWN": "确认夹爪物理量程和目标量程。",
         "GRIPPER_DIRECTION_UNKNOWN": "确认夹爪开合方向。",
-        "UNKNOWN_HAND_REPRESENTATION": "确认手部字段是关节角还是三维关键点。",
         "UNKNOWN_UNIT": "确认物理单位后再添加 _m 或 _rad。",
         "UNKNOWN_LEFT_RIGHT": "确认字段对应的左侧、右侧或双侧后再规范化。",
         "DECLARED_NAME_CONFLICT": "确认声明名称与实际字段语义是否一致。",

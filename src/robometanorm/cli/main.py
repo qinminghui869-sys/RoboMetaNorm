@@ -6,11 +6,13 @@ import argparse
 from collections.abc import Sequence
 import os
 from pathlib import Path
+import sys
 
 from robometanorm.application.pipeline import normalize_datasets, scan_datasets
 from robometanorm.camera.vlm_classifier import OpenAICompatibleVlmClassifier, VlmClassifier
 from robometanorm.domain.models import DatasetResult, LayoutType
 from robometanorm.machine.vlm_semantic_resolver import OpenAICompatibleMachineVlmResolver
+from robometanorm.machine.models import ProfileProgress
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -29,6 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vlm_classifier=vlm_classifier,
                 machine_vlm_resolver=_build_machine_vlm_resolver(vlm_classifier),
                 confidence_threshold=arguments.confidence_threshold,
+                profile_progress=_print_profile_progress,
             )
     except ValueError as error:
         parser.error(str(error))
@@ -158,3 +161,25 @@ def _format_summary(results: Sequence[DatasetResult]) -> str:
 def _format_row(values: Sequence[str], widths: Sequence[int]) -> str:
     """按列宽对齐一行表格。"""
     return " | ".join(value.ljust(width) for value, width in zip(values, widths))
+
+
+def _print_profile_progress(event: ProfileProgress) -> None:
+    """将画像进度写到 stderr，保持 stdout 汇总表兼容。"""
+    if event.kind == "episode" and event.path is not None:
+        print(
+            f"正在分析 episode {event.current}/{event.total}: {event.path.name}",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif event.kind == "cache_hit":
+        print(
+            f"已加载 Parquet 画像缓存，共 {event.total} episodes",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif event.kind == "cache_write_warning":
+        print(
+            f"Parquet 画像缓存写入失败，将继续使用内存结果: {event.message}",
+            file=sys.stderr,
+            flush=True,
+        )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -19,7 +20,8 @@ from robometanorm.domain.models import (
     ReviewItem,
 )
 from robometanorm.machine.normalizer import normalize_machine_fields
-from robometanorm.machine.parquet_profiler import profile_parquets
+from robometanorm.machine.models import ProfileProgress
+from robometanorm.machine.profile_cache import load_or_profile_parquets
 from robometanorm.machine.vlm_semantic_resolver import MachineVlmResolver
 from robometanorm.writers.json_writer import write_normalization_files
 
@@ -54,6 +56,7 @@ def normalize_datasets(
     vlm_classifier: VlmClassifier | None = None,
     machine_vlm_resolver: MachineVlmResolver | None = None,
     confidence_threshold: float = 0.85,
+    profile_progress: Callable[[ProfileProgress], None] | None = None,
 ) -> list[DatasetResult]:
     """执行 P1/P2 规范建议并生成两个输出文件。"""
     results = scan_datasets(root, layout)
@@ -67,7 +70,9 @@ def normalize_datasets(
                 vlm_classifier=vlm_classifier,
                 confidence_threshold=confidence_threshold,
             )
-            parquet_profile = _profile_first_parquet(result.candidate)
+            parquet_profile = _profile_dataset_parquets(
+                result.candidate, profile_progress
+            )
             machine_result = normalize_machine_fields(
                 camera_result.normalized_info,
                 parquet_profile,
@@ -104,14 +109,21 @@ def normalize_datasets(
     return results
 
 
-def _profile_first_parquet(candidate: DatasetCandidate):
+def _profile_dataset_parquets(
+    candidate: DatasetCandidate,
+    progress: Callable[[ProfileProgress], None] | None = None,
+):
     """读取受限样本并比较各 Episode 布局，不改写任何源数据。"""
     if candidate.data_path is None:
         return None
     parquet_paths = sorted(candidate.data_path.rglob("*.parquet"))
     if not parquet_paths:
         return None
-    return profile_parquets(parquet_paths)
+    return load_or_profile_parquets(
+        parquet_paths,
+        candidate.info_path.parent / ".robometanorm_cache",
+        progress=progress,
+    )
 
 
 def _status_after_reviews(

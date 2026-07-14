@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -32,7 +32,6 @@ class CliIntegrationTest(unittest.TestCase):
         (self.dataset_path / "data").mkdir()
         (self.dataset_path / "videos" / "front").mkdir(parents=True)
         (self.dataset_path / "videos" / "front" / "episode_000000.mp4").touch()
-        (self.dataset_path / "robot.urdf").touch()
         (self.dataset_path / "collector.py").touch()
         (self.dataset_path / "convert_to_lerobot.py").touch()
         info = {
@@ -165,6 +164,32 @@ class CliIntegrationTest(unittest.TestCase):
             info,
         )
 
+    def test_normalize_reports_episode_progress_then_cache_hit(self) -> None:
+        self._write_two_dimensional_parquet("episode_000000.parquet", 0.0)
+        self._write_two_dimensional_parquet("episode_000001.parquet", 1.0)
+
+        _, first_stderr = self._run_captured(
+            "normalize", "--root", str(self.root)
+        )
+        _, second_stderr = self._run_captured(
+            "normalize", "--root", str(self.root)
+        )
+
+        self.assertIn("正在分析 episode 1/2", first_stderr)
+        self.assertIn("正在分析 episode 2/2", first_stderr)
+        self.assertIn("已加载 Parquet 画像缓存，共 2 episodes", second_stderr)
+
+    def _write_two_dimensional_parquet(self, filename: str, offset: float) -> None:
+        pq.write_table(
+            pa.table(
+                {
+                    "action": [[offset, offset + 1.0]],
+                    "observation.state": [[offset, offset + 1.0]],
+                }
+            ),
+            self.dataset_path / "data" / filename,
+        )
+
     @staticmethod
     def _head_quaternion_feature() -> dict[str, object]:
         return {
@@ -180,12 +205,18 @@ class CliIntegrationTest(unittest.TestCase):
 
     @staticmethod
     def _run(*arguments: str) -> str:
+        stdout, _ = CliIntegrationTest._run_captured(*arguments)
+        return stdout
+
+    @staticmethod
+    def _run_captured(*arguments: str) -> tuple[str, str]:
         output = io.StringIO()
-        with redirect_stdout(output):
+        errors = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
             exit_code = main(list(arguments))
         if exit_code != 0:
             raise AssertionError(f"命令返回非零状态: {exit_code}")
-        return output.getvalue()
+        return output.getvalue(), errors.getvalue()
 
 
 if __name__ == "__main__":

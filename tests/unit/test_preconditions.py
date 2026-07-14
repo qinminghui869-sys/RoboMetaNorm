@@ -24,7 +24,6 @@ class PreconditionsTest(unittest.TestCase):
         (self.dataset_path / "data").mkdir()
         (self.dataset_path / "videos" / "front").mkdir(parents=True)
         (self.dataset_path / "videos" / "front" / "episode_000000.mp4").touch()
-        (self.dataset_path / "robot.urdf").touch()
         (self.dataset_path / "collector.py").touch()
         (self.dataset_path / "convert_to_lerobot.py").touch()
         self.candidate = DatasetCandidate(
@@ -59,6 +58,16 @@ class PreconditionsTest(unittest.TestCase):
             [item.category for item in report.review_items], ["missing_action"]
         )
         self.assertEqual(report.review_items[0].severity, "block")
+
+    def test_does_not_require_urdf_for_normalization(self) -> None:
+        self.assertFalse(any(self.dataset_path.rglob("*.urdf")))
+
+        report = check_preconditions(self.candidate, self._complete_info())
+
+        self.assertEqual(report.status, DatasetStatus.PASS)
+        self.assertNotIn(
+            "missing_urdf", {item.category for item in report.review_items}
+        )
 
     @staticmethod
     def _complete_info() -> dict[str, object]:

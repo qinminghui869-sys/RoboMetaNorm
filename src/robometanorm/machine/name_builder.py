@@ -8,7 +8,7 @@ import re
 _HEAD_QUATERNION_PATTERN = re.compile(r"^head_(?:rotation_)?quat_([xyzw])$")
 _STANDARD_NAME_PATTERN = re.compile(
     r"^(?:"
-    r"(?:left|right)_(?:arm|hand)_joint_\d+_rad|"
+    r"(?:left|right)_arm_joint_\d+_rad|"
     r"(?:left|right)_gripper_open|"
     r"(?:left|right)_eef_pos_[xyz]_m|"
     r"(?:left|right)_eef_rot_euler_[xyz]_rad|"
@@ -40,8 +40,6 @@ def build_names_from_semantics(semantics: object, vector_length: int) -> list[st
         return [f"head_pos_{axis}_m" for axis in "xyz"]
     if semantic_type == "arm_joint" and side in {"left", "right"} and unit == "rad":
         return [f"{side}_arm_joint_{index}_rad" for index in range(vector_length)]
-    if semantic_type == "hand_joint" and side in {"left", "right"} and unit == "rad":
-        return [f"{side}_hand_joint_{index}_rad" for index in range(vector_length)]
     if semantic_type == "eef_position" and side in {"left", "right"} and unit == "m" and vector_length == 3:
         return [f"{side}_eef_pos_{axis}_m" for axis in "xyz"]
     return None

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from robometanorm.machine.models import ParquetProfile, VectorProfile
+from robometanorm.machine.models import ParquetProfile, ProfileProgress, VectorProfile
 
 
 def profile_parquet(parquet_path: Path, sample_rows: int = 512) -> ParquetProfile:
@@ -55,17 +55,24 @@ def profile_parquet(parquet_path: Path, sample_rows: int = 512) -> ParquetProfil
 
 
 def profile_parquets(
-    parquet_paths: Sequence[Path], sample_rows: int = 512
+    parquet_paths: Sequence[Path],
+    sample_rows: int = 512,
+    progress: Callable[[ProfileProgress], None] | None = None,
 ) -> ParquetProfile:
     """比较每个 Episode 的有限样本布局，并返回首个 Episode 的画像。"""
     if not parquet_paths:
         raise ValueError("至少需要一个 Parquet 文件")
-    profiles = [profile_parquet(path, sample_rows) for path in parquet_paths]
+    profiles: list[ParquetProfile] = []
+    total = len(parquet_paths)
+    for current, path in enumerate(parquet_paths, start=1):
+        if progress is not None:
+            progress(ProfileProgress("episode", current, total, path))
+        profiles.append(profile_parquet(path, sample_rows))
     reference = profiles[0]
     inconsistent = _find_inconsistent_columns(reference, profiles[1:])
     return replace(
         reference,
-        episode_count=len(profiles),
+        episode_count=total,
         inconsistent_columns=tuple(sorted(inconsistent)),
     )
 

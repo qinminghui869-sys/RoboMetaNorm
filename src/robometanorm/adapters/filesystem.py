@@ -8,7 +8,7 @@ from pathlib import Path
 from robometanorm.domain.models import DatasetCandidate, LayoutType
 
 
-EXCLUDED_DIRECTORY_NAMES = {".git", ".cache", ".codex", ".agents", "__pycache__"}
+EXCLUDED_DIRECTORY_NAMES = {".git", ".cache", "__pycache__"}
 
 
 def discover_datasets(root: Path, layout: LayoutType = LayoutType.AUTO) -> list[DatasetCandidate]:

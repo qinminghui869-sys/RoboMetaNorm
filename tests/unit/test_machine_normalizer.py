@@ -13,7 +13,11 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.machine.models import ParquetProfile, VectorProfile
 from robometanorm.machine.normalizer import normalize_machine_fields
-from robometanorm.machine.vlm_semantic_resolver import MachineSemantics
+from robometanorm.machine.vlm_semantic_resolver import (
+    MachineSemanticSegment,
+    MachineSemantics,
+    MachineVlmResolutionError,
+)
 
 
 class _FixedMachineResolver:
@@ -36,6 +40,15 @@ class _CountingMachineResolver(_FixedMachineResolver):
     def resolve(self, evidence: dict[str, object]) -> MachineSemantics:
         self.call_count += 1
         return super().resolve(evidence)
+
+
+class _FailingMachineResolver:
+    """模拟已经脱敏的 VLM 协议错误。"""
+
+    def resolve(self, evidence: dict[str, object]) -> MachineSemantics:
+        raise MachineVlmResolutionError(
+            "Authorization: Bearer sk-secret; segments[0].representation 不合法: pose_7d"
+        )
 
 
 class MachineNormalizerTest(unittest.TestCase):
@@ -107,20 +120,7 @@ class MachineNormalizerTest(unittest.TestCase):
                 )
             }
         )
-        semantics = MachineSemantics(
-            semantic_type="head_orientation_quaternion",
-            side="none",
-            body_part="head",
-            representation="quaternion_xyzw",
-            unit="unknown",
-            declared_name_status="partially_correct",
-            standardizable="direct",
-            required_transform="none",
-            confidence=0.94,
-            alternatives=(),
-            need_human_review=False,
-            reason="四元数维度与数值特征一致。",
-        )
+        semantics = self._head_quaternion_semantics()
 
         result = normalize_machine_fields(
             source_info,
@@ -262,37 +262,24 @@ class MachineNormalizerTest(unittest.TestCase):
     def test_keeps_grouped_names_when_vlm_returns_no_supported_target(self) -> None:
         source_info = self._info(
             {
-                "observation.state.hand": {
+                "observation.state.grouped": {
                     "dtype": "float32",
                     "shape": [3],
-                    "names": ["hand_group"],
+                    "names": ["grouped_value"],
                 }
             }
         )
-        unknown_semantics = MachineSemantics(
-            semantic_type="unknown",
-            side="unknown",
-            body_part="unknown",
-            representation="unknown",
-            unit="unknown",
-            declared_name_status="unknown",
-            standardizable="review",
-            required_transform="none",
-            confidence=0.5,
-            alternatives=(),
-            need_human_review=True,
-            reason="证据不足。",
-        )
+        unknown_semantics = self._unknown_semantics(3)
 
         result = normalize_machine_fields(
             source_info,
-            self._profile({"observation.state.hand": 3}),
+            self._profile({"observation.state.grouped": 3}),
             vlm_resolver=_FixedMachineResolver(unknown_semantics),
         )
 
         self.assertEqual(
-            result.normalized_info["features"]["observation.state.hand"]["names"],
-            ["hand_group"],
+            result.normalized_info["features"]["observation.state.grouped"]["names"],
+            ["grouped_value"],
         )
         self.assertIn(
             "NAMES_ORDER_MISMATCH",
@@ -301,21 +288,89 @@ class MachineNormalizerTest(unittest.TestCase):
         review = next(item for item in result.machine_review_items if item.category == "NAMES_ORDER_MISMATCH")
         self.assertEqual(review.candidates, ("unknown",))
 
+    def test_keeps_dexterous_hand_names_for_generic_review_without_vlm(self) -> None:
+        names = ["left_hand_joint_0_rad", "left_finger_joint_0_rad"]
+        source_info = self._info(
+            {
+                "observation.state.dexterous_hand": {
+                    "dtype": "float32",
+                    "shape": [2],
+                    "names": names,
+                    "unit": "rad",
+                }
+            }
+        )
+        resolver = _CountingMachineResolver(self._unknown_semantics(2))
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.dexterous_hand": 2}),
+            vlm_resolver=resolver,
+        )
+
+        self.assertEqual(
+            result.normalized_info["features"]["observation.state.dexterous_hand"]["names"],
+            names,
+        )
+        self.assertEqual(resolver.call_count, 0)
+        self.assertEqual(
+            [item.category for item in result.machine_review_items],
+            ["UNCLASSIFIED_MACHINE_FIELD"],
+        )
+        review = result.machine_review_items[0]
+        self.assertEqual(review.candidates, ())
+        self.assertIsNone(review.vlm_result)
+
+    def test_keeps_grouped_hand_field_for_generic_review_without_vlm(self) -> None:
+        source_info = self._info(
+            {
+                "observation.state.hand": {
+                    "dtype": "float32",
+                    "shape": [3],
+                    "names": ["hand_group"],
+                }
+            }
+        )
+        resolver = _CountingMachineResolver(self._unknown_semantics(3))
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.hand": 3}),
+            vlm_resolver=resolver,
+        )
+
+        self.assertEqual(
+            result.normalized_info["features"]["observation.state.hand"]["names"],
+            ["hand_group"],
+        )
+        self.assertEqual(resolver.call_count, 0)
+        self.assertEqual(
+            [item.category for item in result.machine_review_items],
+            ["UNCLASSIFIED_MACHINE_FIELD"],
+        )
+
     def test_records_transform_and_declared_name_conflict_from_vlm(self) -> None:
         source_info = self._info(
             {"observation.state.rotation": self._feature(["raw_0", "raw_1", "raw_2", "raw_3"])}
         )
         semantics = MachineSemantics(
-            semantic_type="eef_rotation_euler",
-            side="left",
-            body_part="arm",
-            representation="quaternion_xyzw",
-            unit="rad",
-            declared_name_status="misleading",
-            standardizable="needs_transform",
-            required_transform="quaternion_to_euler",
-            confidence=0.95,
-            alternatives=(),
+            segments=(
+                MachineSemanticSegment(
+                    local_slice=(0, 4),
+                    semantic_type="eef_rotation_euler",
+                    side="left",
+                    body_part="arm",
+                    representation="quaternion_xyzw",
+                    unit="rad",
+                    declared_name_status="misleading",
+                    standardizable="needs_transform",
+                    required_transform="quaternion_to_euler",
+                    confidence=0.95,
+                    alternatives=(),
+                    need_human_review=False,
+                    reason="四元数需要转换为欧拉角。",
+                ),
+            ),
             need_human_review=False,
             reason="四元数需要转换为欧拉角。",
         )
@@ -342,29 +397,16 @@ class MachineNormalizerTest(unittest.TestCase):
             {
                 "action": self._feature(["raw_0", "raw_1", "raw_2"]),
                 "observation.state": self._feature(["raw_0", "raw_1", "raw_2"]),
-                "observation.state.hand": {
+                "observation.state.auxiliary": {
                     "dtype": "float32",
                     "shape": [3],
-                    "names": ["hand_group"],
+                    "names": ["auxiliary_group"],
                 },
             }
         )
-        unknown_semantics = MachineSemantics(
-            semantic_type="unknown",
-            side="unknown",
-            body_part="unknown",
-            representation="unknown",
-            unit="unknown",
-            declared_name_status="unknown",
-            standardizable="review",
-            required_transform="none",
-            confidence=0.5,
-            alternatives=(),
-            need_human_review=True,
-            reason="证据不足。",
-        )
+        unknown_semantics = self._unknown_semantics(3)
         profile = self._profile(
-            {"action": 3, "observation.state": 3, "observation.state.hand": 3},
+            {"action": 3, "observation.state": 3, "observation.state.auxiliary": 3},
             equal_action_state=True,
         )
         samples = profile.samples["action"]
@@ -376,7 +418,7 @@ class MachineNormalizerTest(unittest.TestCase):
             {
                 "action": samples,
                 "observation.state": samples.copy(),
-                "observation.state.hand": samples.copy(),
+                "observation.state.auxiliary": samples.copy(),
             },
         )
         resolver = _CountingMachineResolver(unknown_semantics)
@@ -385,6 +427,110 @@ class MachineNormalizerTest(unittest.TestCase):
 
         self.assertEqual(resolver.call_count, 1)
         self.assertIn("ACTION_EQUALS_STATE", {item.category for item in result.machine_review_items})
+
+    def test_concatenates_names_only_when_all_segments_are_safe(self) -> None:
+        source_info = self._info(
+            {
+                "observation.state.arms": {
+                    "dtype": "float32",
+                    "shape": [6],
+                    "names": ["left_arm", "right_arm"],
+                    "unit": "rad",
+                }
+            }
+        )
+        semantics = MachineSemantics(
+            segments=(
+                self._arm_segment((0, 3), "left"),
+                self._arm_segment((3, 6), "right"),
+            ),
+            need_human_review=False,
+            reason="左右臂分段明确。",
+        )
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.arms": 6}),
+            vlm_resolver=_FixedMachineResolver(semantics),
+        )
+
+        self.assertEqual(
+            result.normalized_info["features"]["observation.state.arms"]["names"],
+            [
+                "left_arm_joint_0_rad",
+                "left_arm_joint_1_rad",
+                "left_arm_joint_2_rad",
+                "right_arm_joint_0_rad",
+                "right_arm_joint_1_rad",
+                "right_arm_joint_2_rad",
+            ],
+        )
+        self.assertEqual(result.machine_review_items, ())
+
+    def test_keeps_names_when_any_segment_needs_review(self) -> None:
+        source_info = self._info(
+            {
+                "observation.state.arms": {
+                    "dtype": "float32",
+                    "shape": [6],
+                    "names": ["left_arm", "right_arm"],
+                    "unit": "rad",
+                }
+            }
+        )
+        right = self._arm_segment((3, 6), "right")
+        right = MachineSemanticSegment(
+            **{
+                **right.__dict__,
+                "unit": "unknown",
+                "standardizable": "review",
+                "need_human_review": True,
+            }
+        )
+        semantics = MachineSemantics(
+            segments=(self._arm_segment((0, 3), "left"), right),
+            need_human_review=True,
+            reason="右臂单位未知。",
+        )
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.arms": 6}),
+            vlm_resolver=_FixedMachineResolver(semantics),
+        )
+
+        self.assertEqual(
+            result.normalized_info["features"]["observation.state.arms"]["names"],
+            ["left_arm", "right_arm"],
+        )
+        review = next(
+            item
+            for item in result.machine_review_items
+            if item.source_feature == "observation.state.arms"
+        )
+        self.assertEqual(len(review.vlm_result["segments"]), 2)
+
+    def test_records_sanitized_vlm_error_on_review_item(self) -> None:
+        source_info = self._info(
+            {"observation.state.raw": self._feature(["raw_0"])}
+        )
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile({"observation.state.raw": 1}),
+            vlm_resolver=_FailingMachineResolver(),
+        )
+
+        review = next(
+            item
+            for item in result.machine_review_items
+            if item.category == "VLM_RESOLUTION_FAILED"
+        )
+        vlm_error = getattr(review, "vlm_error", None)
+        self.assertIsInstance(vlm_error, str)
+        self.assertIn("segments[0].representation 不合法: pose_7d", vlm_error)
+        self.assertNotIn("Authorization", vlm_error)
+        self.assertNotIn("sk-secret", vlm_error)
 
     @staticmethod
     def _feature(names: list[str], shape: int | None = None) -> dict[str, object]:
@@ -397,18 +543,69 @@ class MachineNormalizerTest(unittest.TestCase):
     @staticmethod
     def _head_quaternion_semantics() -> MachineSemantics:
         return MachineSemantics(
-            semantic_type="head_orientation_quaternion",
-            side="none",
-            body_part="head",
-            representation="quaternion_xyzw",
-            unit="unknown",
+            segments=(
+                MachineSemanticSegment(
+                    local_slice=(0, 4),
+                    semantic_type="head_orientation_quaternion",
+                    side="none",
+                    body_part="head",
+                    representation="quaternion_xyzw",
+                    unit="unknown",
+                    declared_name_status="partially_correct",
+                    standardizable="direct",
+                    required_transform="none",
+                    confidence=0.94,
+                    alternatives=(),
+                    need_human_review=False,
+                    reason="四元数维度与数值特征一致。",
+                ),
+            ),
+            need_human_review=False,
+            reason="四元数维度与数值特征一致。",
+        )
+
+    @staticmethod
+    def _unknown_semantics(vector_length: int) -> MachineSemantics:
+        return MachineSemantics(
+            segments=(
+                MachineSemanticSegment(
+                    local_slice=(0, vector_length),
+                    semantic_type="unknown",
+                    side="unknown",
+                    body_part="unknown",
+                    representation="unknown",
+                    unit="unknown",
+                    declared_name_status="unknown",
+                    standardizable="review",
+                    required_transform="none",
+                    confidence=0.5,
+                    alternatives=(),
+                    need_human_review=True,
+                    reason="证据不足。",
+                ),
+            ),
+            need_human_review=True,
+            reason="证据不足。",
+        )
+
+    @staticmethod
+    def _arm_segment(
+        local_slice: tuple[int, int], side: str
+    ) -> MachineSemanticSegment:
+        return MachineSemanticSegment(
+            local_slice=local_slice,
+            semantic_type="arm_joint",
+            side=side,
+            body_part="arm",
+            representation="joint_vector",
+            unit="rad",
             declared_name_status="partially_correct",
             standardizable="direct",
             required_transform="none",
-            confidence=0.94,
+            confidence=0.96,
             alternatives=(),
             need_human_review=False,
-            reason="四元数维度与数值特征一致。",
+            reason="分段和单位由字段证据确认。",
         )
 
     @staticmethod

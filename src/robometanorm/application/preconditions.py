@@ -41,8 +41,6 @@ def check_preconditions(
         review_items.append(
             _review("camera_primary", "block", "未发现可作为主摄像头的视觉特征。")
         )
-    if not _contains_file(candidate.source_path, {".urdf"}):
-        review_items.append(_review("missing_urdf", "block", "未发现机器人 URDF 文件。"))
     if not _contains_named_script(candidate.source_path, ("collect", "record", "capture")):
         review_items.append(
             _review("missing_collection_program", "warning", "未发现数据采集落盘程序。")
