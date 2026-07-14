@@ -18,7 +18,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.cli.main import main
-from robometanorm.camera.vlm_classifier import OpenAICompatibleVlmClassifier
+from robometanorm.camera.vlm import OpenAICompatibleVlmClassifier
 
 
 class CliIntegrationTest(unittest.TestCase):

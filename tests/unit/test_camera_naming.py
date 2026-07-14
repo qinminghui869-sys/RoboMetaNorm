@@ -8,8 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.camera.collision_checker import find_colliding_sources
-from robometanorm.camera.name_parser import propose_camera_name
+from robometanorm.camera.naming import find_colliding_sources, propose_camera_name
 
 
 class CameraNamingTest(unittest.TestCase):

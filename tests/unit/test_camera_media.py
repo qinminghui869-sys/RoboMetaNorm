@@ -12,12 +12,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.camera.discovery import find_camera_media
-from robometanorm.camera.frame_sampler import first_stage_ratios, second_stage_ratios
-from robometanorm.camera.media_probe import probe_media
+from robometanorm.camera.media import (
+    find_camera_media,
+    first_stage_ratios,
+    probe_media,
+    second_stage_ratios,
+)
 from robometanorm.camera.normalizer import _select_second_stage_episodes
-from robometanorm.camera.prompt_builder import build_vlm_prompt
-from robometanorm.camera.vlm_classifier import parse_vlm_semantics
+from robometanorm.camera.vlm import build_vlm_prompt, parse_vlm_semantics
 from robometanorm.domain.models import DatasetCandidate, LayoutType
 
 
@@ -84,7 +86,7 @@ class CameraMediaTest(unittest.TestCase):
         }
         completed = CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
 
-        with patch("robometanorm.camera.media_probe.subprocess.run", return_value=completed):
+        with patch("robometanorm.camera.media.subprocess.run", return_value=completed):
             media = probe_media(Path("episode.mp4"))
 
         self.assertEqual(media.codec, "h264")

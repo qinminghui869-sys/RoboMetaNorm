@@ -10,7 +10,7 @@ from pathlib import Path
 from robometanorm.adapters.filesystem import discover_datasets
 from robometanorm.application.preconditions import check_preconditions
 from robometanorm.camera.normalizer import normalize_cameras
-from robometanorm.camera.vlm_classifier import VlmClassifier
+from robometanorm.camera.vlm import VlmClassifier
 from robometanorm.domain.models import (
     DatasetCandidate,
     DatasetResult,

@@ -7,24 +7,27 @@ from copy import deepcopy
 from pathlib import Path
 import tempfile
 
-from robometanorm.camera.collision_checker import find_colliding_sources
-from robometanorm.camera.discovery import discover_camera_features, find_camera_media
-from robometanorm.camera.frame_sampler import (
+from robometanorm.camera.media import (
+    MediaInfo,
+    discover_camera_features,
     extract_rgb_frames,
+    find_camera_media,
     first_stage_ratios,
+    probe_media,
     second_stage_ratios,
 )
-from robometanorm.camera.media_probe import MediaInfo, probe_media
 from robometanorm.camera.models import (
     CameraNameProposal,
     CameraNormalizationResult,
     CameraReviewCandidate,
     CameraReviewItem,
 )
-from robometanorm.camera.name_builder import build_camera_key
-from robometanorm.camera.name_parser import propose_camera_name
-from robometanorm.camera.prompt_builder import build_vlm_prompt
-from robometanorm.camera.vlm_classifier import CameraSemantics, VlmClassifier
+from robometanorm.camera.naming import (
+    build_camera_key,
+    find_colliding_sources,
+    propose_camera_name,
+)
+from robometanorm.camera.vlm import CameraSemantics, VlmClassifier, build_vlm_prompt
 from robometanorm.domain.models import DatasetCandidate
 from robometanorm.episode_sampling import select_representative_episodes
 

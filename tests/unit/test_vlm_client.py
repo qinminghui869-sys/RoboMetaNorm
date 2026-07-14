@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.camera.vlm_classifier import OpenAICompatibleVlmClassifier
+from robometanorm.camera.vlm import OpenAICompatibleVlmClassifier
 
 
 class _Response:
@@ -81,7 +81,7 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
         )
 
         with patch(
-            "robometanorm.camera.vlm_classifier.request.urlopen",
+            "robometanorm.camera.vlm.request.urlopen",
             side_effect=[transient_error, response],
         ) as urlopen:
             semantics = client.classify("system", "user", ())
@@ -107,7 +107,7 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
         )
 
         with patch(
-            "robometanorm.camera.vlm_classifier.request.urlopen",
+            "robometanorm.camera.vlm.request.urlopen",
             return_value=response,
         ) as urlopen:
             payload = client.request_json("return JSON", "user", ())
@@ -124,7 +124,7 @@ class OpenAICompatibleVlmClientTest(unittest.TestCase):
         )
         client = OpenAICompatibleVlmClassifier("http://localhost/v1", "test-vlm", "test-key")
 
-        with patch("robometanorm.camera.vlm_classifier.request.urlopen", return_value=response):
+        with patch("robometanorm.camera.vlm.request.urlopen", return_value=response):
             payload = client.request_json("system", "user", ())
 
         self.assertEqual(payload, {"semantic_type": "unknown"})
