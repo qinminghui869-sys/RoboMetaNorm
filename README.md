@@ -1,132 +1,161 @@
 # RoboMetaNorm
 
-面向机器人数据集的**规范化建议工具**。RoboMetaNorm 扫描数据集、检查转换前置条件，并依据《数据转换标准》生成可审核的元数据建议；它不直接改写原始数据。
+RoboMetaNorm 是面向机器人数据集的非破坏性元数据规范化工具。它扫描数据集，结合有限的 Parquet 样本和视频证据生成规范化建议与人工复核清单，不直接修改任何源数据。
 
-## 核心原则
+## 设计原则
 
-- **非破坏性**：不修改 `info.json`、Parquet、视频目录或媒体文件。
-- **可审核**：每个数据集在 `meta/` 中生成 `info_norm.json` 和 `info_norm_review.json`，并将可删除的 Parquet 画像缓存放在隐藏子目录。
-- **确定性优先**：相机与机器字段均由规则决定最终名称；VLM 只提供受限语义。
-- **批处理隔离**：单个数据集异常不会中断其余数据集；全局结果仅输出到命令行，不落盘汇总文件。
+- **源数据只读**：不修改 `info.json`、Parquet、视频、图像或 Depth 文件。
+- **规则优先**：最终字段名由确定性规则生成；VLM 仅提供受约束的语义判断。
+- **保守采纳**：证据不足、命名冲突或结构不一致时保留源字段，并进入人工复核。
+- **结果可追溯**：规范建议、复核原因、候选项和证据分别写入数据集的 `meta/` 目录。
+- **批处理隔离**：单个数据集失败不会中断同一批次中的其他数据集。
 
-## 当前能力
+## 支持范围
 
-| 阶段 | 状态 | 能力 |
-| --- | --- | --- |
-| P0 | 已实现 | 递归发现、两种目录布局、前置条件检查、原子输出、命令行汇总 |
-| P1 | 已实现 | 相机字段映射、固定 token 命名、媒体探测、冲突复核、可选 VLM 语义识别、RGB/Depth 编码建议 |
-| P2 | 已实现 | Parquet 有限样本画像、Episode 进度与缓存、action/state 去重、复合字段分段语义、保守命名与人工复核 |
+| 能力 | 说明 |
+| --- | --- |
+| 数据集发现 | 支持平铺和任务分组目录，可自动识别或显式指定布局 |
+| 前置检查 | 检查 RGB、action、observation、主摄像头等必要证据 |
+| 相机字段 | 规范 RGB/Depth 字段名，检查媒体 FPS 与 shape，建议 AV1/FFV1 编码 |
+| 机器字段 | 基于有限 Parquet 样本检查维度、跨 Episode 布局、父子切片及 action/state 一致性 |
+| 可选 VLM | 为规则无法确定的相机或机器字段提供结构化语义判断 |
+| 审核输出 | 生成规范化元数据建议和结构化人工复核清单 |
 
-机器字段规范仅覆盖机械臂末端为夹爪的机器人。显式灵巧手字段保持源名称，不发送给机器 VLM，也不生成候选名称，而是进入通用人工复核。
+机器字段规范仅适用于末端执行器为夹爪的机械臂。灵巧手、手指关节和手部关键点字段保持源名称，不发送给机器字段 VLM，并进入人工复核。
 
-## 环境与安装
+本工具不转换数值，不推断未知单位，不依赖 URDF，也不处理四元数转欧拉角、夹爪量程或方向转换、骨架及关键点转换。
+
+## 环境要求
 
 - Python 3.10+
-- PyArrow 与 NumPy（随主依赖安装，用于 P2 Parquet 画像）
-- 系统安装 FFprobe/FFmpeg（P1 媒体探测与抽帧）
+- NumPy 与 PyArrow：随主依赖安装，用于 Parquet 有限样本画像
+- FFprobe 与 FFmpeg：用于视频探测和抽帧
+- OpenAI-compatible VLM 服务：可选，仅在配置后调用
+
+安装项目：
 
 ```bash
 python3 -m pip install -e .
 ```
 
-Depth 预览需要可选依赖：
+如需 Depth 预览能力，可安装可选依赖：
 
 ```bash
 python3 -m pip install -e '.[depth]'
 ```
 
-## 输入约定
+## 输入目录
 
-支持以下两种布局，扫描入口均为 `meta/info.json`：
+扫描入口固定为每个数据集的 `meta/info.json`。支持两种布局：
 
 ```text
 # 平铺布局
-collect_data/<dataset>/meta/info.json
+/path/to/datasets/
+└── <dataset>/
+    ├── meta/info.json
+    ├── data/
+    ├── videos/
+    └── depth/                 # 可选
 
 # 任务分组布局
-single_collect_data/<task>/<dataset>/meta/info.json
+/path/to/datasets/
+└── <task>/
+    └── <dataset>/
+        ├── meta/info.json
+        ├── data/
+        ├── videos/
+        └── depth/             # 可选
 ```
 
-数据集目录至少包含 `data/` 或 `videos/`；depth 媒体如存在，放在 `<dataset>/depth/`。命名规范化不解析、也不要求 URDF。扫描会忽略 `.git`、`.cache` 和 `__pycache__`。
+数据集至少需要 `data/` 或 `videos/` 目录。扫描会忽略 `.git`、`.cache` 和 `__pycache__`。
 
 ## 快速开始
 
-先只读扫描，确认状态与复核数量：
+先执行只读扫描，检查数据集状态和复核数量：
 
 ```bash
-robometanorm scan --root /path/to/collect_data
+robometanorm scan --root /path/to/datasets
 ```
 
-确认后生成规范化建议：
+生成规范化建议：
 
 ```bash
-robometanorm normalize --root /path/to/collect_data
+robometanorm normalize --root /path/to/datasets
 ```
 
-可用 `--layout auto|flat|task_grouped` 限制目录布局，默认 `auto`。未安装命令行入口时，可改用：
+使用 `--layout auto|flat|task_grouped` 指定目录布局，默认值为 `auto`。如果尚未安装命令行入口，可直接从源码运行：
 
 ```bash
-PYTHONPATH=src python3 -m robometanorm scan --root /path/to/collect_data
+PYTHONPATH=src python3 -m robometanorm scan --root /path/to/datasets
 ```
 
-### 可选：启用 VLM
+### 启用 VLM
 
-默认不调用外部 VLM。配置后，未知或冲突相机可抽帧请求语义；机器字段仅提交结构、有限样本数值画像与声明名称，不提交目标字段名：
-
-```bash
-export OPENAI_API_KEY="<secret>"
-
-robometanorm normalize --root /path/to/collect_data \
-  --vlm-endpoint http://127.0.0.1:8002/v1 \
-  --vlm-model qwen3-vl-30b-a3b-instruct-fp8
-```
-
-生产环境请通过环境变量或密钥管理系统注入密钥，禁止将密钥写入命令历史、配置文件或版本库。可按需设置 `--vlm-timeout-seconds`、`--vlm-max-retries`、`--vlm-retry-backoff-seconds`、`--vlm-max-tokens` 和 `--confidence-threshold`（P1 相机阈值）。P2 自动写入固定要求：置信度不低于 0.92、无歧义、无需转换、维度匹配；有量纲字段还必须在元数据中显式确认单位。
-
-DashScope Qwen3.7-Plus 可使用：
+默认不调用外部 VLM。`--vlm-endpoint` 与 `--vlm-model` 必须同时提供，API Key 通过环境变量注入：
 
 ```bash
-export DASHSCOPE_API_KEY="<secret>"
+export VLM_API_KEY="<secret>"
 
 robometanorm normalize \
-  --root /path/to/collect_data \
-  --layout flat \
-  --vlm-endpoint 'https://dashscope.aliyuncs.com/compatible-mode/v1' \
-  --vlm-model 'qwen3.7-plus' \
-  --vlm-api-key-env DASHSCOPE_API_KEY
+  --root /path/to/datasets \
+  --vlm-endpoint https://vlm.example.com/v1 \
+  --vlm-model your-model \
+  --vlm-api-key-env VLM_API_KEY
 ```
 
-对 DashScope endpoint，客户端会固定使用非思考模式和 JSON Mode，并不发送 `max_tokens`，以降低结构化 JSON 被截断的风险。非 DashScope endpoint 保持原有请求参数。机器 VLM 返回的复合字段必须以连续 `segments` 完整覆盖源向量；首次业务 schema 错误只纠错一次，再失败则保留源名并将脱敏原因写入审核文件。
+不要将密钥写入命令、配置文件或版本库。可按需设置以下参数：
 
-### Parquet 画像进度与缓存
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `--confidence-threshold` | `0.85` | 相机 VLM 结果的自动采纳阈值 |
+| `--vlm-timeout-seconds` | `120` | 单次请求超时秒数 |
+| `--vlm-max-retries` | `2` | 网络异常、HTTP 429 和 5xx 的最大重试次数 |
+| `--vlm-retry-backoff-seconds` | `1.0` | 指数退避的初始等待秒数 |
+| `--vlm-max-tokens` | `1024` | 非特定兼容端点的最大输出 token 数 |
 
-首次 `normalize` 会在 stderr 中输出 `正在分析 episode 1/100` 类似进度。画像成功后写入 `<dataset>/meta/.robometanorm_cache/`；当 Parquet 相对路径、大小、mtime 和采样配置未变时，后续运行会输出 `已加载 Parquet 画像缓存`。缓存损坏或指纹不匹配时会自动重建，不会修改源 Parquet。
+机器字段自动采纳使用更严格的固定门槛：置信度不低于 `0.92`、结果无歧义、无需数值转换且维度一致；有量纲字段还必须在源元数据中明确单位。复合字段必须由连续分段完整覆盖，任一分段不满足要求时保留整个源字段。
 
-## 输出与状态
+对于 DashScope compatible-mode endpoint，客户端使用非思考模式和 JSON Mode，并省略 `max_tokens`，避免结构化结果被截断。其他 OpenAI-compatible endpoint 使用标准请求参数。
 
-`normalize` 生成两个审核文件和一组可删除缓存：
+## Episode 采样策略
+
+为控制大规模数据集的分析开销，规范化过程对每类数据最多读取 2 个 Episode：
+
+- 文件按路径稳定排序；只有一个 Episode 时读取该文件，两个及以上时读取首个和末个。
+- Parquet 仅对入选文件读取 schema、文件元数据和首个 batch；每个 batch 最多 `512` 行。
+- 视频探测、抽帧和 VLM 判断最多接收首、末两个 Episode；第一阶段证据充分时可提前结束，只读取首个视频。
+- Parquet 缓存指纹只包含入选文件。未参与分析的中间 Episode 发生变化时不会重建缓存。
+- 为确定末个 Episode，程序仍需遍历目录项；未入选文件不会进入 Parquet 内容读取、FFprobe、视频抽帧或 VLM 判断。
+
+该策略以固定、可复现的有限样本换取更低的 I/O 成本。跨 Episode 一致性结论仅代表本次选中的首、末样本。
+
+## 输出与复核
+
+`normalize` 在每个数据集的 `meta/` 目录生成：
 
 ```text
 <dataset>/meta/
-├── info.json                 # 原始文件，保持不变
-├── info_norm.json            # 规范化建议
-├── info_norm_review.json     # 人工复核与运行信息
-└── .robometanorm_cache/      # Parquet 画像 JSON/NPZ 缓存
+├── info.json                    # 源元数据，保持不变
+├── info_norm.json               # 规范化建议
+├── info_norm_review.json        # 人工复核项与运行信息
+└── .robometanorm_cache/         # 可删除的 Parquet 画像缓存
 ```
 
-P1 中，确定性 RGB 相机建议使用 `observation.images.cam_<位置>_rgb` 与 `av1`；Depth 建议使用 `_depth` 与 `ffv1`。P2 对 `action`、`observation.state` 及其子字段只读取每个 Episode 的受限 Parquet 样本，验证维度、跨 Episode 布局、父子连续切片与 action/state 一致性后才建议名称。复合字段的 VLM 结果以 `segments` 保存；只有顶层与每个分段全部通过门槛才会拼接新名，否则整个源字段保留不变。机器字段命名不覆盖灵巧手、手指关节或手部关键点。P2 不改变数值、不推断未知单位、不将 wrist 默认视为 EEF，也不处理四元数转欧拉角、夹爪量程/方向、骨架与关键点；这些内容保留源名并写入 `machine_review_items`。FPS、dtype、shape 和未涉及字段保持原值。
+相机建议使用 `observation.images.cam_<位置>_<rgb|depth>` 格式。机器字段仅在声明、实测结构和语义证据全部满足要求时生成新名称。FPS、dtype、shape、数值内容和未覆盖字段保持原值。
 
-状态优先级：`ERROR > BLOCKED > REVIEW > PASS`。
+状态按严重程度排序为 `ERROR > BLOCKED > REVIEW > PASS`：
 
 - `PASS`：检查通过，无待处理项。
-- `REVIEW`：可继续使用，但需要人工确认。
-- `BLOCKED`：缺少 RGB、action、observation 或主摄像头等实际命名证据。URDF 不是本工具的前置条件。
-- `ERROR`：元数据读取、输出或运行时发生错误。
+- `REVIEW`：已生成可用建议，但存在需要人工确认的内容。
+- `BLOCKED`：缺少继续判断所需的必要命名或结构证据。
+- `ERROR`：元数据读取、输出或运行过程发生错误。
+
+建议先运行 `scan`，处理 `BLOCKED` 项并确认 `REVIEW` 原因，再对生产数据运行 `normalize`。
 
 ## 验证
+
+运行完整测试：
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
-
-建议在生产批处理前先对小规模副本运行 `scan`，审阅 `REVIEW`/`BLOCKED` 的原因后再执行 `normalize`。
