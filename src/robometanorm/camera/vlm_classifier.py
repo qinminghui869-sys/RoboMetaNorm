@@ -190,8 +190,6 @@ def parse_vlm_semantics(payload: Mapping[str, object]) -> CameraSemantics:
     confidence = payload.get("confidence")
     if modality not in {"rgb", "depth", "unknown"}:
         raise ValueError("VLM 模态不合法")
-    if mount_type not in {"body", "external", "unknown"}:
-        raise ValueError("VLM 安装类型不合法")
     if not isinstance(direction_tokens, list) or not all(
         isinstance(token, str) and token in EXTERNAL_DIRECTION_TOKENS
         for token in direction_tokens

@@ -121,6 +121,23 @@ class CameraMediaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_vlm_semantics({"target_key": "observation.images.cam_left_rgb"})
 
+    def test_vlm_mount_type_does_not_restrict_semantic_parsing(self) -> None:
+        semantics = parse_vlm_semantics(
+            {
+                "modality": "rgb",
+                "mount_type": "fixed",
+                "direction_tokens": ["left"],
+                "body_part": None,
+                "is_primary": False,
+                "confidence": 0.94,
+                "ambiguous": False,
+                "alternatives": [],
+                "need_human_review": False,
+            }
+        )
+
+        self.assertEqual(semantics.mount_type, "fixed")
+
 
 if __name__ == "__main__":
     unittest.main()
