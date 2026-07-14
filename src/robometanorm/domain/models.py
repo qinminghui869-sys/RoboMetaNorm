@@ -72,3 +72,7 @@ class DatasetResult:
     source_info: dict[str, object] | None
     camera_review_count: int = 0
     machine_review_count: int = 0
+    camera_confirmed_count: int = 0
+    camera_inferred_count: int = 0
+    camera_unresolved_count: int = 0
+    topology_error_count: int = 0

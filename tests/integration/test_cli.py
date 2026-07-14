@@ -64,6 +64,9 @@ class CliIntegrationTest(unittest.TestCase):
         output = self._run("normalize", "--root", str(self.root))
 
         self.assertIn("dataset_001", output)
+        self.assertIn("Cam C/I/U", output)
+        self.assertIn("Topology Errors", output)
+        self.assertIn("0/0/1", output)
         self.assertTrue((self.dataset_path / "meta" / "info_norm.json").is_file())
         self.assertTrue((self.dataset_path / "meta" / "info_norm_review.json").is_file())
         normalized = json.loads(

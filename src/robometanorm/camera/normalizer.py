@@ -68,11 +68,17 @@ def normalize_cameras(
     review_items: list[CameraReviewItem] = []
     proposal_reviews: dict[str, CameraReviewItem] = {}
     robot_id = robot_identity.canonical_id if robot_identity is not None else None
+    topology_lookup_requested = bool(
+        robot_id is not None
+        and topology_resolver is not None
+        and any(
+            propose_camera_name(source_key) is None
+            for source_key in camera_features
+        )
+    )
     topology = (
         topology_resolver.resolve(robot_id)
-        if robot_id is not None
-        and topology_resolver is not None
-        and any(propose_camera_name(source_key) is None for source_key in camera_features)
+        if topology_lookup_requested
         else None
     )
     pending: list[_CameraEvidence] = []
@@ -102,7 +108,9 @@ def normalize_cameras(
     unresolved: list[_CameraEvidence] = []
     for evidence in pending:
         semantics = evidence.semantics
-        if _semantics_is_decisive(semantics, confidence_threshold):
+        if _semantics_is_decisive(
+            semantics, confidence_threshold
+        ) and _semantics_matches_source_category(evidence.source_key, semantics):
             mount = _mount_from_semantics(semantics)
             if mount is not None:
                 confirmed = _topology_confirms_mount(
@@ -180,8 +188,23 @@ def normalize_cameras(
     review_items.extend(proposal_reviews.values())
     review_items.extend(_validate_media(candidate, source_info, camera_features))
     _replace_feature_keys(normalized_info, proposals)
+    confirmed_count = sum(
+        proposal.inference_level == "CONFIRMED" for proposal in proposals.values()
+    )
+    inferred_count = sum(
+        proposal.inference_level == "INFERRED" for proposal in proposals.values()
+    )
     return CameraNormalizationResult(
-        normalized_info, tuple(_deduplicate_reviews(review_items))
+        normalized_info=normalized_info,
+        camera_review_items=tuple(_deduplicate_reviews(review_items)),
+        confirmed_count=confirmed_count,
+        inferred_count=inferred_count,
+        unresolved_count=len(camera_features) - len(proposals),
+        topology_error_count=int(
+            topology_lookup_requested
+            and topology_resolver is not None
+            and bool(getattr(topology_resolver, "last_error_code", None))
+        ),
     )
 
 
@@ -437,6 +460,7 @@ def _topology_confirms_mount(
     """联网拓扑和本地画面必须一致，才能标记确认。"""
     return bool(
         topology
+        and not topology.partial
         and not topology.ambiguous
         and topology.confidence >= confidence_threshold
         and mount in topology.camera_mounts
@@ -514,11 +538,30 @@ def _supported_remaining_mounts(
     occupied_mounts: set[CameraMount],
     remaining_source_count: int,
 ) -> list[CameraMount]:
-    """源名只作弱提示；没有其他证据时不让单一拓扑直接改名。"""
+    """先要求本地画面支持安装类别，再用槽位关系形成唯一解。"""
+    semantics = evidence.semantics
+    if (
+        semantics is None
+        or semantics.mount_type is None
+        or semantics.confidence < 0.85
+        or semantics.ambiguous
+        or semantics.need_human_review
+    ):
+        return []
+    expected_mount_type = _source_mount_type_constraint(evidence.source_key)
+    compatible = [
+        mount
+        for mount in available
+        if mount.mount_type == semantics.mount_type
+        and (
+            expected_mount_type is None
+            or mount.mount_type == expected_mount_type
+        )
+    ]
     source_tokens = set(re.findall(r"[a-z0-9]+", evidence.source_key.lower()))
     hinted = [
         mount
-        for mount in available
+        for mount in compatible
         if source_tokens.intersection(
             {*mount.direction_tokens, *([mount.body_part] if mount.body_part else [])}
         )
@@ -526,11 +569,11 @@ def _supported_remaining_mounts(
     if len(hinted) == 1:
         return hinted
     if (
-        len(available) == 1
+        len(compatible) == 1
         and remaining_source_count == 1
         and occupied_mounts
     ):
-        return list(available)
+        return compatible
     return []
 
 
@@ -567,13 +610,24 @@ def _unresolved_review(
     if topology is None and topology_resolver is not None:
         topology_error = getattr(topology_resolver, "last_error", None)
         topology_error_code = getattr(topology_resolver, "last_error_code", None)
+        topology_error_evidence = dict(
+            getattr(topology_resolver, "last_error_evidence", {}) or {}
+        )
         if topology_error_code:
             review_evidence["topology_error_code"] = topology_error_code
         if topology_error:
             review_evidence["topology_error"] = topology_error
+        if topology_error_evidence:
+            review_evidence["topology_error_evidence"] = topology_error_evidence
 
     candidates: tuple[CameraReviewCandidate, ...] = ()
-    if evidence.semantics is not None:
+    source_category_conflict = bool(
+        evidence.semantics is not None
+        and not _semantics_matches_source_category(
+            evidence.source_key, evidence.semantics
+        )
+    )
+    if evidence.semantics is not None and not source_category_conflict:
         target_key = build_camera_key(
             evidence.semantics.mount_type or "",
             evidence.semantics.direction_tokens,
@@ -592,17 +646,43 @@ def _unresolved_review(
             candidates=evidence.issue.candidates or candidates,
             evidence=review_evidence,
         )
-    reason_code = (
-        "VLM_LOW_CONFIDENCE_OR_AMBIGUOUS"
-        if evidence.semantics is not None
-        else "CAMERA_NAME_UNRESOLVED"
-    )
+    topology_error_code = review_evidence.get("topology_error_code")
+    if source_category_conflict:
+        reason_code = "SOURCE_CAMERA_CATEGORY_CONFLICT"
+    elif isinstance(topology_error_code, str):
+        reason_code = topology_error_code
+    elif evidence.semantics is None:
+        reason_code = "CAMERA_NAME_UNRESOLVED"
+    elif (
+        evidence.semantics.confidence >= 0.85
+        and not evidence.semantics.ambiguous
+        and not evidence.semantics.need_human_review
+    ):
+        reason_code = "CAMERA_SEMANTICS_INCOMPLETE"
+    else:
+        reason_code = "VLM_LOW_CONFIDENCE_OR_AMBIGUOUS"
     return _review(
         evidence.source_key,
         reason_code,
         candidates=candidates,
         evidence=review_evidence,
     )
+
+
+def _semantics_matches_source_category(
+    source_key: str, semantics: CameraSemantics
+) -> bool:
+    """执行少量具有明确类别含义的源字段约束。"""
+    expected_mount_type = _source_mount_type_constraint(source_key)
+    return expected_mount_type is None or semantics.mount_type == expected_mount_type
+
+
+def _source_mount_type_constraint(source_key: str) -> str | None:
+    """third-view 类字段明确表示外部相机，但不提供具体方位。"""
+    tokens = set(re.findall(r"[a-z0-9]+", source_key.lower()))
+    if "third" in tokens and ({"view", "person"} & tokens):
+        return "external"
+    return None
 
 
 def _camera_evidence_payload(
@@ -634,6 +714,15 @@ def _topology_payload(topology: RobotCameraTopology | None) -> object:
         ],
         "confidence": topology.confidence,
         "ambiguous": topology.ambiguous,
+        "partial": topology.partial,
+        "rejected_mounts": [
+            {
+                "field": rejection.field,
+                "value": rejection.value,
+                "reason": rejection.reason,
+            }
+            for rejection in topology.rejected_mounts
+        ],
     }
 
 

@@ -175,12 +175,36 @@ class CameraMediaTest(unittest.TestCase):
 
         self.assertNotIn("target_key", system_prompt + user_prompt)
         self.assertIn("direction_tokens 仅允许", system_prompt)
+        self.assertIn("external 必须且只能返回一个方位词", system_prompt)
         self.assertIn("未知时返回空数组 []", system_prompt)
         self.assertIn("body_part 仅允许", system_prompt)
         self.assertIn("未知时返回 null", system_prompt)
+        self.assertIn("high 只是弱提示", system_prompt)
+        self.assertIn("居中且较高的机器人视角", system_prompt)
+        self.assertIn("固定俯视", system_prompt)
+        self.assertIn("third_view", system_prompt)
+        self.assertIn("不能据此猜测方位", system_prompt)
         self.assertEqual(semantics.body_part, "wrist")
         with self.assertRaises(ValueError):
             parse_vlm_semantics({"target_key": "observation.images.cam_left_rgb"})
+
+    def test_rejects_multiple_external_direction_tokens(self) -> None:
+        with self.assertRaises(CameraSemanticsValidationError) as caught:
+            parse_vlm_semantics(
+                {
+                    "modality": "rgb",
+                    "mount_type": "external",
+                    "direction_tokens": ["top", "side"],
+                    "body_part": None,
+                    "is_primary": False,
+                    "confidence": 0.95,
+                    "ambiguous": False,
+                    "alternatives": [],
+                    "need_human_review": False,
+                }
+            )
+
+        self.assertEqual(caught.exception.field, "direction_tokens")
 
     def test_normalizes_safe_unknown_sentinels_but_rejects_unknown_tokens(self) -> None:
         payload = {

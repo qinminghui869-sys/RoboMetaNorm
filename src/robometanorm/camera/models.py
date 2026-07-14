@@ -15,13 +15,28 @@ class CameraMount:
 
 
 @dataclass(frozen=True)
+class TopologyRejection:
+    """被拓扑 schema 拒绝的单个相机槽位及其原始证据。"""
+
+    field: str
+    value: object
+    reason: str
+
+
+@dataclass(frozen=True)
 class RobotCameraTopology:
-    """联网查询并通过严格 schema 校验的机器人本体相机拓扑。"""
+    """联网查询并通过 schema 校验的机器人标准相机配置。"""
 
     robot_id: str
     camera_mounts: tuple[CameraMount, ...]
     confidence: float
     ambiguous: bool
+    rejected_mounts: tuple[TopologyRejection, ...] = ()
+
+    @property
+    def partial(self) -> bool:
+        """是否仅有部分槽位通过校验。"""
+        return bool(self.rejected_mounts)
 
 
 @dataclass(frozen=True)
@@ -60,3 +75,7 @@ class CameraNormalizationResult:
 
     normalized_info: dict[str, object]
     camera_review_items: tuple[CameraReviewItem, ...]
+    confirmed_count: int = 0
+    inferred_count: int = 0
+    unresolved_count: int = 0
+    topology_error_count: int = 0

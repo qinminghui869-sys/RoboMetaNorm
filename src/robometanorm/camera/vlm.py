@@ -29,11 +29,14 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = f"""你是机器人数据集相机语义分类器。
 根据字段元数据和视频采样图判断模态、安装类型、方位、本体部位、主摄像头与歧义。
 left/right 表示安装位置而非画面物体位置；wrist 表示末端执行器附近且随机械臂运动。
+源名中的 high 只是弱提示，不能直接等同于 head 或 top；必须以采样画面为本地证据。
+源名中的 third_view 或 third_person 表示 external 类别，但不能据此猜测方位；方位必须由采样画面的主视角判断。
+居中且较高的机器人视角、机械臂从画面边缘进入，可支持 on_robot/head；固定俯视的支架或环境总览视角支持 external/top。
 严格返回一个 JSON 对象，不得输出最终标准字段名：
 - modality 仅允许 rgb、depth、unknown。
 - mount_type 仅允许 on_robot、external。
 - on_robot 的 direction_tokens 仅允许 {", ".join(sorted(ON_ROBOT_DIRECTION_TOKENS | {"ego"}))}。
-- external 的 direction_tokens 仅允许 {", ".join(sorted(EXTERNAL_DIRECTION_TOKENS))}；未知时返回空数组 []。
+- external 必须且只能返回一个方位词，仅允许 {", ".join(sorted(EXTERNAL_DIRECTION_TOKENS))}；确实未知时返回空数组 [] 并标记歧义。
 - body_part 仅允许 {", ".join(sorted(BODY_PART_TOKENS))}；未知时返回 null。
 - external 的 body_part 必须为 null；ego 不得与其他方位或部位组合。
 - is_primary、ambiguous、need_human_review 必须是布尔值。
@@ -365,6 +368,12 @@ def parse_vlm_semantics(payload: Mapping[str, object]) -> CameraSemantics:
     if mount_type == "external" and body_part is not None:
         raise CameraSemanticsValidationError(
             "外部相机不得包含本体部位", field="body_part", value=body_part
+        )
+    if mount_type == "external" and len(direction_tokens) > 1:
+        raise CameraSemanticsValidationError(
+            "外部相机只能包含一个方位词",
+            field="direction_tokens",
+            value=direction_tokens,
         )
     if (
         isinstance(confidence, bool)

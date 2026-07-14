@@ -84,8 +84,10 @@ def build_camera_key(
             or not tokens.issubset(ON_ROBOT_DIRECTION_TOKENS)
         ):
             return None
-    elif body_part is not None or not tokens or not tokens.issubset(
-        EXTERNAL_DIRECTION_TOKENS
+    elif (
+        body_part is not None
+        or len(tokens) != 1
+        or not tokens.issubset(EXTERNAL_DIRECTION_TOKENS)
     ):
         return None
 

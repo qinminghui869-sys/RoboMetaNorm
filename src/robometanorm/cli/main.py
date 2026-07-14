@@ -167,13 +167,32 @@ def _build_gripper_direction_resolver(
 
 def _format_summary(results: Sequence[DatasetResult]) -> str:
     """使用标准库输出框架约定的执行汇总表。"""
-    headers = ["Dataset", "Status", "Cameras", "Machine Fields", "Reviews"]
+    headers = [
+        "Dataset",
+        "Status",
+        "Cameras",
+        "Machine Fields",
+        "Cam C/I/U",
+        "Topology Errors",
+        "Machine Reviews",
+        "Reviews",
+    ]
     rows = [
         [
             result.candidate.dataset_name,
             result.status.value,
             str(result.camera_count),
             str(result.machine_field_count),
+            "/".join(
+                str(count)
+                for count in (
+                    result.camera_confirmed_count,
+                    result.camera_inferred_count,
+                    result.camera_unresolved_count,
+                )
+            ),
+            str(result.topology_error_count),
+            str(result.machine_review_count),
             str(
                 len(result.review_items)
                 + result.camera_review_count

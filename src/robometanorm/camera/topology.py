@@ -1,4 +1,4 @@
-"""按机器人型号联网查询并校验本体相机拓扑。"""
+"""按机器人型号联网查询并校验标准相机配置。"""
 
 from __future__ import annotations
 
@@ -6,15 +6,20 @@ from collections.abc import Mapping
 import json
 from typing import Protocol
 
-from robometanorm.camera.models import CameraMount, RobotCameraTopology
-from robometanorm.camera.naming import build_camera_key
+from robometanorm.camera.models import (
+    CameraMount,
+    RobotCameraTopology,
+    TopologyRejection,
+)
+from robometanorm.camera.naming import MOUNT_TYPES, build_camera_key
 
 
 TOPOLOGY_SYSTEM_PROMPT = """你是机器人硬件相机拓扑研究助手。
-请联网检索机器人厂商、产品手册和可靠技术资料，判断指定型号出厂或本体集成的相机安装位。
-只报告机器人本体相机，不报告数据采集现场额外架设的外部相机。
+请联网检索机器人厂商、产品手册和可靠技术资料，判断指定型号的标准相机配置。
+报告机器人本体集成相机，以及标准平台配置中的固定外部相机；不要报告数据采集现场临时架设的任意相机。
 严格返回 JSON，不得返回数据集最终字段名或 target_key。
-camera_mounts 每项只含 mount_type、direction_tokens、body_part；mount_type 必须为 on_robot。
+camera_mounts 每项只含 mount_type、direction_tokens、body_part；mount_type 只能为 on_robot 或 external。
+external 必须且只能给出一个主方位词，body_part 必须为 null。
 证据冲突或型号不明确时设置 ambiguous=true 并降低 confidence。"""
 
 
@@ -102,7 +107,22 @@ class OpenAICompatibleRobotCameraTopologyResolver:
             )
             return self._cache_result(cache_key, None)
 
-        self._set_error(None, None, {})
+        if topology.partial:
+            rejected_mounts = [
+                {
+                    "field": rejection.field,
+                    "value": rejection.value,
+                    "reason": rejection.reason,
+                }
+                for rejection in topology.rejected_mounts
+            ]
+            self._set_error(
+                f"机器人相机拓扑仅部分有效，拒绝 {len(rejected_mounts)} 个槽位",
+                "ROBOT_TOPOLOGY_PARTIAL",
+                {"rejected_mounts": rejected_mounts},
+            )
+        else:
+            self._set_error(None, None, {})
         return self._cache_result(cache_key, topology)
 
     def _cache_result(
@@ -136,7 +156,7 @@ class OpenAICompatibleRobotCameraTopologyResolver:
 def parse_robot_camera_topology(
     payload: Mapping[str, object],
 ) -> RobotCameraTopology:
-    """把联网结果限制为内置规范允许的机器人本体相机槽位。"""
+    """校验标准相机配置；保留合法槽位并记录局部非法证据。"""
     if "target_key" in payload:
         raise RobotCameraTopologyValidationError(
             "联网结果不得包含最终字段名",
@@ -171,47 +191,20 @@ def parse_robot_camera_topology(
         )
 
     mounts: list[CameraMount] = []
+    rejected_mounts: list[TopologyRejection] = []
     for index, value in enumerate(mounts_payload):
         field_prefix = f"camera_mounts[{index}]"
-        if not isinstance(value, Mapping):
-            raise RobotCameraTopologyValidationError(
-                "相机槽位必须是对象", field=field_prefix, value=value
+        try:
+            mount = _parse_camera_mount(value, field_prefix)
+        except RobotCameraTopologyValidationError as topology_error:
+            rejected_mounts.append(
+                TopologyRejection(
+                    field=topology_error.field,
+                    value=topology_error.value,
+                    reason=str(topology_error),
+                )
             )
-        if "target_key" in value:
-            raise RobotCameraTopologyValidationError(
-                "相机槽位不得包含最终字段名",
-                field=f"{field_prefix}.target_key",
-                value=value.get("target_key"),
-            )
-        if value.get("mount_type") != "on_robot":
-            raise RobotCameraTopologyValidationError(
-                "机器人拓扑只能包含本体相机",
-                field=f"{field_prefix}.mount_type",
-                value=value.get("mount_type"),
-            )
-        directions = value.get("direction_tokens")
-        body_part = value.get("body_part")
-        if not isinstance(directions, list) or not all(
-            isinstance(token, str) for token in directions
-        ):
-            raise RobotCameraTopologyValidationError(
-                "direction_tokens 必须是字符串数组",
-                field=f"{field_prefix}.direction_tokens",
-                value=directions,
-            )
-        if body_part is not None and not isinstance(body_part, str):
-            raise RobotCameraTopologyValidationError(
-                "body_part 必须是字符串或 null",
-                field=f"{field_prefix}.body_part",
-                value=body_part,
-            )
-        mount = CameraMount("on_robot", tuple(directions), body_part)
-        if build_camera_key(
-            mount.mount_type, mount.direction_tokens, mount.body_part, "rgb"
-        ) is None:
-            raise RobotCameraTopologyValidationError(
-                "相机槽位不符合内置命名规范", field=field_prefix, value=dict(value)
-            )
+            continue
         if mount not in mounts:
             mounts.append(mount)
 
@@ -220,4 +213,50 @@ def parse_robot_camera_topology(
         camera_mounts=tuple(mounts),
         confidence=float(confidence),
         ambiguous=ambiguous,
+        rejected_mounts=tuple(rejected_mounts),
     )
+
+
+def _parse_camera_mount(value: object, field_prefix: str) -> CameraMount:
+    """解析单个槽位，使局部失败不会丢弃其余有效拓扑。"""
+    if not isinstance(value, Mapping):
+        raise RobotCameraTopologyValidationError(
+            "相机槽位必须是对象", field=field_prefix, value=value
+        )
+    if "target_key" in value:
+        raise RobotCameraTopologyValidationError(
+            "相机槽位不得包含最终字段名",
+            field=f"{field_prefix}.target_key",
+            value=value.get("target_key"),
+        )
+    mount_type = value.get("mount_type")
+    if mount_type not in MOUNT_TYPES:
+        raise RobotCameraTopologyValidationError(
+            "mount_type 只能为 on_robot 或 external",
+            field=f"{field_prefix}.mount_type",
+            value=mount_type,
+        )
+    directions = value.get("direction_tokens")
+    body_part = value.get("body_part")
+    if not isinstance(directions, list) or not all(
+        isinstance(token, str) for token in directions
+    ):
+        raise RobotCameraTopologyValidationError(
+            "direction_tokens 必须是字符串数组",
+            field=f"{field_prefix}.direction_tokens",
+            value=directions,
+        )
+    if body_part is not None and not isinstance(body_part, str):
+        raise RobotCameraTopologyValidationError(
+            "body_part 必须是字符串或 null",
+            field=f"{field_prefix}.body_part",
+            value=body_part,
+        )
+    mount = CameraMount(str(mount_type), tuple(directions), body_part)
+    if build_camera_key(
+        mount.mount_type, mount.direction_tokens, mount.body_part, "rgb"
+    ) is None:
+        raise RobotCameraTopologyValidationError(
+            "相机槽位不符合内置命名规范", field=field_prefix, value=dict(value)
+        )
+    return mount

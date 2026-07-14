@@ -45,6 +45,16 @@ class CameraNamingTest(unittest.TestCase):
             "observation.images.cam_env_depth",
         )
 
+    def test_rejects_compound_external_camera_directions(self) -> None:
+        self.assertIsNone(
+            build_camera_key("external", ("top", "side"), None, "rgb")
+        )
+        self.assertIsNone(
+            parse_standard_camera_key(
+                "observation.images.cam_top_side_rgb"
+            )
+        )
+
     def test_rejects_tokens_that_do_not_match_the_mount_type(self) -> None:
         self.assertIsNone(build_camera_key("external", ("left",), "wrist", "rgb"))
         self.assertIsNone(build_camera_key("on_robot", ("env",), "head", "rgb"))

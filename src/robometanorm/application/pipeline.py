@@ -158,6 +158,10 @@ def normalize_datasets(
                 review_items=report.review_items,
                 camera_review_count=len(camera_result.camera_review_items),
                 machine_review_count=len(machine_result.machine_review_items),
+                camera_confirmed_count=camera_result.confirmed_count,
+                camera_inferred_count=camera_result.inferred_count,
+                camera_unresolved_count=camera_result.unresolved_count,
+                topology_error_count=camera_result.topology_error_count,
             )
         except (OSError, RuntimeError, ValueError) as error:
             results[index] = _error_result(result.candidate, error)

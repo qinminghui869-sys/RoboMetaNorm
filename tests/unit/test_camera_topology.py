@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 from robometanorm.camera.topology import (
     OpenAICompatibleRobotCameraTopologyResolver,
     RobotCameraTopologyValidationError,
+    TOPOLOGY_SYSTEM_PROMPT,
     parse_robot_camera_topology,
 )
 
@@ -75,49 +76,90 @@ class CameraTopologyTest(unittest.TestCase):
         self.assertEqual(topology.confidence, 0.95)
         self.assertFalse(topology.ambiguous)
 
-    def test_rejects_final_names_external_mounts_and_invalid_tokens(self) -> None:
+    def test_rejects_final_names_at_the_top_level(self) -> None:
         with self.assertRaises(RobotCameraTopologyValidationError) as caught:
             parse_robot_camera_topology(
                 {**_airbot_payload(), "target_key": "observation.images.cam_head_rgb"}
             )
         self.assertEqual(caught.exception.field, "target_key")
 
+    def test_accepts_platform_external_cameras_from_the_robot_configuration(self) -> None:
         external = _airbot_payload()
+        external["robot_id"] = "agilex_cobot_magic"
         external["camera_mounts"] = [
             {
                 "mount_type": "external",
-                "direction_tokens": ["front"],
+                "direction_tokens": ["top"],
                 "body_part": None,
             }
         ]
-        with self.assertRaises(RobotCameraTopologyValidationError) as caught:
-            parse_robot_camera_topology(external)
-        self.assertEqual(caught.exception.field, "camera_mounts[0].mount_type")
 
+        topology = parse_robot_camera_topology(external)
+
+        self.assertEqual(topology.camera_mounts[0].mount_type, "external")
+        self.assertEqual(topology.camera_mounts[0].direction_tokens, ("top",))
+        self.assertFalse(topology.partial)
+        self.assertIn("标准平台配置中的固定外部相机", TOPOLOGY_SYSTEM_PROMPT)
+
+    def test_keeps_valid_mounts_and_records_rejected_mounts(self) -> None:
         invalid = _airbot_payload()
-        invalid["camera_mounts"] = [
+        invalid["camera_mounts"].extend(
+            [
             {
                 "mount_type": "on_robot",
-                "direction_tokens": ["high"],
-                "body_part": "head",
-            }
-        ]
-        with self.assertRaises(RobotCameraTopologyValidationError) as caught:
-            parse_robot_camera_topology(invalid)
-        self.assertEqual(caught.exception.field, "camera_mounts[0]")
-
-        nested_target = _airbot_payload()
-        nested_target["camera_mounts"] = [
+                "direction_tokens": ["top"],
+                "body_part": None,
+            },
             {
                 "mount_type": "on_robot",
                 "direction_tokens": [],
                 "body_part": "head",
                 "target_key": "observation.images.cam_head_rgb",
+            },
+            ]
+        )
+
+        topology = parse_robot_camera_topology(invalid)
+
+        self.assertEqual(len(topology.camera_mounts), 3)
+        self.assertTrue(topology.partial)
+        self.assertEqual(len(topology.rejected_mounts), 2)
+        self.assertEqual(topology.rejected_mounts[0].field, "camera_mounts[3]")
+        self.assertEqual(
+            topology.rejected_mounts[0].value,
+            {
+                "mount_type": "on_robot",
+                "direction_tokens": ["top"],
+                "body_part": None,
+            },
+        )
+        self.assertEqual(
+            topology.rejected_mounts[1].field,
+            "camera_mounts[4].target_key",
+        )
+
+    def test_resolver_exposes_partial_topology_evidence(self) -> None:
+        payload = _airbot_payload()
+        payload["camera_mounts"].append(
+            {
+                "mount_type": "on_robot",
+                "direction_tokens": ["top"],
+                "body_part": None,
             }
-        ]
-        with self.assertRaises(RobotCameraTopologyValidationError) as caught:
-            parse_robot_camera_topology(nested_target)
-        self.assertEqual(caught.exception.field, "camera_mounts[0].target_key")
+        )
+        resolver = OpenAICompatibleRobotCameraTopologyResolver(
+            _TopologyClient(payload)
+        )
+
+        topology = resolver.resolve("airbot_mmk2")
+
+        self.assertIsNotNone(topology)
+        self.assertTrue(topology.partial)
+        self.assertEqual(resolver.last_error_code, "ROBOT_TOPOLOGY_PARTIAL")
+        self.assertEqual(
+            resolver.last_error_evidence["rejected_mounts"][0]["field"],
+            "camera_mounts[3]",
+        )
 
     def test_resolver_queries_each_robot_only_once(self) -> None:
         client = _TopologyClient(_airbot_payload())
