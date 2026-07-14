@@ -20,9 +20,10 @@ from robometanorm.machine.rules import (
     declared_names,
     declared_vector_length,
     discover_machine_features,
-    is_dexterous_hand_field,
+    is_out_of_scope_machine_field,
     resolve_child_slices,
     risk_categories,
+    unknown_unit_indices,
 )
 from robometanorm.machine.vlm import (
     MachineSemantics,
@@ -41,6 +42,20 @@ def normalize_machine_fields(
     """只为维度、表示形式和单位均可确认的字段生成名称建议。"""
     normalized_info = deepcopy(dict(source_info))
     source_features = discover_machine_features(source_info)
+    out_of_scope = _find_out_of_scope_field(source_features)
+    if out_of_scope is not None:
+        feature_name, names = out_of_scope
+        return MachineNormalizationResult(
+            normalized_info,
+            (
+                _review(
+                    feature_name,
+                    "OUT_OF_SCOPE_MACHINE_FIELD",
+                    tuple(names),
+                    _required_action("OUT_OF_SCOPE_MACHINE_FIELD"),
+                ),
+            ),
+        )
     normalized_features = normalized_info.get("features")
     if not isinstance(normalized_features, dict):
         return MachineNormalizationResult(normalized_info, ())
@@ -116,16 +131,20 @@ def normalize_machine_fields(
             if action_names is not None:
                 _replace_names(normalized_features, "action", action_names)
 
-    if equal_action_state:
-        review_items.append(
-            _review(
-                "action",
-                "ACTION_EQUALS_STATE",
-                (),
-                "action 与 observation.state 的采样向量一致，复用同一分析结果。",
-            )
-        )
-    return MachineNormalizationResult(normalized_info, tuple(_deduplicate_reviews(review_items)))
+    return MachineNormalizationResult(
+        normalized_info, tuple(_deduplicate_reviews(review_items))
+    )
+
+
+def _find_out_of_scope_field(
+    source_features: Mapping[str, Mapping[str, object]],
+) -> tuple[str, list[str]] | None:
+    """在任何分析前定位当前规范未覆盖的灵巧手或骨架字段。"""
+    for feature_name, feature in source_features.items():
+        names = declared_names(feature) or []
+        if is_out_of_scope_machine_field(feature_name, names):
+            return feature_name, names
+    return None
 
 
 def _build_parent_names_from_children(
@@ -236,16 +255,6 @@ def _normalize_feature_names(
                 source_slice=source_slice,
             )
         ]
-    if is_dexterous_hand_field(feature_name, names):
-        return None, [
-            _review(
-                feature_name,
-                "UNCLASSIFIED_MACHINE_FIELD",
-                tuple(names),
-                _required_action("UNCLASSIFIED_MACHINE_FIELD"),
-                source_slice=source_slice,
-            )
-        ]
     if len(names) < declared_length:
         return _normalize_grouped_feature_names(
             feature_name,
@@ -298,22 +307,42 @@ def _normalize_feature_names(
     if not names_are_confirmed and not categories:
         categories.add("UNCLASSIFIED_MACHINE_FIELD")
     vlm_result = _semantics_to_dict(semantics) if semantics else None
-    reviews = [
-        _review(
-            feature_name,
-            category,
-            tuple(names),
-            _required_action(category),
-            source_slice=source_slice,
-            vlm_result=vlm_result,
-            candidates=candidates,
-            vlm_error=(
-                resolver_error if category == "VLM_RESOLUTION_FAILED" else None
-            ),
+    reviews: list[MachineReviewItem] = []
+    for category in sorted(categories):
+        review_names, review_slice = _review_scope(category, names, source_slice)
+        reviews.append(
+            _review(
+                feature_name,
+                category,
+                review_names,
+                _required_action(category),
+                source_slice=review_slice,
+                vlm_result=vlm_result,
+                candidates=candidates,
+                vlm_error=(
+                    resolver_error
+                    if category == "VLM_RESOLUTION_FAILED"
+                    else None
+                ),
+            )
         )
-        for category in sorted(categories)
-    ]
     return normalized_names, reviews
+
+
+def _review_scope(
+    category: str,
+    names: list[str],
+    source_slice: tuple[int, int] | None,
+) -> tuple[tuple[str, ...], tuple[int, int] | None]:
+    """将可定位的单位问题收敛到实际受影响维度。"""
+    if category != "UNKNOWN_UNIT":
+        return tuple(names), source_slice
+    indices = unknown_unit_indices(names)
+    if not indices:
+        return tuple(names), source_slice
+    start, end = min(indices), max(indices) + 1
+    parent_offset = source_slice[0] if source_slice is not None else 0
+    return tuple(names[start:end]), (parent_offset + start, parent_offset + end)
 
 
 def _normalize_grouped_feature_names(
@@ -590,7 +619,6 @@ def _required_action(category: str) -> str:
     """提供与风险类别对应的人工确认动作。"""
     actions = {
         "WRIST_EEF_RELATION_UNKNOWN": "确认 wrist 字段是否为末端执行器位姿。",
-        "SKELETON_STANDARD_UNDEFINED": "确认骨架或关键点字段的后续标准。",
         "GRIPPER_RANGE_UNKNOWN": "确认夹爪物理量程和目标量程。",
         "GRIPPER_DIRECTION_UNKNOWN": "确认夹爪开合方向。",
         "UNKNOWN_UNIT": "确认物理单位后再添加 _m 或 _rad。",
@@ -598,6 +626,10 @@ def _required_action(category: str) -> str:
         "DECLARED_NAME_CONFLICT": "确认声明名称与实际字段语义是否一致。",
         "QUATERNION_REQUIRES_EULER_CONVERSION": "确认旋转表示转换后再写入欧拉角字段名。",
         "UNCLASSIFIED_MACHINE_FIELD": "确认字段语义、表示形式和单位后再规范化。",
+        "OUT_OF_SCOPE_MACHINE_FIELD": (
+            "灵巧手、手指、骨架或关键点字段不在当前规范范围，"
+            "保留全部源字段并人工复核。"
+        ),
         "VLM_SEMANTICS_REVIEW": "确认 VLM 语义及其单位、表示形式后再采纳。",
         "VLM_RESOLUTION_FAILED": "检查 VLM 服务或改为人工确认字段语义。",
         "CROSS_EPISODE_LAYOUT_INCONSISTENT": "确认不同 Episode 的字段 schema 和向量长度一致。",

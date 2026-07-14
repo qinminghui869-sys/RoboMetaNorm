@@ -81,11 +81,11 @@ class MachineNormalizerTest(unittest.TestCase):
         self.assertEqual(result.normalized_info["features"]["action"]["names"], expected)
         self.assertEqual(result.normalized_info["features"]["observation.state"]["names"], expected)
         self.assertEqual(source_info, original_info)
-        self.assertIn("ACTION_EQUALS_STATE", {item.category for item in result.machine_review_items})
+        self.assertNotIn("ACTION_EQUALS_STATE", {item.category for item in result.machine_review_items})
         self.assertIn("UNKNOWN_UNIT", {item.category for item in result.machine_review_items})
 
     def test_keeps_unsafe_names_and_records_machine_review_categories(self) -> None:
-        names = ["left_wrist_pose_x", "left_skeleton_point_1", "left_gripper"]
+        names = ["left_wrist_pose_x", "left_joint_1", "left_gripper"]
         source_info = self._info({"action": self._feature(names)})
 
         result = normalize_machine_fields(source_info, self._profile({"action": 3}))
@@ -95,7 +95,6 @@ class MachineNormalizerTest(unittest.TestCase):
             {item.category for item in result.machine_review_items},
             {
                 "WRIST_EEF_RELATION_UNKNOWN",
-                "SKELETON_STANDARD_UNDEFINED",
                 "GRIPPER_RANGE_UNKNOWN",
                 "GRIPPER_DIRECTION_UNKNOWN",
                 "UNKNOWN_UNIT",
@@ -315,7 +314,7 @@ class MachineNormalizerTest(unittest.TestCase):
         self.assertEqual(resolver.call_count, 0)
         self.assertEqual(
             [item.category for item in result.machine_review_items],
-            ["UNCLASSIFIED_MACHINE_FIELD"],
+            ["OUT_OF_SCOPE_MACHINE_FIELD"],
         )
         review = result.machine_review_items[0]
         self.assertEqual(review.candidates, ())
@@ -346,8 +345,44 @@ class MachineNormalizerTest(unittest.TestCase):
         self.assertEqual(resolver.call_count, 0)
         self.assertEqual(
             [item.category for item in result.machine_review_items],
-            ["UNCLASSIFIED_MACHINE_FIELD"],
+            ["OUT_OF_SCOPE_MACHINE_FIELD"],
         )
+
+    def test_skips_all_machine_analysis_when_skeleton_fields_are_out_of_scope(self) -> None:
+        source_info = self._info(
+            {
+                "action": self._feature(["left_arm_joint_0_rad"]),
+                "observation.state": self._feature(
+                    ["left_arm_joint_0_rad", "left_skeleton_point_0"]
+                ),
+                "observation.state.full_skeleton": {
+                    "dtype": "float32",
+                    "shape": [3],
+                    "names": ["full_skeleton"],
+                },
+            }
+        )
+        original_info = deepcopy(source_info)
+        resolver = _CountingMachineResolver(self._unknown_semantics(3))
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile(
+                {
+                    "action": 1,
+                    "observation.state": 2,
+                    "observation.state.full_skeleton": 3,
+                }
+            ),
+            vlm_resolver=resolver,
+        )
+
+        self.assertEqual(result.normalized_info, original_info)
+        self.assertEqual(resolver.call_count, 0)
+        self.assertEqual(len(result.machine_review_items), 1)
+        review = result.machine_review_items[0]
+        self.assertEqual(review.category, "OUT_OF_SCOPE_MACHINE_FIELD")
+        self.assertIn("保留全部源字段", review.required_action)
 
     def test_records_transform_and_declared_name_conflict_from_vlm(self) -> None:
         source_info = self._info(
@@ -426,7 +461,28 @@ class MachineNormalizerTest(unittest.TestCase):
         result = normalize_machine_fields(source_info, profile, vlm_resolver=resolver)
 
         self.assertEqual(resolver.call_count, 1)
-        self.assertIn("ACTION_EQUALS_STATE", {item.category for item in result.machine_review_items})
+        self.assertNotIn("ACTION_EQUALS_STATE", {item.category for item in result.machine_review_items})
+
+    def test_limits_unknown_unit_review_to_affected_dimensions(self) -> None:
+        names = [
+            "left_arm_joint_0_rad",
+            "left_wrist_pose_x",
+            "left_arm_joint_1_rad",
+        ]
+        source_info = self._info({"action": self._feature(names)})
+
+        result = normalize_machine_fields(
+            source_info,
+            self._profile({"action": 3}),
+        )
+
+        review = next(
+            item
+            for item in result.machine_review_items
+            if item.category == "UNKNOWN_UNIT"
+        )
+        self.assertEqual(review.source_slice, (1, 2))
+        self.assertEqual(review.declared_names, ("left_wrist_pose_x",))
 
     def test_concatenates_names_only_when_all_segments_are_safe(self) -> None:
         source_info = self._info(

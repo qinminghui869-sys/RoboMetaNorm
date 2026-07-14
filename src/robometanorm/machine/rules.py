@@ -12,8 +12,8 @@ from robometanorm.machine.models import ParquetProfile
 
 PARENT_MACHINE_FEATURES = ("action", "observation.state")
 
-_DEXTEROUS_HAND_TOKEN = re.compile(
-    r"(?<![a-z0-9])(?:dexterous|hand|finger)(?![a-z0-9])",
+_OUT_OF_SCOPE_TOKEN = re.compile(
+    r"(?<![a-z0-9])(?:dexterous|hand|finger|skeleton|keypoint)(?![a-z0-9])",
     re.IGNORECASE,
 )
 _HEAD_QUATERNION_PATTERN = re.compile(r"^head_(?:rotation_)?quat_([xyzw])$")
@@ -76,12 +76,12 @@ def action_equals_state(profile: ParquetProfile | None) -> bool:
     )
 
 
-def is_dexterous_hand_field(
+def is_out_of_scope_machine_field(
     source_feature: str, names: Sequence[str]
 ) -> bool:
-    """判断机器字段是否明确属于夹爪末端规范之外的灵巧手字段。"""
+    """判断字段是否属于当前夹爪末端规范未覆盖的灵巧手或骨架数据。"""
     return any(
-        _DEXTEROUS_HAND_TOKEN.search(value) is not None
+        _OUT_OF_SCOPE_TOKEN.search(value) is not None
         for value in (source_feature, *names)
     )
 
@@ -112,15 +112,26 @@ def risk_categories(names: Sequence[str]) -> set[str]:
         categories.add("DECLARED_NAME_CONFLICT")
     if any("wrist" in name for name in lowered):
         categories.add("WRIST_EEF_RELATION_UNKNOWN")
-    if any("skeleton" in name or "keypoint" in name for name in lowered):
-        categories.add("SKELETON_STANDARD_UNDEFINED")
     if any("gripper" in name for name in lowered):
         categories.update({"GRIPPER_RANGE_UNKNOWN", "GRIPPER_DIRECTION_UNKNOWN"})
-    if any("pose" in name or "position" in name for name in lowered):
-        categories.add("UNKNOWN_UNIT")
-    if any("joint" in name and not name.endswith("_rad") for name in lowered):
+    if unknown_unit_indices(lowered):
         categories.add("UNKNOWN_UNIT")
     return categories
+
+
+def unknown_unit_indices(names: Sequence[str]) -> tuple[int, ...]:
+    """返回缺少所需显式单位 token 的字段维度。"""
+    indices: list[int] = []
+    for index, name in enumerate(names):
+        lowered = name.lower()
+        tokens = set(re.findall(r"[a-z0-9]+", lowered))
+        if "joint" in lowered and "rad" not in tokens:
+            indices.append(index)
+        elif "position" in lowered and "m" not in tokens:
+            indices.append(index)
+        elif "pose" in lowered and not tokens.intersection({"m", "rad"}):
+            indices.append(index)
+    return tuple(indices)
 
 
 def build_confirmed_machine_name(source_name: str) -> str | None:

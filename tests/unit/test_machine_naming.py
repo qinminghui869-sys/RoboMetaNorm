@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 from robometanorm.machine.rules import (
     build_confirmed_machine_name,
     build_names_from_semantics,
+    risk_categories,
+    unknown_unit_indices,
 )
 
 
@@ -29,6 +31,20 @@ class MachineNamingTest(unittest.TestCase):
             build_confirmed_machine_name("left_gripper_open"),
             "left_gripper_open",
         )
+
+    def test_recognizes_unit_tokens_before_structural_suffixes(self) -> None:
+        names = [
+            "follower_left_arm_joint_1_rad.pos",
+            "right_joint_1",
+            "left_eef_position_x_m.value",
+        ]
+
+        self.assertEqual(unknown_unit_indices(names), (1,))
+        self.assertNotIn(
+            "UNKNOWN_UNIT",
+            risk_categories(["follower_left_arm_joint_1_rad.pos"]),
+        )
+        self.assertIn("UNKNOWN_UNIT", risk_categories(["right_joint_1"]))
 
 
 if __name__ == "__main__":
