@@ -26,6 +26,7 @@ from robometanorm.camera.name_parser import propose_camera_name
 from robometanorm.camera.prompt_builder import build_vlm_prompt
 from robometanorm.camera.vlm_classifier import CameraSemantics, VlmClassifier
 from robometanorm.domain.models import DatasetCandidate
+from robometanorm.episode_sampling import select_representative_episodes
 
 
 def normalize_cameras(
@@ -194,10 +195,8 @@ def _semantics_is_decisive(semantics: CameraSemantics | None) -> bool:
 
 
 def _select_second_stage_episodes(media_files: Sequence[Path]) -> tuple[Path, ...]:
-    """多 episode 取首、中、末，单 episode 只取自身。"""
-    if len(media_files) <= 1:
-        return tuple(media_files)
-    return (media_files[0], media_files[len(media_files) // 2], media_files[-1])
+    """按稳定顺序最多选择首、末两个 Episode。"""
+    return select_representative_episodes(media_files)
 
 
 def _proposal_from_semantics(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -11,10 +12,13 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
+from robometanorm.camera.discovery import find_camera_media
 from robometanorm.camera.frame_sampler import first_stage_ratios, second_stage_ratios
 from robometanorm.camera.media_probe import probe_media
+from robometanorm.camera.normalizer import _select_second_stage_episodes
 from robometanorm.camera.prompt_builder import build_vlm_prompt
 from robometanorm.camera.vlm_classifier import parse_vlm_semantics
+from robometanorm.domain.models import DatasetCandidate, LayoutType
 
 
 class CameraMediaTest(unittest.TestCase):
@@ -24,6 +28,45 @@ class CameraMediaTest(unittest.TestCase):
         self.assertEqual(first_stage_ratios(), (0.1, 0.5, 0.9))
         self.assertEqual(second_stage_ratios(1), (0.1, 0.3, 0.5, 0.7, 0.9))
         self.assertEqual(second_stage_ratios(3), (0.2, 0.5, 0.8))
+
+    def test_discovers_only_first_and_last_camera_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            dataset_path = Path(temporary_directory)
+            media_directory = (
+                dataset_path / "videos" / "observation.images.camera_1"
+            )
+            media_directory.mkdir(parents=True)
+            episodes = tuple(
+                media_directory / f"episode_{index:06d}.mp4"
+                for index in range(4)
+            )
+            for episode in episodes:
+                episode.touch()
+            candidate = DatasetCandidate(
+                dataset_name="dataset",
+                task_name=None,
+                source_path=dataset_path,
+                layout_type=LayoutType.FLAT,
+                info_path=dataset_path / "meta" / "info.json",
+                data_path=None,
+                video_path=dataset_path / "videos",
+                depth_path=None,
+            )
+
+            self.assertEqual(
+                find_camera_media(candidate, "observation.images.camera_1"),
+                (episodes[0], episodes[-1]),
+            )
+
+    def test_second_stage_selects_only_first_and_last_camera_episode(self) -> None:
+        episodes = tuple(
+            Path(f"episode_{index:06d}.mp4") for index in range(4)
+        )
+
+        self.assertEqual(
+            _select_second_stage_episodes(episodes),
+            (episodes[0], episodes[-1]),
+        )
 
     def test_reads_media_metadata_from_ffprobe_json(self) -> None:
         payload = {

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from robometanorm.domain.models import DatasetCandidate
+from robometanorm.episode_sampling import select_representative_episodes
 
 
 MEDIA_SUFFIXES = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
@@ -24,7 +25,7 @@ def discover_camera_features(info: Mapping[str, object]) -> dict[str, Mapping[st
 
 
 def find_camera_media(candidate: DatasetCandidate, source_key: str) -> tuple[Path, ...]:
-    """按视频目录名匹配源字段，返回排序后的 episode 文件。"""
+    """按视频目录名匹配源字段，返回首、末 Episode 文件。"""
     roots = [path for path in (candidate.video_path, candidate.depth_path) if path is not None]
     files = [
         path
@@ -35,4 +36,4 @@ def find_camera_media(candidate: DatasetCandidate, source_key: str) -> tuple[Pat
         and path.suffix.lower() in MEDIA_SUFFIXES
         and source_key in path.parts
     ]
-    return tuple(sorted(files))
+    return select_representative_episodes(files)
