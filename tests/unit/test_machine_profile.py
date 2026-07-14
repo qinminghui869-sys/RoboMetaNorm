@@ -14,7 +14,11 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.machine.rules import resolve_child_slices
-from robometanorm.machine.profiling import profile_parquet, profile_parquets
+from robometanorm.machine.profiling import (
+    profile_parquet,
+    profile_parquets,
+    sample_gripper_extremes,
+)
 
 
 class MachineParquetProfileTest(unittest.TestCase):
@@ -79,6 +83,62 @@ class MachineParquetProfileTest(unittest.TestCase):
 
         self.assertEqual(profile.episode_count, 2)
         self.assertIn("action", profile.inconsistent_columns)
+
+    def test_profiles_declared_gripper_dimension_across_both_episodes(self) -> None:
+        first_path = Path(self.temp_dir.name) / "episode_000.parquet"
+        last_path = Path(self.temp_dir.name) / "episode_999.parquet"
+        pq.write_table(
+            pa.table({"action": [[1.0, 0.0], [2.0, 1.0]]}), first_path
+        )
+        pq.write_table(
+            pa.table({"action": [[3.0, 99.0], [4.0, 103.0]]}), last_path
+        )
+
+        profile = profile_parquets(
+            (first_path, last_path),
+            sample_rows=1,
+            gripper_indices={"action": (1,)},
+        )
+
+        gripper = profile.gripper_profiles["action:1"]
+        self.assertEqual(gripper.sample_count, 4)
+        self.assertEqual(gripper.min_value, 0.0)
+        self.assertEqual(gripper.max_value, 103.0)
+        self.assertGreater(gripper.p99, 99.0)
+        self.assertEqual(gripper.unique_count, 4)
+
+    def test_selects_synchronized_low_and_high_gripper_samples(self) -> None:
+        first_path = Path(self.temp_dir.name) / "episode_000.parquet"
+        last_path = Path(self.temp_dir.name) / "episode_999.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "timestamp": [0.0, 0.5],
+                    "action": [[1.0, 0.0], [2.0, 20.0]],
+                }
+            ),
+            first_path,
+        )
+        pq.write_table(
+            pa.table(
+                {
+                    "timestamp": [0.25, 0.75],
+                    "action": [[3.0, 80.0], [4.0, 100.0]],
+                }
+            ),
+            last_path,
+        )
+
+        samples = sample_gripper_extremes(
+            (first_path, last_path), "action", 1
+        )
+
+        self.assertIsNotNone(samples)
+        low, high = samples
+        self.assertEqual((low.value, low.timestamp_seconds), (0.0, 0.0))
+        self.assertEqual((high.value, high.timestamp_seconds), (100.0, 0.75))
+        self.assertEqual(low.parquet_path, first_path)
+        self.assertEqual(high.parquet_path, last_path)
 
     def test_emits_one_progress_event_per_episode(self) -> None:
         second_path = Path(self.temp_dir.name) / "episode_001.parquet"

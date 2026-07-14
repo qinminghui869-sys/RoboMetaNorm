@@ -11,7 +11,10 @@ import sys
 from robometanorm.application.pipeline import normalize_datasets, scan_datasets
 from robometanorm.camera.vlm import OpenAICompatibleVlmClassifier, VlmClassifier
 from robometanorm.domain.models import DatasetResult, LayoutType
-from robometanorm.machine.vlm import OpenAICompatibleMachineVlmResolver
+from robometanorm.machine.vlm import (
+    OpenAICompatibleGripperDirectionResolver,
+    OpenAICompatibleMachineVlmResolver,
+)
 from robometanorm.machine.models import ProfileProgress
 
 
@@ -30,6 +33,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 layout,
                 vlm_classifier=vlm_classifier,
                 machine_vlm_resolver=_build_machine_vlm_resolver(vlm_classifier),
+                gripper_direction_resolver=_build_gripper_direction_resolver(
+                    vlm_classifier
+                ),
                 confidence_threshold=arguments.confidence_threshold,
                 profile_progress=_print_profile_progress,
             )
@@ -125,6 +131,15 @@ def _build_machine_vlm_resolver(
     """机器字段复用相同 VLM 连接配置，但始终只请求语义 JSON。"""
     if isinstance(vlm_classifier, OpenAICompatibleVlmClassifier):
         return OpenAICompatibleMachineVlmResolver(vlm_classifier)
+    return None
+
+
+def _build_gripper_direction_resolver(
+    vlm_classifier: VlmClassifier | None,
+) -> OpenAICompatibleGripperDirectionResolver | None:
+    """启用 VLM 时复用同一客户端分析夹爪同步帧。"""
+    if isinstance(vlm_classifier, OpenAICompatibleVlmClassifier):
+        return OpenAICompatibleGripperDirectionResolver(vlm_classifier)
     return None
 
 

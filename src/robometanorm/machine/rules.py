@@ -7,7 +7,11 @@ import re
 
 import numpy as np
 
-from robometanorm.machine.models import ParquetProfile
+from robometanorm.machine.models import (
+    GripperRangeInference,
+    ParquetProfile,
+    ScalarProfile,
+)
 
 
 PARENT_MACHINE_FEATURES = ("action", "observation.state")
@@ -112,11 +116,72 @@ def risk_categories(names: Sequence[str]) -> set[str]:
         categories.add("DECLARED_NAME_CONFLICT")
     if any("wrist" in name for name in lowered):
         categories.add("WRIST_EEF_RELATION_UNKNOWN")
-    if any("gripper" in name for name in lowered):
-        categories.update({"GRIPPER_RANGE_UNKNOWN", "GRIPPER_DIRECTION_UNKNOWN"})
     if unknown_unit_indices(lowered):
         categories.add("UNKNOWN_UNIT")
     return categories
+
+
+def gripper_side_from_name(name: str) -> str | None:
+    """只从明确的左右 token 中提取夹爪侧别。"""
+    tokens = set(re.findall(r"[a-z0-9]+", name.lower()))
+    sides = tokens.intersection({"left", "right"})
+    if len(sides) != 1:
+        return None
+    return next(iter(sides))
+
+
+def gripper_direction_from_name(name: str) -> str | None:
+    """仅以明确表示开度或开口宽度的名称确认数值方向。"""
+    lowered = name.lower()
+    if "gripper" not in lowered:
+        return None
+    tokens = set(re.findall(r"[a-z0-9]+", lowered))
+    if tokens.intersection({"open", "opening", "width", "gap", "distance"}):
+        return "increasing_is_open"
+    if "degree_mm" in lowered or "opening_width" in lowered:
+        return "increasing_is_open"
+    return None
+
+
+def infer_gripper_range(profile: ScalarProfile) -> GripperRangeInference | None:
+    """用稳健分位数匹配标准允许的夹爪量程，不做样本极值拉伸。"""
+    low = profile.p01 if profile.p01 is not None else profile.p05
+    high = profile.p99 if profile.p99 is not None else profile.p95
+    if (
+        low is None
+        or high is None
+        or profile.unique_count < 2
+        or profile.nan_ratio > 0.05
+        or profile.inf_ratio > 0.0
+        or high <= low
+    ):
+        return None
+
+    scales = (0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0)
+    scale = min(scales, key=lambda candidate: abs(high - candidate) / candidate)
+    high_error = abs(high - scale) / scale
+    if high_error > 0.1 or abs(low) > 0.1 * scale or high - low < 0.5 * scale:
+        return None
+
+    minimum = profile.min_value
+    maximum = profile.max_value
+    if (
+        minimum is None
+        or maximum is None
+        or minimum < -0.1 * scale
+        or maximum > 1.1 * scale
+    ):
+        return None
+    clipping_required = bool(
+        minimum < 0.0 or maximum > scale
+    )
+    confidence = max(0.9, 0.98 - high_error)
+    return GripperRangeInference(
+        closed_value=0.0,
+        open_value=scale,
+        confidence=confidence,
+        clipping_required=clipping_required,
+    )
 
 
 def unknown_unit_indices(names: Sequence[str]) -> tuple[int, ...]:

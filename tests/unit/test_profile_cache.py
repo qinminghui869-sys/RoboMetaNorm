@@ -52,8 +52,12 @@ class ProfileCacheTest(unittest.TestCase):
             second.samples["action"], first.samples["action"]
         )
         self.assertTrue(any(event.kind == "cache_hit" for event in events))
-        self.assertTrue((self.cache_dir / "parquet_profile_v2.json").is_file())
-        self.assertTrue((self.cache_dir / "parquet_samples_v2.npz").is_file())
+        self.assertTrue((self.cache_dir / "parquet_profile_v3.json").is_file())
+        self.assertTrue((self.cache_dir / "parquet_samples_v3.npz").is_file())
+        self.assertEqual(
+            second.gripper_profiles["action:0"],
+            first.gripper_profiles["action:0"],
+        )
 
     def test_mtime_change_invalidates_cache(self) -> None:
         self._load()
@@ -74,7 +78,7 @@ class ProfileCacheTest(unittest.TestCase):
 
     def test_corrupt_metadata_is_recomputed(self) -> None:
         self._load()
-        metadata_path = self.cache_dir / "parquet_profile_v2.json"
+        metadata_path = self.cache_dir / "parquet_profile_v3.json"
         metadata_path.write_text("not json", encoding="utf-8")
 
         with patch(
@@ -85,7 +89,7 @@ class ProfileCacheTest(unittest.TestCase):
 
         profiler.assert_called_once()
         self.assertEqual(result.episode_count, 2)
-        self.assertEqual(json.loads(metadata_path.read_text())["cache_version"], 2)
+        self.assertEqual(json.loads(metadata_path.read_text())["cache_version"], 3)
 
     def test_cache_write_failure_keeps_profile_and_emits_warning(self) -> None:
         events: list[ProfileProgress] = []
@@ -104,7 +108,7 @@ class ProfileCacheTest(unittest.TestCase):
 
     def test_mismatched_npz_fingerprint_is_recomputed(self) -> None:
         self._load()
-        samples_path = self.cache_dir / "parquet_samples_v2.npz"
+        samples_path = self.cache_dir / "parquet_samples_v3.npz"
         with samples_path.open("wb") as file_handle:
             np.savez_compressed(
                 file_handle,
@@ -123,7 +127,7 @@ class ProfileCacheTest(unittest.TestCase):
 
     def test_truncated_npz_is_recomputed(self) -> None:
         self._load()
-        samples_path = self.cache_dir / "parquet_samples_v2.npz"
+        samples_path = self.cache_dir / "parquet_samples_v3.npz"
         samples_path.write_bytes(b"")
 
         with patch(
@@ -142,6 +146,7 @@ class ProfileCacheTest(unittest.TestCase):
             self.paths,
             self.cache_dir,
             sample_rows=16,
+            gripper_indices={"action": (0,)},
             progress=events.append if events is not None else None,
         )
 

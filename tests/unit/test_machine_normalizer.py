@@ -11,7 +11,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.machine.models import ParquetProfile, VectorProfile
+from robometanorm.machine.models import (
+    GripperDirectionEvidence,
+    ParquetProfile,
+    ScalarProfile,
+    VectorProfile,
+)
 from robometanorm.machine.normalizer import normalize_machine_fields
 from robometanorm.machine.vlm import (
     MachineSemanticSegment,
@@ -100,6 +105,196 @@ class MachineNormalizerTest(unittest.TestCase):
                 "UNKNOWN_UNIT",
             },
         )
+
+    def test_directly_normalizes_confirmed_unit_gripper_and_emits_proposal(self) -> None:
+        source_info = self._info({"action": self._feature(["left_gripper_open"])})
+        profile = self._profile_with_gripper(
+            {"action": 1}, "action:0", self._gripper_profile(0.0, 1.0)
+        )
+
+        result = normalize_machine_fields(source_info, profile)
+
+        self.assertEqual(
+            result.normalized_info["features"]["action"]["names"],
+            ["left_gripper_open"],
+        )
+        self.assertEqual(result.machine_review_items, ())
+        proposal = result.gripper_transform_proposals[0]
+        self.assertEqual(proposal.target_name, "left_gripper_open")
+        self.assertEqual(proposal.formula, "clip(x, 0, 1)")
+        self.assertFalse(proposal.transform_required)
+
+    def test_keeps_scale_100_source_name_and_emits_conversion_proposal(self) -> None:
+        source_name = "leader_left_gripper_degree_mm.pos"
+        source_info = self._info({"action": self._feature([source_name])})
+        profile = self._profile_with_gripper(
+            {"action": 1}, "action:0", self._gripper_profile(-3.0, 103.0)
+        )
+
+        result = normalize_machine_fields(source_info, profile)
+
+        self.assertEqual(
+            result.normalized_info["features"]["action"]["names"],
+            [source_name],
+        )
+        self.assertEqual(result.machine_review_items, ())
+        proposal = result.gripper_transform_proposals[0]
+        self.assertEqual(proposal.target_name, "left_gripper_open")
+        self.assertEqual(proposal.source_open, 100.0)
+        self.assertEqual(proposal.formula, "clip(x / 100, 0, 1)")
+        self.assertTrue(proposal.transform_required)
+
+    def test_uses_visual_direction_for_generic_gripper_name(self) -> None:
+        source_info = self._info({"action": self._feature(["right_gripper"])})
+        profile = self._profile_with_gripper(
+            {"action": 1}, "action:0", self._gripper_profile(0.0, 1.0)
+        )
+        direction = GripperDirectionEvidence(
+            direction="increasing_is_open",
+            confidence=0.96,
+            method="synchronized_video",
+            details={"low_value": 0.0, "high_value": 1.0},
+        )
+
+        result = normalize_machine_fields(
+            source_info,
+            profile,
+            gripper_directions={"right": direction},
+        )
+
+        self.assertEqual(
+            result.normalized_info["features"]["action"]["names"],
+            ["right_gripper_open"],
+        )
+        self.assertEqual(result.machine_review_items, ())
+        self.assertEqual(
+            result.gripper_transform_proposals[0].direction_evidence,
+            "synchronized_video",
+        )
+
+    def test_reviews_only_direction_when_generic_gripper_range_is_known(self) -> None:
+        source_info = self._info({"action": self._feature(["right_gripper"])})
+        profile = self._profile_with_gripper(
+            {"action": 1}, "action:0", self._gripper_profile(0.0, 1.0)
+        )
+
+        result = normalize_machine_fields(source_info, profile)
+
+        self.assertEqual(result.gripper_transform_proposals, ())
+        self.assertEqual(
+            [item.category for item in result.machine_review_items],
+            ["GRIPPER_DIRECTION_UNKNOWN"],
+        )
+        self.assertEqual(result.machine_review_items[0].source_slice, (0, 1))
+
+    def test_reuses_unique_sibling_scale_for_constant_gripper_dimension(self) -> None:
+        names = [
+            "leader_left_gripper_degree_mm.pos",
+            "leader_right_gripper_degree_mm.pos",
+        ]
+        source_info = self._info({"action": self._feature(names)})
+        profile = self._profile({"action": 2})
+        constant = ScalarProfile(
+            sample_count=100,
+            min_value=100.0,
+            max_value=100.0,
+            p01=100.0,
+            p05=100.0,
+            p50=100.0,
+            p95=100.0,
+            p99=100.0,
+            mean_value=100.0,
+            std_value=0.0,
+            nan_ratio=0.0,
+            inf_ratio=0.0,
+            unique_count=1,
+        )
+        profile = ParquetProfile(
+            profile.row_count,
+            profile.row_group_count,
+            profile.schema_columns,
+            profile.columns,
+            profile.samples,
+            gripper_profiles={
+                "action:0": constant,
+                "action:1": self._gripper_profile(0.0, 100.0),
+            },
+        )
+
+        result = normalize_machine_fields(source_info, profile)
+
+        self.assertEqual(result.machine_review_items, ())
+        self.assertEqual(len(result.gripper_transform_proposals), 2)
+        left = result.gripper_transform_proposals[0]
+        self.assertEqual(left.source_open, 100.0)
+        self.assertEqual(left.range_evidence, "sibling_parquet_scale")
+
+    def test_emits_separate_proposals_for_equal_action_and_state(self) -> None:
+        source_name = "leader_left_gripper_degree_mm.pos"
+        source_info = self._info(
+            {
+                "action": self._feature([source_name]),
+                "observation.state": self._feature([source_name]),
+            }
+        )
+        profile = self._profile(
+            {"action": 1, "observation.state": 1}, equal_action_state=True
+        )
+        gripper = self._gripper_profile(0.0, 100.0)
+        profile = ParquetProfile(
+            profile.row_count,
+            profile.row_group_count,
+            profile.schema_columns,
+            profile.columns,
+            profile.samples,
+            gripper_profiles={"action:0": gripper, "observation.state:0": gripper},
+        )
+
+        result = normalize_machine_fields(source_info, profile)
+
+        self.assertEqual(result.machine_review_items, ())
+        self.assertEqual(
+            {item.source_feature for item in result.gripper_transform_proposals},
+            {"action", "observation.state"},
+        )
+        self.assertEqual(
+            result.normalized_info["features"]["action"]["names"],
+            [source_name],
+        )
+
+    def test_equal_state_name_cannot_overwrite_action_that_needs_transform(self) -> None:
+        action_name = "leader_left_gripper_degree_mm.pos"
+        source_info = self._info(
+            {
+                "action": self._feature([action_name]),
+                "observation.state": self._feature(["left_gripper_open"]),
+            }
+        )
+        profile = self._profile(
+            {"action": 1, "observation.state": 1}, equal_action_state=True
+        )
+        gripper = self._gripper_profile(0.0, 100.0)
+        profile = ParquetProfile(
+            profile.row_count,
+            profile.row_group_count,
+            profile.schema_columns,
+            profile.columns,
+            profile.samples,
+            gripper_profiles={"action:0": gripper, "observation.state:0": gripper},
+        )
+
+        result = normalize_machine_fields(source_info, profile)
+
+        self.assertEqual(
+            result.normalized_info["features"]["action"]["names"],
+            [action_name],
+        )
+        action = next(
+            item
+            for item in result.gripper_transform_proposals
+            if item.source_feature == "action"
+        )
+        self.assertTrue(action.transform_required)
 
     def test_keeps_feature_when_declared_names_do_not_match_actual_vector_length(self) -> None:
         source_info = self._info({"action": self._feature(["head_rotation_quat_x"], shape=4)})
@@ -675,6 +870,39 @@ class MachineNormalizerTest(unittest.TestCase):
             samples[name] = values
             columns[name] = VectorProfile(name, length, 0.0, 1.0, 0.0, 0.5, 1.0, 0.5, 0.1, 0.0, 0.0)
         return ParquetProfile(2, 1, tuple(lengths), columns, samples)
+
+    @staticmethod
+    def _profile_with_gripper(
+        lengths: dict[str, int], profile_key: str, gripper: ScalarProfile
+    ) -> ParquetProfile:
+        profile = MachineNormalizerTest._profile(lengths)
+        return ParquetProfile(
+            profile.row_count,
+            profile.row_group_count,
+            profile.schema_columns,
+            profile.columns,
+            profile.samples,
+            gripper_profiles={profile_key: gripper},
+        )
+
+    @staticmethod
+    def _gripper_profile(minimum: float, maximum: float) -> ScalarProfile:
+        scale = 100.0 if maximum > 10 else 1.0
+        return ScalarProfile(
+            sample_count=100,
+            min_value=minimum,
+            max_value=maximum,
+            p01=0.0,
+            p05=0.0,
+            p50=scale / 2,
+            p95=scale,
+            p99=scale,
+            mean_value=scale / 2,
+            std_value=scale / 2,
+            nan_ratio=0.0,
+            inf_ratio=0.0,
+            unique_count=20,
+        )
 
 
 if __name__ == "__main__":

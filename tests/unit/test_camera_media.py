@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.camera.media import (
+    extract_rgb_frame_at,
     find_camera_media,
     first_stage_ratios,
     probe_media,
@@ -126,6 +127,27 @@ class CameraMediaTest(unittest.TestCase):
         self.assertEqual(media.width, 640)
         self.assertAlmostEqual(media.fps, 30000 / 1001)
         self.assertEqual(media.frame_count, 90)
+
+    def test_extracts_one_frame_at_an_exact_episode_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            target = Path(temporary_directory) / "sample.jpg"
+
+            def create_frame(command: list[str], **_: object) -> CompletedProcess:
+                Path(command[-1]).touch()
+                return CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch(
+                "robometanorm.camera.media.subprocess.run",
+                side_effect=create_frame,
+            ) as run:
+                result = extract_rgb_frame_at(
+                    Path("episode_000001.mp4"), 1.25, target
+                )
+
+        self.assertEqual(result, target)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-ss") + 1], "1.250000")
+        self.assertEqual(command[command.index("-frames:v") + 1], "1")
 
     def test_vlm_prompt_and_response_are_semantic_only(self) -> None:
         system_prompt, user_prompt = build_vlm_prompt(

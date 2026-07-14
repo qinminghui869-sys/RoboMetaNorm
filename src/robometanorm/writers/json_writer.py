@@ -12,7 +12,7 @@ import tempfile
 from robometanorm import __version__
 from robometanorm.camera.models import CameraReviewItem
 from robometanorm.domain.models import DatasetCandidate, DatasetStatus, PreconditionReport
-from robometanorm.machine.models import MachineReviewItem
+from robometanorm.machine.models import GripperTransformProposal, MachineReviewItem
 
 
 def write_normalization_files(
@@ -22,6 +22,7 @@ def write_normalization_files(
     *,
     camera_review_items: Sequence[CameraReviewItem] = (),
     machine_review_items: Sequence[MachineReviewItem] = (),
+    gripper_transform_proposals: Sequence[GripperTransformProposal] = (),
     phase: str = "P0",
 ) -> None:
     """写入 P0/P1/P2 规范建议和人工复核文件。"""
@@ -31,6 +32,7 @@ def write_normalization_files(
         report,
         camera_review_items,
         machine_review_items,
+        gripper_transform_proposals,
         phase,
     )
     _validate_payloads(output_info, review)
@@ -48,6 +50,7 @@ def _build_review(
     report: PreconditionReport,
     camera_review_items: Sequence[CameraReviewItem],
     machine_review_items: Sequence[MachineReviewItem],
+    gripper_transform_proposals: Sequence[GripperTransformProposal],
     phase: str,
 ) -> dict[str, object]:
     """将领域复核项转换为公开 JSON 结构。"""
@@ -113,6 +116,25 @@ def _build_review(
                 },
             }
             for item in machine_review_items
+        ],
+        "gripper_transform_proposals": [
+            {
+                "source_feature": item.source_feature,
+                "source_index": item.source_index,
+                "source_name": item.source_name,
+                "target_name": item.target_name,
+                "source_closed": item.source_closed,
+                "source_open": item.source_open,
+                "target_range": list(item.target_range),
+                "formula": item.formula,
+                "clipping_policy": item.clipping_policy,
+                "direction_evidence": item.direction_evidence,
+                "range_evidence": item.range_evidence,
+                "confidence": item.confidence,
+                "transform_required": item.transform_required,
+                "observed_profile": item.observed_profile,
+            }
+            for item in gripper_transform_proposals
         ],
     }
 

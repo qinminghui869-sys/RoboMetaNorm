@@ -17,7 +17,10 @@ from robometanorm.domain.models import (
     PreconditionReport,
 )
 from robometanorm.camera.models import CameraReviewCandidate, CameraReviewItem
-from robometanorm.machine.models import MachineReviewItem
+from robometanorm.machine.models import (
+    GripperTransformProposal,
+    MachineReviewItem,
+)
 from robometanorm.writers.json_writer import write_normalization_files
 
 
@@ -154,6 +157,43 @@ class JsonWriterTest(unittest.TestCase):
             review["machine_review_items"][0]["vlm_error"],
             "segments[0].unit 不合法",
         )
+
+    def test_writes_gripper_transform_proposal_without_forcing_review(self) -> None:
+        proposal = GripperTransformProposal(
+            source_feature="action",
+            source_index=7,
+            source_name="leader_left_gripper_degree_mm.pos",
+            target_name="left_gripper_open",
+            source_closed=0.0,
+            source_open=100.0,
+            target_range=(0.0, 1.0),
+            formula="clip(x / 100, 0, 1)",
+            clipping_policy="clip_to_unit_interval",
+            direction_evidence="declared_name",
+            range_evidence="parquet_percentiles",
+            confidence=0.96,
+            transform_required=True,
+            observed_profile={"p01": 0.0, "p99": 100.0},
+        )
+
+        write_normalization_files(
+            self.candidate,
+            self.info,
+            self.report,
+            gripper_transform_proposals=(proposal,),
+            phase="P2",
+        )
+
+        review = json.loads(
+            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        serialized = review["gripper_transform_proposals"][0]
+        self.assertEqual(serialized["target_name"], "left_gripper_open")
+        self.assertEqual(serialized["target_range"], [0.0, 1.0])
+        self.assertEqual(serialized["formula"], "clip(x / 100, 0, 1)")
+        self.assertFalse(review["review_required"])
 
 
 if __name__ == "__main__":

@@ -14,15 +14,17 @@ import zipfile
 import numpy as np
 
 from robometanorm.machine.models import (
+    GripperFrameSample,
     ParquetProfile,
     ProfileProgress,
+    ScalarProfile,
     VectorProfile,
 )
 
 
-CACHE_VERSION = 2
-METADATA_FILENAME = "parquet_profile_v2.json"
-SAMPLES_FILENAME = "parquet_samples_v2.npz"
+CACHE_VERSION = 3
+METADATA_FILENAME = "parquet_profile_v3.json"
+SAMPLES_FILENAME = "parquet_samples_v3.npz"
 
 
 def profile_parquet(parquet_path: Path, sample_rows: int = 512) -> ParquetProfile:
@@ -72,6 +74,8 @@ def profile_parquets(
     parquet_paths: Sequence[Path],
     sample_rows: int = 512,
     progress: Callable[[ProfileProgress], None] | None = None,
+    *,
+    gripper_indices: Mapping[str, Sequence[int]] | None = None,
 ) -> ParquetProfile:
     """比较每个 Episode 的有限样本布局，并返回首个 Episode 的画像。"""
     if not parquet_paths:
@@ -88,6 +92,193 @@ def profile_parquets(
         reference,
         episode_count=total,
         inconsistent_columns=tuple(sorted(inconsistent)),
+        gripper_profiles=_profile_gripper_dimensions(
+            parquet_paths, gripper_indices or {}
+        ),
+    )
+
+
+def _profile_gripper_dimensions(
+    parquet_paths: Sequence[Path],
+    gripper_indices: Mapping[str, Sequence[int]],
+) -> dict[str, ScalarProfile]:
+    """只投影夹爪所在向量列，并聚合首末 Episode 的目标维度。"""
+    requested = {
+        column_name: tuple(sorted(set(indices)))
+        for column_name, indices in gripper_indices.items()
+        if indices
+    }
+    if not requested:
+        return {}
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise RuntimeError("P2 需要安装 pyarrow 才能读取 Parquet") from error
+
+    values_by_key: dict[str, list[np.ndarray]] = {
+        _gripper_profile_key(column_name, index): []
+        for column_name, indices in requested.items()
+        for index in indices
+    }
+    for parquet_path in parquet_paths:
+        parquet_file = pq.ParquetFile(parquet_path)
+        available = set(parquet_file.schema_arrow.names)
+        columns = [name for name in requested if name in available]
+        for batch in parquet_file.iter_batches(columns=columns, batch_size=4096):
+            payload = batch.to_pydict()
+            for column_name, indices in requested.items():
+                vector_values = _as_vector_array(payload.get(column_name))
+                if vector_values is None:
+                    continue
+                for index in indices:
+                    if 0 <= index < vector_values.shape[1]:
+                        values_by_key[_gripper_profile_key(column_name, index)].append(
+                            vector_values[:, index]
+                        )
+    return {
+        key: _build_scalar_profile(np.concatenate(parts))
+        for key, parts in values_by_key.items()
+        if parts
+    }
+
+
+def sample_gripper_extremes(
+    parquet_paths: Sequence[Path],
+    feature_name: str,
+    index: int,
+    *,
+    fps: float | None = None,
+) -> tuple[GripperFrameSample, GripperFrameSample] | None:
+    """只投影目标维度和时间列，返回接近 5%/95% 分位数的同步样本。"""
+    if not parquet_paths or index < 0:
+        return None
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise RuntimeError("P2 需要安装 pyarrow 才能读取 Parquet") from error
+
+    samples: list[GripperFrameSample] = []
+    for parquet_path in parquet_paths:
+        parquet_file = pq.ParquetFile(parquet_path)
+        available = set(parquet_file.schema_arrow.names)
+        if feature_name not in available:
+            continue
+        time_column = next(
+            (
+                name
+                for name in ("timestamp", "time", "frame_index", "index")
+                if name in available
+            ),
+            None,
+        )
+        if time_column is None and (fps is None or fps <= 0):
+            continue
+        columns = [feature_name]
+        if time_column is not None:
+            columns.append(time_column)
+        row_offset = 0
+        for batch in parquet_file.iter_batches(columns=columns, batch_size=4096):
+            payload = batch.to_pydict()
+            vectors = _as_vector_array(payload.get(feature_name))
+            if vectors is None or index >= vectors.shape[1]:
+                row_offset += batch.num_rows
+                continue
+            timestamps = _batch_timestamps(
+                payload.get(time_column) if time_column is not None else None,
+                time_column,
+                vectors.shape[0],
+                row_offset,
+                fps,
+            )
+            if timestamps is None:
+                row_offset += batch.num_rows
+                continue
+            for local_index, (value, timestamp) in enumerate(
+                zip(vectors[:, index], timestamps)
+            ):
+                if np.isfinite(value) and np.isfinite(timestamp) and timestamp >= 0:
+                    samples.append(
+                        GripperFrameSample(
+                            parquet_path=parquet_path,
+                            row_index=row_offset + local_index,
+                            timestamp_seconds=float(timestamp),
+                            value=float(value),
+                        )
+                    )
+            row_offset += batch.num_rows
+
+    values = np.asarray([sample.value for sample in samples], dtype=np.float64)
+    if values.size < 2 or np.unique(values).size < 2:
+        return None
+    low_target, high_target = np.percentile(values, [5, 95])
+    low = min(samples, key=lambda sample: abs(sample.value - low_target))
+    high = min(samples, key=lambda sample: abs(sample.value - high_target))
+    if low.value >= high.value:
+        return None
+    return low, high
+
+
+def _batch_timestamps(
+    values: object,
+    column_name: str | None,
+    row_count: int,
+    row_offset: int,
+    fps: float | None,
+) -> np.ndarray | None:
+    """优先使用 Episode 内时间戳，否则用帧序号和声明帧率换算。"""
+    if isinstance(values, list) and len(values) == row_count:
+        try:
+            numeric = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if column_name in {"frame_index", "index"}:
+            return numeric / fps if fps is not None and fps > 0 else None
+        return numeric
+    if fps is None or fps <= 0:
+        return None
+    return np.arange(row_offset, row_offset + row_count, dtype=np.float64) / fps
+
+
+def _gripper_profile_key(column_name: str, index: int) -> str:
+    return f"{column_name}:{index}"
+
+
+def _build_scalar_profile(values: np.ndarray) -> ScalarProfile:
+    """计算夹爪标量的稳健分位数、异常值比例和离散度。"""
+    flattened = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = flattened[np.isfinite(flattened)]
+    total = flattened.size
+    if finite.size:
+        quantiles = np.percentile(finite, [1, 5, 50, 95, 99])
+        return ScalarProfile(
+            sample_count=int(finite.size),
+            min_value=float(np.min(finite)),
+            max_value=float(np.max(finite)),
+            p01=float(quantiles[0]),
+            p05=float(quantiles[1]),
+            p50=float(quantiles[2]),
+            p95=float(quantiles[3]),
+            p99=float(quantiles[4]),
+            mean_value=float(np.mean(finite)),
+            std_value=float(np.std(finite)),
+            nan_ratio=float(np.isnan(flattened).sum() / total),
+            inf_ratio=float(np.isinf(flattened).sum() / total),
+            unique_count=int(np.unique(finite).size),
+        )
+    return ScalarProfile(
+        sample_count=0,
+        min_value=None,
+        max_value=None,
+        p01=None,
+        p05=None,
+        p50=None,
+        p95=None,
+        p99=None,
+        mean_value=None,
+        std_value=None,
+        nan_ratio=float(np.isnan(flattened).sum() / total) if total else 0.0,
+        inf_ratio=float(np.isinf(flattened).sum() / total) if total else 0.0,
+        unique_count=0,
     )
 
 
@@ -212,12 +403,17 @@ def load_or_profile_parquets(
     cache_directory: Path,
     sample_rows: int = 512,
     progress: Callable[[ProfileProgress], None] | None = None,
+    *,
+    gripper_indices: Mapping[str, Sequence[int]] | None = None,
 ) -> ParquetProfile:
     """优先读取有效缓存，否则画像并以 JSON/NPZ 原子落盘。"""
     paths = tuple(parquet_paths)
     if not paths:
         raise ValueError("至少需要一个 Parquet 文件")
-    fingerprint = _fingerprint(paths, sample_rows, cache_directory)
+    requested_grippers = gripper_indices or {}
+    fingerprint = _fingerprint(
+        paths, sample_rows, cache_directory, requested_grippers
+    )
     cached = _load(cache_directory, fingerprint)
     if cached is not None:
         if progress is not None:
@@ -226,7 +422,12 @@ def load_or_profile_parquets(
 
     if progress is not None:
         progress(ProfileProgress("cache_miss", 0, len(paths)))
-    profile = profile_parquets(paths, sample_rows, progress)
+    profile = profile_parquets(
+        paths,
+        sample_rows,
+        progress,
+        gripper_indices=requested_grippers,
+    )
     try:
         _write(cache_directory, fingerprint, sample_rows, profile)
     except Exception as error:
@@ -243,7 +444,10 @@ def load_or_profile_parquets(
 
 
 def _fingerprint(
-    parquet_paths: Sequence[Path], sample_rows: int, cache_directory: Path
+    parquet_paths: Sequence[Path],
+    sample_rows: int,
+    cache_directory: Path,
+    gripper_indices: Mapping[str, Sequence[int]],
 ) -> str:
     """以文件清单、大小、mtime、采样配置和版本计算缓存指纹。"""
     dataset_root = cache_directory.parent.parent
@@ -264,6 +468,10 @@ def _fingerprint(
     payload = {
         "cache_version": CACHE_VERSION,
         "sample_rows": sample_rows,
+        "gripper_indices": {
+            name: sorted(set(indices))
+            for name, indices in sorted(gripper_indices.items())
+        },
         "files": files,
     }
     canonical = json.dumps(
@@ -312,6 +520,15 @@ def _load(cache_directory: Path, fingerprint: str) -> ParquetProfile | None:
                 return None
             columns[column_name] = VectorProfile(**dict(value))
 
+        gripper_profiles_payload = profile_payload.get("gripper_profiles")
+        if not isinstance(gripper_profiles_payload, Mapping):
+            return None
+        gripper_profiles: dict[str, ScalarProfile] = {}
+        for profile_key, value in gripper_profiles_payload.items():
+            if not isinstance(profile_key, str) or not isinstance(value, Mapping):
+                return None
+            gripper_profiles[profile_key] = ScalarProfile(**dict(value))
+
         schema_columns = _string_sequence(
             profile_payload.get("schema_columns"), "schema_columns"
         )
@@ -333,6 +550,7 @@ def _load(cache_directory: Path, fingerprint: str) -> ParquetProfile | None:
             samples=samples,
             episode_count=episode_count,
             inconsistent_columns=inconsistent_columns,
+            gripper_profiles=gripper_profiles,
         )
     except (
         EOFError,
@@ -373,6 +591,10 @@ def _write(
             "schema_columns": list(profile.schema_columns),
             "columns": {
                 name: asdict(value) for name, value in profile.columns.items()
+            },
+            "gripper_profiles": {
+                name: asdict(value)
+                for name, value in profile.gripper_profiles.items()
             },
             "episode_count": profile.episode_count,
             "inconsistent_columns": list(profile.inconsistent_columns),

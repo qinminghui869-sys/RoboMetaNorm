@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import re
 from typing import Protocol
 
 from robometanorm.machine.rules import build_names_from_semantics
+from robometanorm.machine.models import GripperDirectionEvidence
 
 
 SEMANTIC_TYPES = frozenset(
@@ -61,6 +63,14 @@ SYSTEM_PROMPT = """你是机器人数据集机器字段语义分类器。
 不得猜测单位，不得把四元数写成欧拉角，不得默认 wrist 是 EEF，也不得把三维关键点写成关节角。
 证据不足的区段必须使用 unknown 或 need_human_review=true，不能省略任何维度。
 只输出符合约定的合法 JSON，不得输出最终标准字段名。"""
+
+GRIPPER_DIRECTION_SYSTEM_PROMPT = """你是机器人夹爪开合方向判定器。
+图 1 对应夹爪数值较低的同步视频帧，图 2 对应数值较高的同步视频帧。
+只比较目标侧夹爪的物理开口大小，不依据字段名猜测。
+direction 仅允许 increasing_is_open、decreasing_is_open、unknown。
+confidence 必须是 0 到 1 的数字，need_human_review 必须是布尔值。
+遮挡、目标侧不清楚或两帧差异不足时返回 unknown 且 need_human_review=true。
+只返回 JSON 对象，不得返回最终字段名。"""
 
 
 def build_machine_prompt(evidence: Mapping[str, object]) -> tuple[str, str]:
@@ -232,6 +242,88 @@ class DisabledMachineVlmResolver:
 
     def resolve(self, evidence: Mapping[str, object]) -> MachineSemantics | None:
         return None
+
+
+class GripperDirectionResolver(Protocol):
+    """通过同步低值和高值视频帧确认夹爪数值方向。"""
+
+    def resolve(
+        self,
+        evidence: Mapping[str, object],
+        image_paths: Sequence[Path],
+    ) -> GripperDirectionEvidence | None:
+        """证据充分时返回方向，否则返回空。"""
+
+
+class OpenAICompatibleGripperDirectionResolver:
+    """复用通用多模态客户端判定夹爪开合方向。"""
+
+    def __init__(self, client: object):
+        self.client = client
+
+    def resolve(
+        self,
+        evidence: Mapping[str, object],
+        image_paths: Sequence[Path],
+    ) -> GripperDirectionEvidence | None:
+        if len(image_paths) != 2:
+            raise MachineVlmResolutionError("夹爪方向判定需要低值和高值两张同步帧")
+        request_json = getattr(self.client, "request_json", None)
+        if not callable(request_json):
+            raise MachineVlmResolutionError("VLM 客户端缺少 request_json")
+        user_prompt = "\n".join(
+            [
+                f"目标侧: {evidence.get('side')}",
+                f"图 1（低值帧）夹爪值: {evidence.get('low_value')}",
+                f"图 2（高值帧）夹爪值: {evidence.get('high_value')}",
+                "判断数值增大时夹爪是更开还是更闭。",
+                "返回 direction、confidence、need_human_review、reason。",
+            ]
+        )
+        payload = request_json(
+            GRIPPER_DIRECTION_SYSTEM_PROMPT, user_prompt, image_paths
+        )
+        if not isinstance(payload, Mapping):
+            detail = getattr(self.client, "last_error", None) or "未返回 JSON 对象"
+            raise MachineVlmResolutionError(
+                f"夹爪方向 VLM 请求失败: {_sanitize_error_detail(detail)}"
+            )
+        return parse_gripper_direction(payload, evidence)
+
+
+def parse_gripper_direction(
+    payload: Mapping[str, object],
+    evidence: Mapping[str, object],
+) -> GripperDirectionEvidence | None:
+    """校验夹爪方向的受限 VLM 协议。"""
+    if "target_name" in payload or "target_key" in payload:
+        raise ValueError("夹爪方向 VLM 不得输出最终字段名")
+    direction = payload.get("direction")
+    confidence = payload.get("confidence")
+    need_review = payload.get("need_human_review")
+    reason = payload.get("reason")
+    if direction not in {
+        "increasing_is_open",
+        "decreasing_is_open",
+        "unknown",
+    }:
+        raise ValueError(f"夹爪方向不合法: {direction}")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0 <= confidence <= 1
+    ):
+        raise ValueError("夹爪方向置信度必须在 0 到 1 之间")
+    if not isinstance(need_review, bool) or not isinstance(reason, str):
+        raise ValueError("夹爪方向复核标记或理由不合法")
+    if direction == "unknown" or need_review or confidence < 0.85:
+        return None
+    return GripperDirectionEvidence(
+        direction=str(direction),
+        confidence=float(confidence),
+        method="synchronized_video",
+        details={**dict(evidence), "reason": reason},
+    )
 
 
 class OpenAICompatibleMachineVlmResolver:

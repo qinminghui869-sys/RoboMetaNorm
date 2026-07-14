@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.machine.rules import build_names_from_semantics
 from robometanorm.machine.vlm import (
+    OpenAICompatibleGripperDirectionResolver,
     OpenAICompatibleMachineVlmResolver,
     build_machine_prompt,
     can_apply_semantics,
@@ -234,6 +235,54 @@ class MachineVlmTest(unittest.TestCase):
         self.assertIn("network request failed", message)
         self.assertNotIn("Authorization", message)
         self.assertNotIn("sk-secret", message)
+
+    def test_resolves_gripper_direction_from_synchronized_low_high_frames(self) -> None:
+        client = _SequencedClient(
+            [
+                {
+                    "direction": "increasing_is_open",
+                    "confidence": 0.97,
+                    "need_human_review": False,
+                    "reason": "高值帧中的夹爪开口明显更大。",
+                }
+            ]
+        )
+        resolver = OpenAICompatibleGripperDirectionResolver(client)
+
+        evidence = resolver.resolve(
+            {
+                "side": "left",
+                "low_value": 0.0,
+                "high_value": 100.0,
+            },
+            (Path("low.jpg"), Path("high.jpg")),
+        )
+
+        self.assertEqual(evidence.direction, "increasing_is_open")
+        self.assertEqual(evidence.method, "synchronized_video")
+        self.assertEqual(evidence.confidence, 0.97)
+        self.assertIn("图 1", client.requests[0][1])
+        self.assertIn("图 2", client.requests[0][1])
+
+    def test_rejects_uncertain_gripper_direction_response(self) -> None:
+        client = _SequencedClient(
+            [
+                {
+                    "direction": "unknown",
+                    "confidence": 0.7,
+                    "need_human_review": True,
+                    "reason": "夹爪不可见。",
+                }
+            ]
+        )
+        resolver = OpenAICompatibleGripperDirectionResolver(client)
+
+        evidence = resolver.resolve(
+            {"side": "right", "low_value": 0.0, "high_value": 1.0},
+            (Path("low.jpg"), Path("high.jpg")),
+        )
+
+        self.assertIsNone(evidence)
 
     def _parse(self, payload: dict[str, object], vector_length: int):
         return parse_machine_semantics(payload, vector_length=vector_length)

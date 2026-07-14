@@ -191,6 +191,56 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertNotIn("episode_000002.parquet", first_stderr)
         self.assertIn("已加载 Parquet 画像缓存，共 2 episodes", second_stderr)
 
+    def test_normalize_writes_non_destructive_gripper_transform_proposal(self) -> None:
+        source_name = "leader_left_gripper_degree_mm.pos"
+        info = {
+            "fps": 20,
+            "features": {
+                "action": {
+                    "dtype": "float32",
+                    "shape": [1],
+                    "names": [source_name],
+                },
+                "observation.images.image_left": {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                },
+            },
+        }
+        (self.dataset_path / "meta" / "info.json").write_text(
+            json.dumps(info), encoding="utf-8"
+        )
+        pq.write_table(
+            pa.table({"action": [[0.0], [25.0], [50.0], [75.0], [100.0]]}),
+            self.dataset_path / "data" / "episode_000000.parquet",
+        )
+
+        self._run("normalize", "--root", str(self.root))
+
+        normalized = json.loads(
+            (self.dataset_path / "meta" / "info_norm.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        review = json.loads(
+            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(normalized["features"]["action"]["names"], [source_name])
+        proposal = review["gripper_transform_proposals"][0]
+        self.assertEqual(proposal["target_name"], "left_gripper_open")
+        self.assertEqual(proposal["formula"], "clip(x / 100, 0, 1)")
+        self.assertTrue(proposal["transform_required"])
+        self.assertEqual(
+            json.loads(
+                (self.dataset_path / "meta" / "info.json").read_text(
+                    encoding="utf-8"
+                )
+            ),
+            info,
+        )
+
     def _write_two_dimensional_parquet(self, filename: str, offset: float) -> None:
         pq.write_table(
             pa.table(

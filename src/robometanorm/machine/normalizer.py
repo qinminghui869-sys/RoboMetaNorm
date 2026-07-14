@@ -7,6 +7,9 @@ from copy import deepcopy
 import re
 
 from robometanorm.machine.models import (
+    GripperDirectionEvidence,
+    GripperRangeInference,
+    GripperTransformProposal,
     MachineNormalizationResult,
     MachineReviewItem,
     ParquetProfile,
@@ -20,6 +23,9 @@ from robometanorm.machine.rules import (
     declared_names,
     declared_vector_length,
     discover_machine_features,
+    gripper_direction_from_name,
+    gripper_side_from_name,
+    infer_gripper_range,
     is_out_of_scope_machine_field,
     resolve_child_slices,
     risk_categories,
@@ -38,6 +44,7 @@ def normalize_machine_fields(
     *,
     vlm_resolver: MachineVlmResolver | None = None,
     dataset_name: str | None = None,
+    gripper_directions: Mapping[str, GripperDirectionEvidence] | None = None,
 ) -> MachineNormalizationResult:
     """只为维度、表示形式和单位均可确认的字段生成名称建议。"""
     normalized_info = deepcopy(dict(source_info))
@@ -61,6 +68,7 @@ def normalize_machine_fields(
         return MachineNormalizationResult(normalized_info, ())
 
     review_items: list[MachineReviewItem] = []
+    gripper_proposals: list[GripperTransformProposal] = []
     equal_action_state = action_equals_state(parquet_profile)
     state_child_slices = _resolve_state_child_slices(parquet_profile, source_features)
     child_normalized_names: dict[str, list[str] | None] = {}
@@ -69,7 +77,7 @@ def normalize_machine_fields(
     for feature_name, feature in source_features.items():
         if feature_name in PARENT_MACHINE_FEATURES:
             continue
-        normalized_names, field_reviews = _normalize_feature_names(
+        normalized_names, field_reviews, field_proposals = _normalize_feature_names(
             feature_name,
             feature,
             parquet_profile,
@@ -78,9 +86,11 @@ def normalize_machine_fields(
             vlm_resolver=vlm_resolver,
             dataset_name=dataset_name,
             robot_type=source_info.get("robot_type"),
+            gripper_directions=gripper_directions,
         )
         child_normalized_names[feature_name] = normalized_names
         review_items.extend(field_reviews)
+        gripper_proposals.extend(field_proposals)
         if normalized_names is not None:
             _replace_names(normalized_features, feature_name, normalized_names)
 
@@ -96,7 +106,7 @@ def normalize_machine_fields(
         if state_names is not None:
             _replace_names(normalized_features, "observation.state", state_names)
     elif state_feature is not None:
-        state_names, field_reviews = _normalize_feature_names(
+        state_names, field_reviews, field_proposals = _normalize_feature_names(
             "observation.state",
             state_feature,
             parquet_profile,
@@ -105,8 +115,10 @@ def normalize_machine_fields(
             vlm_resolver=vlm_resolver,
             dataset_name=dataset_name,
             robot_type=source_info.get("robot_type"),
+            gripper_directions=gripper_directions,
         )
         review_items.extend(field_reviews)
+        gripper_proposals.extend(field_proposals)
         if state_names is not None:
             _replace_names(normalized_features, "observation.state", state_names)
 
@@ -116,8 +128,32 @@ def normalize_machine_fields(
             # action/state 样本和值均相同，action 直接复用 state 的布局结果。
             if state_names is not None:
                 _replace_names(normalized_features, "action", state_names)
+            if parquet_profile is not None:
+                action_declared_names = declared_names(action_feature)
+                if action_declared_names is not None:
+                    direct_names, field_reviews, field_proposals = _analyze_grippers(
+                        "action",
+                        action_declared_names,
+                        parquet_profile,
+                        source_slice=None,
+                        direction_evidence=gripper_directions or {},
+                    )
+                    review_items.extend(field_reviews)
+                    gripper_proposals.extend(field_proposals)
+                    base_names = (
+                        list(state_names)
+                        if state_names is not None
+                        and len(state_names) == len(action_declared_names)
+                        else list(action_declared_names)
+                    )
+                    for index, source_name in enumerate(action_declared_names):
+                        if "gripper" not in source_name.lower():
+                            continue
+                        base_names[index] = direct_names.get(index, source_name)
+                    if direct_names or state_names is not None:
+                        _replace_names(normalized_features, "action", base_names)
         else:
-            action_names, field_reviews = _normalize_feature_names(
+            action_names, field_reviews, field_proposals = _normalize_feature_names(
                 "action",
                 action_feature,
                 parquet_profile,
@@ -126,13 +162,17 @@ def normalize_machine_fields(
                 vlm_resolver=vlm_resolver,
                 dataset_name=dataset_name,
                 robot_type=source_info.get("robot_type"),
+                gripper_directions=gripper_directions,
             )
             review_items.extend(field_reviews)
+            gripper_proposals.extend(field_proposals)
             if action_names is not None:
                 _replace_names(normalized_features, "action", action_names)
 
     return MachineNormalizationResult(
-        normalized_info, tuple(_deduplicate_reviews(review_items))
+        normalized_info,
+        tuple(_deduplicate_reviews(review_items)),
+        tuple(gripper_proposals),
     )
 
 
@@ -203,7 +243,12 @@ def _normalize_feature_names(
     vlm_resolver: MachineVlmResolver | None,
     dataset_name: str | None,
     robot_type: object,
-) -> tuple[list[str] | None, list[MachineReviewItem]]:
+    gripper_directions: Mapping[str, GripperDirectionEvidence] | None,
+) -> tuple[
+    list[str] | None,
+    list[MachineReviewItem],
+    list[GripperTransformProposal],
+]:
     """先校验实际长度，再在规则与 VLM 双重门槛下生成建议。"""
     names = declared_names(feature)
     declared_length = declared_vector_length(feature)
@@ -222,7 +267,7 @@ def _normalize_feature_names(
                 "声明 names、shape 与 Parquet 实际向量长度不一致。",
                 source_slice=source_slice,
             )
-        ]
+        ], []
     if profile is None or actual_length is None:
         return None, [
             _review(
@@ -232,7 +277,7 @@ def _normalize_feature_names(
                 "未获得 Parquet 实际向量长度，不能安全修改名称。",
                 source_slice=source_slice,
             )
-        ]
+        ], []
     if len(names) > declared_length:
         return None, [
             _review(
@@ -242,7 +287,7 @@ def _normalize_feature_names(
                 "声明 names 数量超过实际向量维度，不能安全修改名称。",
                 source_slice=source_slice,
             )
-        ]
+        ], []
     if len(names) == declared_length and _feature_layout_inconsistent(
         feature_name, profile
     ):
@@ -254,9 +299,9 @@ def _normalize_feature_names(
                 "确认不同 Episode 的字段 schema 和向量长度一致后再规范化。",
                 source_slice=source_slice,
             )
-        ]
+        ], []
     if len(names) < declared_length:
-        return _normalize_grouped_feature_names(
+        normalized, reviews = _normalize_grouped_feature_names(
             feature_name,
             feature,
             names,
@@ -268,10 +313,26 @@ def _normalize_feature_names(
             dataset_name=dataset_name,
             robot_type=robot_type,
         )
+        return normalized, reviews, []
 
     normalized_names = [build_confirmed_machine_name(name) or name for name in names]
+    gripper_indices = {
+        index for index, name in enumerate(names) if "gripper" in name.lower()
+    }
+    direct_gripper_names, gripper_reviews, proposals = _analyze_grippers(
+        feature_name,
+        names,
+        profile,
+        source_slice=source_slice,
+        direction_evidence=gripper_directions or {},
+    )
+    for index, target_name in direct_gripper_names.items():
+        normalized_names[index] = target_name
     categories = risk_categories(names)
-    names_are_confirmed = all(build_confirmed_machine_name(name) is not None for name in names)
+    names_are_confirmed = all(
+        build_confirmed_machine_name(name) is not None or index in gripper_indices
+        for index, name in enumerate(names)
+    )
     semantics: MachineSemantics | None = None
     resolver_error: str | None = None
     if vlm_resolver is not None and (categories or not names_are_confirmed):
@@ -307,7 +368,7 @@ def _normalize_feature_names(
     if not names_are_confirmed and not categories:
         categories.add("UNCLASSIFIED_MACHINE_FIELD")
     vlm_result = _semantics_to_dict(semantics) if semantics else None
-    reviews: list[MachineReviewItem] = []
+    reviews: list[MachineReviewItem] = list(gripper_reviews)
     for category in sorted(categories):
         review_names, review_slice = _review_scope(category, names, source_slice)
         reviews.append(
@@ -326,7 +387,201 @@ def _normalize_feature_names(
                 ),
             )
         )
-    return normalized_names, reviews
+    return normalized_names, reviews, proposals
+
+
+def _analyze_grippers(
+    feature_name: str,
+    names: list[str],
+    profile: ParquetProfile,
+    *,
+    source_slice: tuple[int, int] | None,
+    direction_evidence: Mapping[str, GripperDirectionEvidence],
+) -> tuple[
+    dict[int, str],
+    list[MachineReviewItem],
+    list[GripperTransformProposal],
+]:
+    """逐维确认夹爪量程和方向，并生成非破坏性转换建议。"""
+    direct_names: dict[int, str] = {}
+    reviews: list[MachineReviewItem] = []
+    proposals: list[GripperTransformProposal] = []
+    parent_offset = source_slice[0] if source_slice is not None else 0
+    range_inferences = _infer_feature_gripper_ranges(feature_name, names, profile)
+
+    for index, source_name in enumerate(names):
+        if "gripper" not in source_name.lower():
+            continue
+        item_slice = (parent_offset + index, parent_offset + index + 1)
+        side = gripper_side_from_name(source_name)
+        target_name = f"{side}_gripper_open" if side is not None else None
+        scalar_profile = profile.gripper_profiles.get(f"{feature_name}:{index}")
+        range_inference = range_inferences.get(index)
+        if range_inference is None:
+            reviews.append(
+                _review(
+                    feature_name,
+                    "GRIPPER_RANGE_UNKNOWN",
+                    (source_name,),
+                    _required_action("GRIPPER_RANGE_UNKNOWN"),
+                    source_slice=item_slice,
+                    candidates=(target_name,) if target_name else (),
+                )
+            )
+
+        direction = gripper_direction_from_name(source_name)
+        direction_method = "declared_name"
+        direction_confidence = 0.99
+        if direction is None and side is not None:
+            supplied = direction_evidence.get(
+                f"{feature_name}:{index}", direction_evidence.get(side)
+            )
+            if (
+                supplied is not None
+                and supplied.direction
+                in {"increasing_is_open", "decreasing_is_open"}
+                and supplied.confidence >= 0.85
+            ):
+                direction = supplied.direction
+                direction_method = supplied.method
+                direction_confidence = supplied.confidence
+        if direction is None:
+            reviews.append(
+                _review(
+                    feature_name,
+                    "GRIPPER_DIRECTION_UNKNOWN",
+                    (source_name,),
+                    _required_action("GRIPPER_DIRECTION_UNKNOWN"),
+                    source_slice=item_slice,
+                    candidates=(target_name,) if target_name else (),
+                )
+            )
+        if side is None:
+            reviews.append(
+                _review(
+                    feature_name,
+                    "UNKNOWN_LEFT_RIGHT",
+                    (source_name,),
+                    _required_action("UNKNOWN_LEFT_RIGHT"),
+                    source_slice=item_slice,
+                )
+            )
+
+        if range_inference is None or direction is None or target_name is None:
+            continue
+
+        lower = range_inference.closed_value
+        upper = range_inference.open_value
+        if direction == "increasing_is_open":
+            source_closed, source_open = lower, upper
+        else:
+            source_closed, source_open = upper, lower
+        formula = _gripper_formula(source_closed, source_open)
+        transform_required = bool(
+            range_inference.clipping_required
+            or source_closed != 0.0
+            or source_open != 1.0
+        )
+        proposal = GripperTransformProposal(
+            source_feature=feature_name,
+            source_index=index,
+            source_name=source_name,
+            target_name=target_name,
+            source_closed=source_closed,
+            source_open=source_open,
+            target_range=(0.0, 1.0),
+            formula=formula,
+            clipping_policy="clip_to_unit_interval",
+            direction_evidence=direction_method,
+            range_evidence=range_inference.evidence,
+            confidence=min(range_inference.confidence, direction_confidence),
+            transform_required=transform_required,
+            observed_profile=_scalar_profile_payload(scalar_profile),
+        )
+        proposals.append(proposal)
+        if not transform_required:
+            direct_names[index] = target_name
+
+    return direct_names, reviews, proposals
+
+
+def _infer_feature_gripper_ranges(
+    feature_name: str,
+    names: list[str],
+    profile: ParquetProfile,
+) -> dict[int, GripperRangeInference]:
+    """独立推断各维量程；常量维仅可继承同字段唯一且可靠的量程。"""
+    gripper_indices = [
+        index for index, name in enumerate(names) if "gripper" in name.lower()
+    ]
+    inferred: dict[int, GripperRangeInference] = {}
+    for index in gripper_indices:
+        scalar = profile.gripper_profiles.get(f"{feature_name}:{index}")
+        if scalar is None:
+            continue
+        result = infer_gripper_range(scalar)
+        if result is not None:
+            inferred[index] = result
+
+    scales = {result.open_value for result in inferred.values()}
+    if len(scales) != 1:
+        return inferred
+    scale = next(iter(scales))
+    for index in gripper_indices:
+        if index in inferred:
+            continue
+        scalar = profile.gripper_profiles.get(f"{feature_name}:{index}")
+        if scalar is None or scalar.p50 is None or scalar.unique_count != 1:
+            continue
+        if scalar.nan_ratio > 0.05 or scalar.inf_ratio > 0.0:
+            continue
+        boundary_distance = min(abs(scalar.p50), abs(scalar.p50 - scale))
+        if boundary_distance > 0.1 * scale:
+            continue
+        minimum, maximum = scalar.min_value, scalar.max_value
+        clipping_required = bool(
+            (minimum is not None and minimum < 0.0)
+            or (maximum is not None and maximum > scale)
+        )
+        inferred[index] = GripperRangeInference(
+            closed_value=0.0,
+            open_value=scale,
+            confidence=0.9,
+            clipping_required=clipping_required,
+            evidence="sibling_parquet_scale",
+        )
+    return inferred
+
+
+def _gripper_formula(source_closed: float, source_open: float) -> str:
+    """生成可审计且不依赖样本极值的线性归一化公式。"""
+    if source_closed == 0.0 and source_open == 1.0:
+        return "clip(x, 0, 1)"
+    if source_closed == 0.0:
+        return f"clip(x / {source_open:g}, 0, 1)"
+    if source_open == 0.0:
+        return f"clip(1 - x / {source_closed:g}, 0, 1)"
+    return (
+        f"clip((x - {source_closed:g}) / "
+        f"{source_open - source_closed:g}, 0, 1)"
+    )
+
+
+def _scalar_profile_payload(profile: object) -> dict[str, object]:
+    """保留足以复核量程结论的分位数和边界。"""
+    if profile is None:
+        return {}
+    return {
+        "sample_count": getattr(profile, "sample_count", None),
+        "min": getattr(profile, "min_value", None),
+        "max": getattr(profile, "max_value", None),
+        "p01": getattr(profile, "p01", None),
+        "p05": getattr(profile, "p05", None),
+        "p50": getattr(profile, "p50", None),
+        "p95": getattr(profile, "p95", None),
+        "p99": getattr(profile, "p99", None),
+        "unique_count": getattr(profile, "unique_count", None),
+    }
 
 
 def _review_scope(
@@ -638,8 +893,10 @@ def _required_action(category: str) -> str:
 
 
 def _deduplicate_reviews(items: list[MachineReviewItem]) -> list[MachineReviewItem]:
-    """同一字段与类别只保留一条复核项。"""
-    unique: dict[tuple[str, str], MachineReviewItem] = {}
+    """同一字段、切片与类别只保留一条复核项。"""
+    unique: dict[
+        tuple[str, tuple[int, int] | None, str], MachineReviewItem
+    ] = {}
     for item in items:
-        unique[(item.source_feature, item.category)] = item
+        unique[(item.source_feature, item.source_slice, item.category)] = item
     return list(unique.values())

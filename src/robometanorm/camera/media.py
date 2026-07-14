@@ -201,6 +201,41 @@ def extract_rgb_frames(
     return tuple(frames)
 
 
+def extract_rgb_frame_at(
+    media_path: Path,
+    timestamp_seconds: float,
+    output_path: Path,
+) -> Path:
+    """在 Episode 内指定时刻抽取一张 RGB 帧。"""
+    if timestamp_seconds < 0:
+        raise ValueError("抽帧时间不能为负数")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-y",
+        "-ss",
+        f"{timestamp_seconds:.6f}",
+        "-i",
+        str(media_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1280:-2:force_original_aspect_ratio=decrease",
+        str(output_path),
+    ]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, check=False
+        )
+    except OSError as error:
+        raise ValueError(f"无法执行 FFmpeg: {error}") from error
+    if completed.returncode != 0 or not output_path.is_file():
+        raise ValueError(f"FFmpeg 抽帧失败: {completed.stderr.strip()}")
+    return output_path
+
+
 def write_depth_previews(depth_array: object, output_directory: Path) -> tuple[Path, Path]:
     """以有效值 2%–98% 分位数归一化生成两张预览图。"""
     try:
