@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import sys
 import unittest
@@ -10,7 +11,27 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.models import CameraSlot, MachineComponent
+from robometanorm.models import (
+    CameraAssignment,
+    CameraEvidence,
+    CameraSlot,
+    DatasetCandidate,
+    DatasetEvidence,
+    DatasetMapping,
+    FeatureSchema,
+    HardwareProfile,
+    IdentityAssessment,
+    IdentityEvidence,
+    Issue,
+    LayoutType,
+    MachineAssignment,
+    MachineComponent,
+    MachineEvidence,
+    MediaSample,
+    NormalizationResult,
+    RobotIdentityFact,
+    SourceReference,
+)
 from robometanorm.standard import (
     BODY_PARTS,
     CAMERA_PREFIX,
@@ -22,7 +43,9 @@ from robometanorm.standard import (
     JOINT_COMPONENTS,
     ON_ROBOT_DIRECTIONS,
     SIDED_COMPONENTS,
+    apply_standard,
     are_standard_machine_names,
+    check_preconditions,
     is_standard_machine_name,
     parse_standard_camera_key,
     render_camera_key,
@@ -1006,6 +1029,1187 @@ class MachineStandardTest(unittest.TestCase):
                 )
             )
         )
+
+
+class _ExplodingCopyDict(dict[str, object]):
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        raise MemoryError("copy allocation failed")
+
+
+class _FloatSubclass(float):
+    pass
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _ExplodingEquality:
+    def __deepcopy__(self, memo: dict[int, object]) -> object:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        raise MemoryError("comparison allocation failed")
+
+
+class StandardApplicationTest(unittest.TestCase):
+    """Verify conservative application of researched identity and camera facts."""
+
+    SOURCE_KEY = "observation.images.source_camera"
+    SECOND_SOURCE_KEY = "observation.images.second_camera"
+    TARGET_KEY = "observation.images.cam_front_head_rgb"
+    SECOND_TARGET_KEY = "observation.images.cam_left_wrist_rgb"
+
+    @staticmethod
+    def _candidate() -> DatasetCandidate:
+        root = Path("/fixture/dataset")
+        return DatasetCandidate(
+            dataset_name="dataset",
+            task_name=None,
+            source_path=root,
+            layout_type=LayoutType.FLAT,
+            info_path=root / "meta/info.json",
+            data_path=root / "data",
+            video_path=root / "videos",
+            depth_path=root / "depth",
+        )
+
+    @staticmethod
+    def _identity_evidence(
+        *,
+        info_state: str = "present",
+        info_value: object | None = "raw-model",
+        common_state: str = "missing",
+        common_value: object | None = None,
+        tasks_state: str = "missing",
+        tasks: tuple[object, ...] = (),
+        issues: tuple[Issue, ...] = (),
+    ) -> IdentityEvidence:
+        return IdentityEvidence(
+            info_robot_type_state=info_state,
+            info_robot_type=info_value,
+            common_record_state=common_state,
+            common_record=common_value,
+            tasks_state=tasks_state,
+            tasks=tasks,
+            issues=issues,
+        )
+
+    @staticmethod
+    def _schema(
+        source_key: str,
+        *,
+        dtype: object = "video",
+        shape: tuple[object, ...] = (480, 640, 3),
+        fps: object = 20,
+        codec: object = "h264",
+    ) -> FeatureSchema:
+        return FeatureSchema(source_key, dtype, shape, (), fps, codec)
+
+    @staticmethod
+    def _sample(
+        source_key: str,
+        *,
+        media_type: str = "video",
+        codec: str | None = "av1",
+        fps: float | None = 20.0,
+        width: int | None = 640,
+        height: int | None = 480,
+        frame_path: Path | None = Path("/fixture/frame.jpg"),
+    ) -> MediaSample:
+        return MediaSample(
+            relative_path=f"videos/{source_key}/episode_000000.mp4",
+            media_type=media_type,
+            codec=codec,
+            fps=fps,
+            width=width,
+            height=height,
+            duration_seconds=1.0,
+            pixel_format="yuv420p",
+            frame_path=frame_path,
+        )
+
+    @staticmethod
+    def _machine(source_key: str) -> MachineEvidence:
+        schema = FeatureSchema(source_key, "float32", (2,), ("raw_0", "raw_1"), None, None)
+        return MachineEvidence(schema, (), ())
+
+    def _evidence(
+        self,
+        *,
+        source_key: str | None = None,
+        dtype: object = "video",
+        shape: tuple[object, ...] = (480, 640, 3),
+        fps: object = 20,
+        source_codec: object = "h264",
+        sample: MediaSample | None = None,
+        samples: tuple[MediaSample, ...] | None = None,
+        identity: IdentityEvidence | None = None,
+        include_robot_type: bool = True,
+        issues: tuple[Issue, ...] = (),
+    ) -> DatasetEvidence:
+        key = source_key or self.SOURCE_KEY
+        schema = self._schema(key, dtype=dtype, shape=shape, fps=fps, codec=source_codec)
+        if samples is None:
+            actual_sample = sample or self._sample(
+                key,
+                media_type=dtype if isinstance(dtype, str) else "video",
+                fps=fps if type(fps) in (int, float) else cast(float, fps),
+                width=shape[-2] if len(shape) >= 2 and type(shape[-2]) is int else 640,
+                height=shape[-3] if len(shape) >= 3 and type(shape[-3]) is int else 480,
+            )
+            samples = (actual_sample,)
+        feature = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "fps": fps,
+            "codec": source_codec,
+            "custom": {"preserve": True},
+        }
+        source_info: dict[str, object] = {
+            "fps": 20,
+            "untouched": {"nested": [1, 2, 3]},
+            "features": {
+                key: feature,
+                "action": {
+                    "dtype": "float32",
+                    "shape": [2],
+                    "names": ["raw_action_0", "raw_action_1"],
+                },
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": [2],
+                    "names": ["raw_state_0", "raw_state_1"],
+                },
+            },
+        }
+        if include_robot_type:
+            source_info["robot_type"] = "raw-model"
+        identity_value = identity or self._identity_evidence(
+            info_state="present" if include_robot_type else "missing",
+            info_value="raw-model" if include_robot_type else None,
+        )
+        return DatasetEvidence(
+            candidate=self._candidate(),
+            source_info=source_info,
+            identity=identity_value,
+            cameras=(CameraEvidence(schema, samples),),
+            machines=(self._machine("action"), self._machine("observation.state")),
+            issues=issues,
+        )
+
+    @staticmethod
+    def _source(
+        source_id: str = "official-product",
+        *,
+        kind: str = "official_product",
+    ) -> SourceReference:
+        return SourceReference(
+            source_id,
+            f"Fixture source {source_id}",
+            f"https://fixtures.invalid/{source_id}",
+            kind,
+        )
+
+    @staticmethod
+    def _assessments() -> tuple[IdentityAssessment, ...]:
+        return (
+            IdentityAssessment("info_robot_type", "supports", "local model token agrees"),
+            IdentityAssessment("common_record", "missing", "file is absent"),
+            IdentityAssessment("tasks", "missing", "file is absent"),
+        )
+
+    def _identity_fact(
+        self,
+        *,
+        manufacturer: str | None = "Acme Robotics",
+        model: str | None = "XR-7",
+        confidence: float = 0.95,
+        ambiguous: bool = False,
+        status: str = "consistent",
+        source_ids: tuple[str, ...] = ("official-product",),
+        assessments: tuple[IdentityAssessment, ...] | None = None,
+    ) -> RobotIdentityFact:
+        return RobotIdentityFact(
+            manufacturer=manufacturer,
+            model=model,
+            confidence=confidence,
+            ambiguous=ambiguous,
+            reason="local evidence agrees with the official product page",
+            local_evidence_status=status,
+            source_ids=source_ids,
+            assessments=assessments if assessments is not None else self._assessments(),
+        )
+
+    @staticmethod
+    def _slot(
+        *,
+        camera_id: str = "head-rgb",
+        direction_tokens: tuple[str, ...] = ("front",),
+        body_part: str | None = "head",
+        modality: str = "rgb",
+        confidence: float = 0.96,
+        ambiguous: bool = False,
+        source_ids: tuple[str, ...] = ("official-product",),
+    ) -> CameraSlot:
+        return CameraSlot(
+            camera_id=camera_id,
+            interface_name="fixture interface",
+            mount_type="on_robot",
+            direction_tokens=direction_tokens,
+            body_part=body_part,
+            modality=modality,
+            confidence=confidence,
+            ambiguous=ambiguous,
+            reason="official camera specification",
+            source_ids=source_ids,
+        )
+
+    def _profile(
+        self,
+        *,
+        identity: RobotIdentityFact | None = None,
+        sources: tuple[SourceReference, ...] | None = None,
+        cameras: tuple[CameraSlot, ...] | None = None,
+    ) -> HardwareProfile:
+        return HardwareProfile(
+            identity=identity or self._identity_fact(),
+            sources=sources if sources is not None else (self._source(),),
+            cameras=cameras if cameras is not None else (self._slot(),),
+            components=(),
+        )
+
+    def _mapping(
+        self,
+        *,
+        source_key: str | None = None,
+        camera_id: str | None = "head-rgb",
+        confidence: float = 0.94,
+        ambiguous: bool = False,
+        cameras: tuple[CameraAssignment, ...] | None = None,
+        machines: tuple[MachineAssignment, ...] = (),
+    ) -> DatasetMapping:
+        assignment = CameraAssignment(
+            source_key or self.SOURCE_KEY,
+            camera_id,
+            confidence,
+            ambiguous,
+            "representative frames match the official slot",
+        )
+        return DatasetMapping(cameras or (assignment,), machines)
+
+    def _with_second_camera(self, evidence: DatasetEvidence) -> DatasetEvidence:
+        source_info = deepcopy(evidence.source_info)
+        features = cast(dict[str, object], source_info["features"])
+        features[self.SECOND_SOURCE_KEY] = deepcopy(features[self.SOURCE_KEY])
+        first = evidence.cameras[0]
+        second_schema = replace(first.schema, source_key=self.SECOND_SOURCE_KEY)
+        second_sample = replace(
+            first.samples[0],
+            relative_path=f"videos/{self.SECOND_SOURCE_KEY}/episode_000000.mp4",
+            frame_path=Path("/fixture/second-frame.jpg"),
+        )
+        return replace(
+            evidence,
+            source_info=source_info,
+            cameras=(*evidence.cameras, CameraEvidence(second_schema, (second_sample,))),
+        )
+
+    def assert_camera_kept(
+        self,
+        result: NormalizationResult,
+        source_key: str | None = None,
+    ) -> None:
+        features = cast(dict[str, object], result.normalized_info["features"])
+        self.assertIn(source_key or self.SOURCE_KEY, features)
+
+    def assert_no_surrogate_text(self, value: object) -> None:
+        if isinstance(value, str):
+            self.assertFalse(
+                any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+            )
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                self.assert_no_surrogate_text(key)
+                self.assert_no_surrogate_text(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self.assert_no_surrogate_text(item)
+        elif hasattr(value, "__dataclass_fields__"):
+            for field_name in value.__dataclass_fields__:
+                self.assert_no_surrogate_text(getattr(value, field_name))
+
+    def test_preconditions_return_only_exact_ordered_blocking_codes(self) -> None:
+        complete = self._evidence()
+        self.assertEqual(check_preconditions(complete), ())
+
+        invalid_action = replace(
+            complete.machines[0],
+            schema=replace(complete.machines[0].schema, source_key="action.extra"),
+        )
+        invalid_observation = replace(
+            complete.machines[1],
+            schema=replace(complete.machines[1].schema, source_key="observation.stateful"),
+        )
+        evidence = replace(
+            complete,
+            cameras=(),
+            machines=(invalid_action, invalid_observation),
+        )
+
+        issues = check_preconditions(evidence)
+
+        self.assertEqual(
+            [item.code for item in issues],
+            ["MISSING_PRIMARY_CAMERA", "MISSING_ACTION", "MISSING_OBSERVATION"],
+        )
+        self.assertTrue(all(item.severity == "block" for item in issues))
+        dotted_observation = replace(
+            complete.machines[1],
+            schema=replace(complete.machines[1].schema, source_key="observation.state.arm"),
+        )
+        self.assertEqual(
+            check_preconditions(replace(complete, machines=(complete.machines[0], dotted_observation))),
+            (),
+        )
+
+    def test_precondition_rgb_requires_strict_schema_and_every_frame(self) -> None:
+        base = self._evidence()
+        camera = base.cameras[0]
+        invalid_cameras = (
+            replace(camera, schema=replace(camera.schema, dtype="Video")),
+            replace(camera, schema=replace(camera.schema, dtype=cast(object, ["video"]))),
+            replace(camera, schema=replace(camera.schema, shape=(640, 3))),
+            replace(camera, schema=replace(camera.schema, shape=(480, 640, 1))),
+            replace(camera, schema=replace(camera.schema, shape=(480, 640, True))),
+            replace(camera, schema=replace(camera.schema, shape=(480, 640, 3.0))),
+            replace(camera, samples=()),
+            replace(camera, samples=(replace(camera.samples[0], frame_path=None),)),
+            replace(
+                camera,
+                samples=(camera.samples[0], replace(camera.samples[0], frame_path=None)),
+            ),
+        )
+        for invalid in invalid_cameras:
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    [item.code for item in check_preconditions(replace(base, cameras=(invalid,)))],
+                    ["MISSING_PRIMARY_CAMERA"],
+                )
+
+        image = replace(
+            camera,
+            schema=replace(camera.schema, dtype="image", shape=(480, 640, 4)),
+            samples=(replace(camera.samples[0], media_type="image"),),
+        )
+        self.assertEqual(check_preconditions(replace(base, cameras=(image,))), ())
+
+    def test_missing_profile_or_mapping_returns_independent_exact_source_copy(self) -> None:
+        evidence = self._evidence(source_key=self.TARGET_KEY, source_codec=None)
+        source_feature = cast(dict[str, object], evidence.source_info["features"])[self.TARGET_KEY]
+        cast(dict[str, object], source_feature).pop("codec")
+        evidence = replace(
+            evidence,
+            cameras=(replace(evidence.cameras[0], schema=replace(evidence.cameras[0].schema, codec=None)),),
+            issues=(Issue("EVIDENCE_FIRST", "evidence", "fixture"),),
+        )
+        extra = (Issue("EXTRA_SECOND", "extra", "fixture"),)
+        cases = ((None, self._mapping(source_key=self.TARGET_KEY)), (self._profile(), None))
+
+        for profile, mapping in cases:
+            with self.subTest(profile=profile is not None, mapping=mapping is not None):
+                result = apply_standard(
+                    evidence,
+                    profile,
+                    mapping,
+                    confidence_threshold=0.85,
+                    extra_issues=extra,
+                )
+                self.assertEqual(result.normalized_info, evidence.source_info)
+                self.assertIsNot(result.normalized_info, evidence.source_info)
+                self.assertIsNot(result.normalized_info["features"], evidence.source_info["features"])
+                self.assertNotIn(
+                    "codec",
+                    cast(dict[str, dict[str, object]], result.normalized_info["features"])[self.TARGET_KEY],
+                )
+                self.assertEqual([item.code for item in result.issues[:2]], ["EVIDENCE_FIRST", "EXTRA_SECOND"])
+                self.assertEqual(result.machine_mappings, ())
+                self.assertEqual(result.robot_identity.output, "raw-model")
+
+    def test_threshold_is_explicit_finite_builtin_and_equality_passes(self) -> None:
+        threshold = 0.85
+        profile = self._profile(
+            identity=self._identity_fact(confidence=threshold),
+            cameras=(self._slot(confidence=threshold),),
+        )
+        mapping = self._mapping(confidence=threshold)
+        result = apply_standard(self._evidence(), profile, mapping, confidence_threshold=threshold)
+        self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
+
+        invalid_values = (True, False, float("nan"), float("inf"), float("-inf"), -0.01, 1.01, _FloatSubclass(0.85))
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    apply_standard(self._evidence(), profile, mapping, confidence_threshold=cast(float, invalid))
+
+    def test_memory_error_from_source_copy_propagates(self) -> None:
+        evidence = replace(self._evidence(), source_info=_ExplodingCopyDict(self._evidence().source_info))
+        with self.assertRaises(MemoryError):
+            apply_standard(evidence, self._profile(), self._mapping(), confidence_threshold=0.85)
+
+    def test_applies_sourced_identity_with_scoped_citations_and_generic_slug(self) -> None:
+        third = self._source("community", kind="third_party")
+        profile = self._profile(sources=(self._source(), third))
+
+        result = apply_standard(self._evidence(), profile, self._mapping(), confidence_threshold=0.85)
+
+        self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+        record = result.robot_identity
+        self.assertEqual((record.source, record.output, record.candidate), ("raw-model", "acme_robotics_xr_7", "acme_robotics_xr_7"))
+        self.assertTrue(record.changed)
+        self.assertNotEqual(record.decision, "review")
+        self.assertEqual([citation["source_id"] for citation in record.citations], ["official-product"])
+        self.assertNotIn("community", {citation["source_id"] for citation in record.citations})
+
+    def test_identity_slug_requires_renderable_tokens_from_manufacturer_and_model(self) -> None:
+        evidence = self._evidence()
+        unrenderable_manufacturer = self._identity_fact(
+            manufacturer="宇树科技",
+            model="G1",
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile(identity=unrenderable_manufacturer),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+        self.assertNotEqual(result.robot_identity.candidate, "g1")
+        self.assertEqual(result.robot_identity.decision, "review")
+        self.assert_camera_kept(result)
+
+        normal = apply_standard(
+            evidence,
+            self._profile(),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(normal.normalized_info["robot_type"], "acme_robotics_xr_7")
+
+    def test_identity_rejects_third_party_or_unreferenced_official_sources(self) -> None:
+        third = self._source("community", kind="third_party")
+        cases = (
+            self._profile(sources=(replace(self._source(), kind="third_party"),)),
+            self._profile(
+                identity=self._identity_fact(source_ids=("community",)),
+                sources=(self._source(), third),
+            ),
+        )
+        for profile in cases:
+            with self.subTest(profile=profile):
+                result = apply_standard(self._evidence(), profile, self._mapping(), confidence_threshold=0.85)
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+                self.assertEqual(result.robot_identity.output, "raw-model")
+                self.assertEqual(result.robot_identity.candidate, "acme_robotics_xr_7")
+                self.assertEqual(result.robot_identity.decision, "review")
+                self.assertIn("ROBOT_IDENTITY_UNRESOLVED", {item.code for item in result.issues})
+
+    def test_missing_source_robot_type_is_never_created(self) -> None:
+        evidence = self._evidence(include_robot_type=False)
+        result = apply_standard(evidence, self._profile(), self._mapping(), confidence_threshold=0.85)
+        self.assertNotIn("robot_type", result.normalized_info)
+        self.assertIsNone(result.robot_identity.source)
+        self.assertIsNone(result.robot_identity.output)
+        self.assertEqual(result.robot_identity.candidate, "acme_robotics_xr_7")
+        self.assertEqual(result.robot_identity.decision, "review")
+
+    def test_missing_robot_type_does_not_block_identity_confirmed_by_other_local_source(self) -> None:
+        identity_evidence = self._identity_evidence(
+            info_state="missing",
+            info_value=None,
+            common_state="present",
+            common_value={"robot": "XR-7"},
+        )
+        evidence = self._evidence(include_robot_type=False, identity=identity_evidence)
+        fact = self._identity_fact(
+            assessments=(
+                IdentityAssessment("info_robot_type", "missing", "field is absent"),
+                IdentityAssessment("common_record", "supports", "record identifies XR-7"),
+                IdentityAssessment("tasks", "missing", "file is absent"),
+            )
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile(identity=fact),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertNotIn("robot_type", result.normalized_info)
+        self.assertNotIn(self.SOURCE_KEY, result.normalized_info["features"])
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
+
+    def test_identity_local_states_require_self_consistent_values_and_exact_tuples(self) -> None:
+        base = self._evidence()
+        invalid_identities = (
+            replace(base.identity, common_record={"unexpected": True}),
+            replace(base.identity, tasks=({"unexpected": True},)),
+            replace(
+                base.identity,
+                tasks=cast(tuple[object, ...], [{"not": "an exact tuple"}]),
+            ),
+        )
+        for identity in invalid_identities:
+            with self.subTest(identity=identity):
+                evidence = replace(base, identity=identity)
+                result = apply_standard(
+                    evidence,
+                    self._profile(),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+                self.assert_camera_kept(result)
+
+    def test_present_null_common_and_invalid_tasks_with_valid_records_are_consistent(self) -> None:
+        cases = (
+            (
+                replace(
+                    self._evidence().identity,
+                    common_record_state="present",
+                    common_record=None,
+                ),
+                (
+                    IdentityAssessment("info_robot_type", "supports", "model agrees"),
+                    IdentityAssessment("common_record", "supports", "JSON null is explicit evidence"),
+                    IdentityAssessment("tasks", "missing", "file is absent"),
+                ),
+            ),
+            (
+                replace(
+                    self._evidence().identity,
+                    tasks_state="invalid",
+                    tasks=({"task": "valid retained line"},),
+                ),
+                (
+                    IdentityAssessment("info_robot_type", "supports", "model agrees"),
+                    IdentityAssessment("common_record", "missing", "file is absent"),
+                    IdentityAssessment("tasks", "invalid", "other lines were invalid"),
+                ),
+            ),
+        )
+        for identity, assessments in cases:
+            with self.subTest(identity=identity):
+                result = apply_standard(
+                    replace(self._evidence(), identity=identity),
+                    self._profile(identity=self._identity_fact(assessments=assessments)),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+                self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
+
+    def test_identity_assessments_must_match_local_states_and_declared_status(self) -> None:
+        base_evidence = self._evidence()
+        invalid_issue = Issue("INFO_ROBOT_TYPE_INVALID", "invalid local value", "identity")
+        invalid_cases: tuple[tuple[DatasetEvidence, RobotIdentityFact], ...] = (
+            (
+                base_evidence,
+                self._identity_fact(assessments=(
+                    IdentityAssessment("info_robot_type", "supports", "ok"),
+                    IdentityAssessment("info_robot_type", "missing", "duplicate"),
+                    IdentityAssessment("tasks", "missing", "absent"),
+                )),
+            ),
+            (
+                base_evidence,
+                self._identity_fact(assessments=(
+                    IdentityAssessment("info_robot_type", "supports", "ok"),
+                    IdentityAssessment("common_record", "supports", "wrong for missing"),
+                    IdentityAssessment("tasks", "missing", "absent"),
+                )),
+            ),
+            (
+                replace(base_evidence, identity=replace(base_evidence.identity, common_record_state="invalid")),
+                self._identity_fact(),
+            ),
+            (
+                replace(base_evidence, identity=replace(base_evidence.identity, issues=(invalid_issue,))),
+                self._identity_fact(),
+            ),
+            (
+                base_evidence,
+                self._identity_fact(
+                    status="conflicts_explained",
+                    assessments=(
+                        IdentityAssessment("info_robot_type", "supports", "ok"),
+                        IdentityAssessment("common_record", "missing", "absent"),
+                        IdentityAssessment("tasks", "missing", "absent"),
+                    ),
+                ),
+            ),
+            (
+                base_evidence,
+                self._identity_fact(
+                    status="conflicts_explained",
+                    assessments=(
+                        IdentityAssessment("info_robot_type", "supports", "ok"),
+                        IdentityAssessment("common_record", "conflicts", ""),
+                        IdentityAssessment("tasks", "missing", "absent"),
+                    ),
+                ),
+            ),
+        )
+        for evidence, identity in invalid_cases:
+            with self.subTest(identity=identity, local=evidence.identity):
+                result = apply_standard(
+                    evidence,
+                    self._profile(identity=identity),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(result.normalized_info.get("robot_type"), "raw-model")
+                self.assertEqual(result.robot_identity.decision, "review")
+
+    def test_explained_identity_conflict_is_accepted_when_support_and_explanation_exist(self) -> None:
+        evidence = self._evidence(
+            identity=self._identity_evidence(
+                common_state="present",
+                common_value={"legacy_model": "XR-6"},
+            )
+        )
+        fact = self._identity_fact(
+            status="conflicts_explained",
+            assessments=(
+                IdentityAssessment("info_robot_type", "supports", "source names XR-7"),
+                IdentityAssessment(
+                    "common_record",
+                    "conflicts",
+                    "record is a documented stale XR-6 export",
+                ),
+                IdentityAssessment("tasks", "missing", "file is absent"),
+            ),
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile(identity=fact),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
+
+    def test_identity_rejects_unsafe_ambiguous_low_or_malformed_facts(self) -> None:
+        facts = (
+            self._identity_fact(ambiguous=True),
+            self._identity_fact(confidence=0.84),
+            self._identity_fact(confidence=cast(float, True)),
+            self._identity_fact(confidence=float("nan")),
+            self._identity_fact(manufacturer="Acme\nRobotics"),
+            self._identity_fact(model=" XR-7"),
+            self._identity_fact(source_ids=("official-product", "official-product")),
+        )
+        for fact in facts:
+            with self.subTest(fact=fact):
+                result = apply_standard(
+                    self._evidence(),
+                    self._profile(identity=fact),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+                self.assertEqual(result.robot_identity.decision, "review")
+
+    def test_surrogate_identity_and_source_text_fails_closed_without_reaching_review(self) -> None:
+        surrogate = "\ud800"
+        base_fact = self._identity_fact()
+        profiles = (
+            self._profile(identity=replace(base_fact, manufacturer=f"Acme{surrogate}")),
+            self._profile(identity=replace(base_fact, reason=f"unsafe{surrogate}reason")),
+            self._profile(sources=(replace(self._source(), title=f"unsafe{surrogate}title"),)),
+        )
+        for profile in profiles:
+            with self.subTest(profile=profile):
+                result = apply_standard(
+                    self._evidence(),
+                    profile,
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+                self.assert_camera_kept(result)
+                self.assert_no_surrogate_text(
+                    (result.robot_identity, result.camera_mappings, result.issues)
+                )
+
+    def test_camera_requires_reliable_identity_assignment_slot_and_own_official_source(self) -> None:
+        third = self._source("community", kind="third_party")
+        low_identity = self._profile(identity=self._identity_fact(confidence=0.2))
+        slot_third_party = self._profile(
+            sources=(self._source(), third),
+            cameras=(self._slot(source_ids=("community",)),),
+        )
+        cases = (
+            (low_identity, self._mapping()),
+            (self._profile(), self._mapping(ambiguous=True)),
+            (self._profile(), self._mapping(confidence=0.2)),
+            (self._profile(cameras=(self._slot(ambiguous=True),)), self._mapping()),
+            (self._profile(cameras=(self._slot(confidence=0.2),)), self._mapping()),
+            (slot_third_party, self._mapping()),
+            (self._profile(), self._mapping(camera_id=None, ambiguous=True)),
+        )
+        for profile, mapping in cases:
+            with self.subTest(profile=profile, mapping=mapping):
+                result = apply_standard(self._evidence(), profile, mapping, confidence_threshold=0.85)
+                self.assert_camera_kept(result)
+                self.assertEqual(result.camera_mappings[0].decision, "review")
+                self.assertTrue(any(item.scope == f"features.{self.SOURCE_KEY}" for item in result.issues))
+
+    def test_camera_slot_renderer_requires_exact_safe_builtin_semantics(self) -> None:
+        valid = self._slot()
+        malformed_slots = (
+            replace(valid, mount_type=_StringSubclass("on_robot")),
+            replace(valid, modality=_StringSubclass("rgb")),
+            replace(valid, body_part=_StringSubclass("head")),
+            replace(valid, direction_tokens=cast(tuple[str, ...], ["front"])),
+            replace(valid, direction_tokens=(_StringSubclass("front"),)),
+            replace(valid, direction_tokens=cast(tuple[str, ...], (["front"],))),
+        )
+        for slot in malformed_slots:
+            with self.subTest(slot=slot):
+                result = apply_standard(
+                    self._evidence(),
+                    self._profile(cameras=(slot,)),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assert_camera_kept(result)
+                self.assertEqual(result.camera_mappings[0].decision, "review")
+
+    def test_identity_states_and_assessment_source_ids_require_exact_builtin_strings(self) -> None:
+        base = self._evidence()
+        state_subclass = replace(
+            base.identity,
+            info_robot_type_state=_StringSubclass("present"),
+        )
+        source_subclass = self._identity_fact(
+            assessments=(
+                IdentityAssessment(_StringSubclass("info_robot_type"), "supports", "agrees"),
+                IdentityAssessment("common_record", "missing", "absent"),
+                IdentityAssessment("tasks", "missing", "absent"),
+            )
+        )
+        cases = (
+            (replace(base, identity=state_subclass), self._identity_fact()),
+            (base, source_subclass),
+        )
+        for evidence, fact in cases:
+            with self.subTest(evidence=evidence, fact=fact):
+                result = apply_standard(
+                    evidence,
+                    self._profile(identity=fact),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+                self.assert_camera_kept(result)
+
+    def test_camera_rejects_missing_sources_and_handcrafted_duplicate_identifiers(self) -> None:
+        duplicate_slot = replace(self._slot(direction_tokens=("left",), body_part="wrist"), camera_id="head-rgb")
+        duplicate_profile = self._profile(cameras=(self._slot(), duplicate_slot))
+        duplicate_mapping = self._mapping(
+            cameras=(
+                CameraAssignment(self.SOURCE_KEY, "head-rgb", 0.95, False, "first"),
+                CameraAssignment(self.SOURCE_KEY, "head-rgb", 0.95, False, "duplicate"),
+            )
+        )
+        cases = (
+            (duplicate_profile, self._mapping()),
+            (self._profile(), duplicate_mapping),
+            (self._profile(), self._mapping(source_key="observation.images.unknown")),
+        )
+        for profile, mapping in cases:
+            with self.subTest(profile=profile, mapping=mapping):
+                result = apply_standard(self._evidence(), profile, mapping, confidence_threshold=0.85)
+                self.assert_camera_kept(result)
+                self.assertEqual(result.camera_mappings[0].decision, "review")
+
+    def test_camera_rejects_schema_frame_media_and_numeric_mismatches(self) -> None:
+        base = self._evidence()
+        camera = base.cameras[0]
+        sample = camera.samples[0]
+        invalid_evidence = (
+            replace(base, cameras=(replace(camera, schema=replace(camera.schema, dtype="array")),)),
+            replace(base, cameras=(replace(camera, schema=replace(camera.schema, shape=(480, 640, 1))),)),
+            replace(base, cameras=(replace(camera, schema=replace(camera.schema, shape=(480, 640, True))),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, frame_path=None),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, media_type="image"),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, fps=19.0),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, fps=float("nan")),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, fps=cast(float, True)),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, width=641),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, width=cast(int, True)),)),)),
+            replace(base, cameras=(replace(camera, samples=(replace(sample, height=479),)),)),
+        )
+        source_mismatch = deepcopy(base.source_info)
+        cast(dict[str, dict[str, object]], source_mismatch["features"])[self.SOURCE_KEY]["shape"] = [720, 1280, 3]
+        bool_fps = deepcopy(base.source_info)
+        cast(dict[str, dict[str, object]], bool_fps["features"])[self.SOURCE_KEY]["fps"] = True
+        invalid_evidence = (
+            *invalid_evidence,
+            replace(base, source_info=source_mismatch),
+            replace(
+                self._evidence(fps=1, sample=self._sample(self.SOURCE_KEY, fps=1.0)),
+                source_info=bool_fps,
+            ),
+        )
+
+        for evidence in invalid_evidence:
+            with self.subTest(evidence=evidence):
+                result = apply_standard(evidence, self._profile(), self._mapping(), confidence_threshold=0.85)
+                self.assert_camera_kept(result)
+                self.assertIn("CAMERA_MEDIA_MISMATCH", {item.code for item in result.issues})
+
+    def test_extreme_builtin_media_number_fails_closed_without_overflow(self) -> None:
+        huge = 10 ** 10000
+        evidence = self._evidence(
+            fps=huge,
+            sample=self._sample(self.SOURCE_KEY, fps=cast(float, huge)),
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile(),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+
+        self.assert_camera_kept(result)
+        self.assertIn("CAMERA_MEDIA_MISMATCH", {item.code for item in result.issues})
+
+    def test_every_sample_must_match_and_static_images_need_complete_probe_data(self) -> None:
+        base = self._evidence()
+        first = base.cameras[0].samples[0]
+        invalid_second = replace(first, relative_path="videos/second.mp4", height=479, frame_path=Path("/fixture/two.jpg"))
+        multi = replace(base, cameras=(replace(base.cameras[0], samples=(first, invalid_second)),))
+        result = apply_standard(multi, self._profile(), self._mapping(), confidence_threshold=0.85)
+        self.assert_camera_kept(result)
+        self.assertIn("CAMERA_MEDIA_MISMATCH", {item.code for item in result.issues})
+
+        image = self._evidence(dtype="image", sample=self._sample(self.SOURCE_KEY, media_type="image", fps=None))
+        image_result = apply_standard(image, self._profile(), self._mapping(), confidence_threshold=0.85)
+        self.assert_camera_kept(image_result)
+        self.assertIn("CAMERA_MEDIA_MISMATCH", {item.code for item in image_result.issues})
+
+    def test_camera_application_needs_at_least_one_frame_not_one_per_sample(self) -> None:
+        base = self._evidence()
+        first = base.cameras[0].samples[0]
+        second_without_frame = replace(
+            first,
+            relative_path="videos/second.mp4",
+            frame_path=None,
+        )
+        evidence = replace(
+            base,
+            cameras=(replace(base.cameras[0], samples=(first, second_without_frame)),),
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile(),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertNotIn(self.SOURCE_KEY, result.normalized_info["features"])
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
+
+        no_frames = replace(
+            base,
+            cameras=(
+                replace(
+                    base.cameras[0],
+                    samples=(replace(first, frame_path=None), second_without_frame),
+                ),
+            ),
+        )
+        rejected = apply_standard(
+            no_frames,
+            self._profile(),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+        self.assert_camera_kept(rejected)
+        self.assertIn("CAMERA_MEDIA_MISMATCH", {item.code for item in rejected.issues})
+
+    def test_rgb_and_depth_apply_pdf_codecs_without_changing_declared_schema(self) -> None:
+        rgb = self._evidence(shape=(480, 640, 4))
+        rgb_result = apply_standard(rgb, self._profile(), self._mapping(), confidence_threshold=0.85)
+        rgb_output = cast(dict[str, dict[str, object]], rgb_result.normalized_info["features"])[self.TARGET_KEY]
+        self.assertEqual((rgb_output["dtype"], rgb_output["shape"], rgb_output["fps"], rgb_output["codec"]), ("video", [480, 640, 4], 20, "av1"))
+
+        depth_slot = self._slot(modality="depth")
+        depth_sample = self._sample(self.SOURCE_KEY, codec="ffv1")
+        depth = self._evidence(shape=(480, 640, 1), sample=depth_sample)
+        depth_result = apply_standard(
+            depth,
+            self._profile(cameras=(depth_slot,)),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+        depth_key = "observation.images.cam_front_head_depth"
+        depth_output = cast(dict[str, dict[str, object]], depth_result.normalized_info["features"])[depth_key]
+        self.assertEqual(depth_output["codec"], "ffv1")
+        self.assertNotIn("MEDIA_TRANSCODE_REQUIRED", {item.code for item in depth_result.issues})
+
+    def test_different_or_unknown_actual_codec_applies_metadata_and_requires_review(self) -> None:
+        for codec in ("h264", None):
+            with self.subTest(codec=codec):
+                evidence = self._evidence(sample=self._sample(self.SOURCE_KEY, codec=codec))
+                result = apply_standard(evidence, self._profile(), self._mapping(), confidence_threshold=0.85)
+                features = cast(dict[str, dict[str, object]], result.normalized_info["features"])
+                self.assertNotIn(self.SOURCE_KEY, features)
+                self.assertEqual(features[self.TARGET_KEY]["codec"], "av1")
+                self.assertIn("MEDIA_TRANSCODE_REQUIRED", {item.code for item in result.issues})
+                self.assertEqual(result.camera_mappings[0].decision, "review")
+
+    def test_duplicate_render_targets_keep_every_involved_source(self) -> None:
+        evidence = self._with_second_camera(self._evidence())
+        slots = (
+            self._slot(camera_id="head-a"),
+            self._slot(camera_id="head-b"),
+        )
+        mapping = self._mapping(
+            cameras=(
+                CameraAssignment(self.SOURCE_KEY, "head-a", 0.95, False, "first"),
+                CameraAssignment(self.SECOND_SOURCE_KEY, "head-b", 0.95, False, "second"),
+            )
+        )
+
+        result = apply_standard(evidence, self._profile(cameras=slots), mapping, confidence_threshold=0.85)
+
+        features = cast(dict[str, object], result.normalized_info["features"])
+        self.assertIn(self.SOURCE_KEY, features)
+        self.assertIn(self.SECOND_SOURCE_KEY, features)
+        self.assertNotIn(self.TARGET_KEY, features)
+        self.assertEqual([record.decision for record in result.camera_mappings], ["review", "review"])
+        self.assertEqual([item.code for item in result.issues].count("CAMERA_NAME_COLLISION"), 2)
+
+    def test_render_collision_includes_low_ambiguous_and_media_rejected_candidates(self) -> None:
+        base = self._with_second_camera(self._evidence())
+        slots = (
+            self._slot(camera_id="head-a"),
+            self._slot(camera_id="head-b"),
+        )
+        second = CameraAssignment(
+            self.SECOND_SOURCE_KEY,
+            "head-b",
+            0.95,
+            False,
+            "second",
+        )
+        cases = (
+            (
+                base,
+                replace(second, confidence=0.2),
+            ),
+            (
+                base,
+                replace(second, ambiguous=True),
+            ),
+            (
+                replace(
+                    base,
+                    cameras=(
+                        base.cameras[0],
+                        replace(
+                            base.cameras[1],
+                            samples=(replace(base.cameras[1].samples[0], width=641),),
+                        ),
+                    ),
+                ),
+                second,
+            ),
+        )
+        for evidence, unsafe_second in cases:
+            with self.subTest(unsafe_second=unsafe_second):
+                mapping = self._mapping(
+                    cameras=(
+                        CameraAssignment(self.SOURCE_KEY, "head-a", 0.95, False, "first"),
+                        unsafe_second,
+                    )
+                )
+                result = apply_standard(
+                    evidence,
+                    self._profile(cameras=slots),
+                    mapping,
+                    confidence_threshold=0.85,
+                )
+                features = cast(dict[str, object], result.normalized_info["features"])
+                self.assertIn(self.SOURCE_KEY, features)
+                self.assertIn(self.SECOND_SOURCE_KEY, features)
+                self.assertNotIn(self.TARGET_KEY, features)
+                self.assertEqual(
+                    [item.code for item in result.issues].count("CAMERA_NAME_COLLISION"),
+                    2,
+                )
+
+    def test_unresolved_assignment_without_render_target_does_not_block_safe_target(self) -> None:
+        evidence = self._with_second_camera(self._evidence())
+        mapping = self._mapping(
+            cameras=(
+                CameraAssignment(self.SOURCE_KEY, "head-rgb", 0.95, False, "safe"),
+                CameraAssignment(self.SECOND_SOURCE_KEY, None, 0.2, True, "unresolved"),
+            )
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile(),
+            mapping,
+            confidence_threshold=0.85,
+        )
+
+        features = cast(dict[str, object], result.normalized_info["features"])
+        self.assertNotIn(self.SOURCE_KEY, features)
+        self.assertIn(self.TARGET_KEY, features)
+        self.assertIn(self.SECOND_SOURCE_KEY, features)
+        self.assertNotIn("CAMERA_NAME_COLLISION", {item.code for item in result.issues})
+
+    def test_occupied_target_blocks_only_that_plan_and_safe_camera_still_applies(self) -> None:
+        evidence = self._with_second_camera(self._evidence())
+        source_info = deepcopy(evidence.source_info)
+        cast(dict[str, object], source_info["features"])[self.TARGET_KEY] = {"dtype": "float32", "shape": [1]}
+        evidence = replace(evidence, source_info=source_info)
+        slots = (
+            self._slot(camera_id="head"),
+            self._slot(camera_id="wrist", direction_tokens=("left",), body_part="wrist"),
+        )
+        mapping = self._mapping(
+            cameras=(
+                CameraAssignment(self.SOURCE_KEY, "head", 0.95, False, "occupied"),
+                CameraAssignment(self.SECOND_SOURCE_KEY, "wrist", 0.95, False, "safe"),
+            )
+        )
+
+        result = apply_standard(evidence, self._profile(cameras=slots), mapping, confidence_threshold=0.85)
+
+        features = cast(dict[str, object], result.normalized_info["features"])
+        self.assertIn(self.SOURCE_KEY, features)
+        self.assertEqual(features[self.TARGET_KEY], {"dtype": "float32", "shape": [1]})
+        self.assertNotIn(self.SECOND_SOURCE_KEY, features)
+        self.assertIn(self.SECOND_TARGET_KEY, features)
+        self.assertEqual([record.decision for record in result.camera_mappings], ["review", "apply"])
+        self.assertIn("CAMERA_NAME_COLLISION", {item.code for item in result.issues})
+
+    def test_standard_source_key_changes_only_codec_and_reports_actual_schema_objects(self) -> None:
+        evidence = self._evidence(source_key=self.TARGET_KEY)
+        mapping = self._mapping(source_key=self.TARGET_KEY)
+
+        result = apply_standard(evidence, self._profile(), mapping, confidence_threshold=0.85)
+
+        record = result.camera_mappings[0]
+        self.assertEqual(record.source_address, f"features.{self.TARGET_KEY}")
+        self.assertEqual(record.source["codec"], "h264")
+        self.assertEqual(record.output["codec"], "av1")
+        self.assertEqual(record.candidate, self.TARGET_KEY)
+        self.assertTrue(record.changed)
+        self.assertEqual(record.decision, "apply")
+        self.assertEqual(tuple(result.normalized_info["features"]), tuple(evidence.source_info["features"]))
+
+    def test_rejected_camera_keeps_actual_output_and_candidate_separate(self) -> None:
+        result = apply_standard(
+            self._evidence(),
+            self._profile(),
+            self._mapping(ambiguous=True),
+            confidence_threshold=0.85,
+        )
+        source_feature = cast(dict[str, dict[str, object]], self._evidence().source_info["features"])[self.SOURCE_KEY]
+        record = result.camera_mappings[0]
+        self.assertEqual(record.source_address, f"features.{self.SOURCE_KEY}")
+        self.assertEqual(record.source, source_feature)
+        self.assertEqual(record.output, source_feature)
+        self.assertEqual(record.candidate, self.TARGET_KEY)
+        self.assertFalse(record.changed)
+        self.assertEqual(record.decision, "review")
+        self.assertTrue(any(item.scope == record.source_address for item in result.issues))
+
+    def test_preserves_unrelated_metadata_and_never_changes_machine_fields(self) -> None:
+        evidence = self._evidence()
+        before_action = deepcopy(cast(dict[str, object], evidence.source_info["features"])["action"])
+        result = apply_standard(
+            evidence,
+            self._profile(),
+            self._mapping(
+                machines=(MachineAssignment("action", (), 1.0, False, "ignored until machine phase"),)
+            ),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(result.normalized_info["untouched"], {"nested": [1, 2, 3]})
+        self.assertEqual(cast(dict[str, object], result.normalized_info["features"])["action"], before_action)
+        self.assertEqual(result.machine_mappings, ())
+
+    def test_manual_nan_bool_and_duplicate_values_fail_closed_without_crashing(self) -> None:
+        profiles_and_mappings = (
+            (self._profile(identity=self._identity_fact(confidence=float("nan"))), self._mapping()),
+            (self._profile(cameras=(self._slot(confidence=float("nan")),)), self._mapping()),
+            (self._profile(cameras=(self._slot(confidence=cast(float, True)),)), self._mapping()),
+            (self._profile(), self._mapping(confidence=float("nan"))),
+            (self._profile(), self._mapping(confidence=cast(float, True))),
+        )
+        for profile, mapping in profiles_and_mappings:
+            with self.subTest(profile=profile, mapping=mapping):
+                result = apply_standard(self._evidence(), profile, mapping, confidence_threshold=0.85)
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model" if profile.identity.confidence != 0.95 else "acme_robotics_xr_7")
+                self.assert_camera_kept(result)
+                self.assertEqual(result.camera_mappings[0].decision, "review")
+
+    def test_malformed_official_url_cannot_authorize_identity_or_camera_changes(self) -> None:
+        malformed = replace(self._source(), url="https://?model=xr7")
+        result = apply_standard(
+            self._evidence(),
+            self._profile(sources=(malformed,)),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+        self.assert_camera_kept(result)
+
+    def test_identity_comparison_memory_error_propagates(self) -> None:
+        exploding = _ExplodingEquality()
+        evidence = self._evidence(
+            identity=self._identity_evidence(info_value=exploding)
+        )
+        source_info = deepcopy(evidence.source_info)
+        source_info["robot_type"] = exploding
+        evidence = replace(evidence, source_info=source_info)
+
+        with self.assertRaises(MemoryError):
+            apply_standard(
+                evidence,
+                self._profile(),
+                self._mapping(),
+                confidence_threshold=0.85,
+            )
+
+    def test_issue_order_is_evidence_then_extra_then_identity_then_camera(self) -> None:
+        evidence = self._evidence(issues=(Issue("EVIDENCE", "evidence", "fixture"),))
+        result = apply_standard(
+            evidence,
+            self._profile(identity=self._identity_fact(ambiguous=True)),
+            self._mapping(ambiguous=True),
+            confidence_threshold=0.85,
+            extra_issues=(Issue("EXTRA", "extra", "fixture"),),
+        )
+        codes = [item.code for item in result.issues]
+        self.assertEqual(codes[:2], ["EVIDENCE", "EXTRA"])
+        self.assertLess(codes.index("ROBOT_IDENTITY_UNRESOLVED"), codes.index("CAMERA_MAPPING_UNRESOLVED"))
 
 
 if __name__ == "__main__":
