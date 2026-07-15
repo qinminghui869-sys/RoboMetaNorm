@@ -1,8 +1,10 @@
-"""Strict rendering and parsing for canonical camera feature keys."""
+"""Strict rendering and parsing for canonical feature names."""
 
 from __future__ import annotations
 
-from robometanorm.models import CameraSlot
+import re
+
+from robometanorm.models import CameraSlot, MachineComponent
 
 
 CAMERA_PREFIX = "observation.images.cam_"
@@ -50,6 +52,77 @@ CONFLICT_GROUPS = (
 
 _MODALITIES = frozenset({"rgb", "depth"})
 _STANDALONE_EXTERNAL_DIRECTIONS = frozenset({"global", "env"})
+
+FIXED_COMPONENTS = {
+    "eef_position": ("position_xyz", "m", 3),
+    "eef_rotation": ("euler_xyz", "rad", 3),
+    "head_rotation": ("euler_xyz", "rad", 3),
+    "head_orientation": ("quaternion_xyzw", "unitless", 4),
+    "base_position": ("position_xyz", "m", 3),
+    "base_rotation": ("euler_xyz", "rad", 3),
+}
+SIDED_COMPONENTS = frozenset(
+    {
+        "arm_joint",
+        "hand_joint",
+        "gripper_open",
+        "gripper_open_scale",
+        "eef_position",
+        "eef_rotation",
+    }
+)
+JOINT_COMPONENTS = frozenset(
+    {"arm_joint", "hand_joint", "head_joint", "torso_joint", "neck_joint"}
+)
+INDEXED_COMPONENTS = frozenset({"head_position"})
+
+_GRIPPER_COMPONENTS = frozenset({"gripper_open", "gripper_open_scale"})
+_MACHINE_COMPONENTS = (
+    frozenset(FIXED_COMPONENTS)
+    | SIDED_COMPONENTS
+    | JOINT_COMPONENTS
+    | INDEXED_COMPONENTS
+)
+_FIXED_NAME_FORMATS = {
+    "eef_position": "eef_pos_{axis}_m",
+    "eef_rotation": "eef_rot_euler_{axis}_rad",
+    "head_rotation": "head_rot_euler_{axis}_rad",
+    "head_orientation": "head_orient_quat_{axis}",
+    "base_position": "base_pos_{axis}_m",
+    "base_rotation": "base_rot_euler_{axis}_rad",
+}
+_INDEX_PATTERN = r"(?:0|[1-9][0-9]*)"
+_MACHINE_NAME_PATTERN = re.compile(
+    rf"(?:"
+    rf"(?:left|right)_(?:arm|hand)_joint_{_INDEX_PATTERN}_rad"
+    rf"|(?:left|right)_gripper_open(?:_scale)?"
+    rf"|(?:left|right)_eef_pos_[xyz]_m"
+    rf"|(?:left|right)_eef_rot_euler_[xyz]_rad"
+    rf"|(?:head|torso|neck)_joint_{_INDEX_PATTERN}_rad"
+    rf"|head_pos_{_INDEX_PATTERN}_m"
+    rf"|head_rot_euler_[xyz]_rad"
+    rf"|head_orient_quat_[xyzw]"
+    rf"|base_pos_[xyz]_m"
+    rf"|base_rot_euler_[xyz]_rad"
+    rf")"
+)
+_NUMBERED_MACHINE_NAME_PATTERN = re.compile(
+    rf"(?P<family>"
+    rf"(?:left|right)_(?:arm|hand)_joint"
+    rf"|(?:head|torso|neck)_joint"
+    rf"|head_pos"
+    rf")_(?P<index>{_INDEX_PATTERN})_(?:rad|m)"
+)
+_FIXED_MACHINE_NAME_PATTERN = re.compile(
+    r"(?P<family>"
+    r"(?:left|right)_eef_pos"
+    r"|(?:left|right)_eef_rot_euler"
+    r"|head_rot_euler"
+    r"|head_orient_quat"
+    r"|base_pos"
+    r"|base_rot_euler"
+    r")_(?P<axis>[xyzw])(?:_(?:m|rad))?"
+)
 
 
 def _has_conflict(direction_set: frozenset[str]) -> bool:
@@ -155,3 +228,131 @@ def parse_standard_camera_key(key: str) -> str | None:
     if render_camera_key(parsed_slot) != key:
         return None
     return modality
+
+
+def render_component_names(component: MachineComponent) -> tuple[str, ...] | None:
+    """Render names for a machine component that exactly matches the standard."""
+
+    kind = component.kind
+    if not isinstance(kind, str) or kind not in _MACHINE_COMPONENTS:
+        return None
+
+    if kind in SIDED_COMPONENTS:
+        if component.side not in ("left", "right"):
+            return None
+        side_prefix = f"{component.side}_"
+    else:
+        if component.side is not None:
+            return None
+        side_prefix = ""
+
+    count = component.count
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return None
+
+    element_order = component.element_order
+    if not isinstance(element_order, tuple) or len(element_order) != count:
+        return None
+    if any(
+        not isinstance(element, str) or not element.strip()
+        for element in element_order
+    ):
+        return None
+    if len(set(element_order)) != count:
+        return None
+
+    if kind in FIXED_COMPONENTS:
+        representation, unit, fixed_count = FIXED_COMPONENTS[kind]
+        expected_order = (
+            ("x", "y", "z", "w")
+            if kind == "head_orientation"
+            else ("x", "y", "z")
+        )
+        if (
+            component.representation != representation
+            or component.unit != unit
+            or count != fixed_count
+            or element_order != expected_order
+        ):
+            return None
+        name_format = _FIXED_NAME_FORMATS[kind]
+        return tuple(
+            side_prefix + name_format.format(axis=axis) for axis in expected_order
+        )
+
+    if kind in JOINT_COMPONENTS:
+        if component.representation != "joint_vector" or component.unit != "rad":
+            return None
+        return tuple(
+            f"{side_prefix}{kind}_{index}_rad" for index in range(count)
+        )
+
+    if kind in INDEXED_COMPONENTS:
+        if component.representation != "position_vector" or component.unit != "m":
+            return None
+        return tuple(f"head_pos_{index}_m" for index in range(count))
+
+    if (
+        kind not in _GRIPPER_COMPONENTS
+        or component.representation != "scalar"
+        or component.unit != "unitless"
+        or count != 1
+    ):
+        return None
+    return (side_prefix + kind,)
+
+
+def is_standard_machine_name(name: str) -> bool:
+    """Return whether one name exactly matches the canonical machine grammar."""
+
+    return isinstance(name, str) and _MACHINE_NAME_PATTERN.fullmatch(name) is not None
+
+
+def are_standard_machine_names(names: tuple[str, ...]) -> bool:
+    """Validate one or more complete canonical machine-name families."""
+
+    if isinstance(names, (str, bytes)):
+        return False
+    try:
+        name_tuple = tuple(names)
+    except TypeError:
+        return False
+
+    if not name_tuple or not all(
+        is_standard_machine_name(name) for name in name_tuple
+    ):
+        return False
+    if len(name_tuple) != len(set(name_tuple)):
+        return False
+
+    numbered_families: dict[str, list[str]] = {}
+    fixed_families: dict[str, list[str]] = {}
+    for name in name_tuple:
+        numbered_match = _NUMBERED_MACHINE_NAME_PATTERN.fullmatch(name)
+        if numbered_match is not None:
+            family = numbered_match.group("family")
+            numbered_families.setdefault(family, []).append(
+                numbered_match.group("index")
+            )
+            continue
+
+        fixed_match = _FIXED_MACHINE_NAME_PATTERN.fullmatch(name)
+        if fixed_match is not None:
+            family = fixed_match.group("family")
+            fixed_families.setdefault(family, []).append(fixed_match.group("axis"))
+
+    if any(
+        indices != [str(index) for index in range(len(indices))]
+        for indices in numbered_families.values()
+    ):
+        return False
+
+    return all(
+        axes
+        == (
+            ["x", "y", "z", "w"]
+            if family == "head_orient_quat"
+            else ["x", "y", "z"]
+        )
+        for family, axes in fixed_families.items()
+    )
