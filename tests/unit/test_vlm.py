@@ -1314,9 +1314,12 @@ class HardwareResearchTest(unittest.TestCase, VlmFixture):
         self.assertIn("联网", system)
         self.assertIn("官方", system)
         self.assertIn("第三方", system)
-        self.assertIn("URDF", system)
-        self.assertIn("触觉", system)
-        self.assertIn("声音", system)
+        self.assertIn(
+            "根对象恰好包含 identity、sources、cameras、components",
+            system,
+        )
+        for excluded_topic in ("URDF", "触觉", "声音", "音频"):
+            self.assertNotIn(excluded_topic, system)
         for schema_token in (
             "identity",
             "sources",
@@ -2080,9 +2083,9 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         normalized = " ".join(system.lower().split())
         self.assertIn("assignment-only", normalized)
         self.assertIn("existing camera_id/component_id", normalized)
-        self.assertIn("do not use hardware_id", normalized)
-        self.assertIn("do not propose final names", normalized)
-        self.assertIn("urdf, tactile, and audio are out of scope", normalized)
+        self.assertIn("supplied camera/component assignments", normalized)
+        for excluded_topic in ("urdf", "tactile", "audio"):
+            self.assertNotIn(excluded_topic, normalized)
 
     def test_parses_structural_mapping_and_defers_task11_consistency(self) -> None:
         payload = self.payload()

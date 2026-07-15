@@ -10,7 +10,6 @@ import json
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from robometanorm.models import (
     CameraAssignment,
@@ -30,10 +29,6 @@ from robometanorm.models import (
     RobotIdentityFact,
     SourceReference,
 )
-
-if TYPE_CHECKING:
-    import numpy as np
-
 
 @dataclass(frozen=True)
 class DatasetFixture:
@@ -310,13 +305,6 @@ class PipelineFixture:
             "duration_seconds": 1.0,
             "pixel_format": "yuv420p",
         }
-
-    @staticmethod
-    def frame_array() -> "np.ndarray":
-        import numpy as np
-
-        return np.zeros((8, 8, 3), dtype=np.uint8)
-
 
 @dataclass(frozen=True)
 class VlmFixture:
