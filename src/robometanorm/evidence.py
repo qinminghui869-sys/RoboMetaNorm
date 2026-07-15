@@ -122,7 +122,11 @@ def collect_camera_evidence(
             output_path = temp_frames / f"frame-{frame_sequence:06d}.jpg"
             frame_sequence += 1
             try:
-                extracted_path = extract_midpoint_frame(media_path, output_path)
+                extracted_path = extract_midpoint_frame(
+                    media_path,
+                    output_path,
+                    duration_seconds=sample.duration_seconds,
+                )
                 if extracted_path != output_path or not output_path.is_file():
                     raise ValueError("frame extraction returned no safe output")
                 sample = replace(sample, frame_path=output_path)
@@ -226,16 +230,22 @@ def probe_media(media_path: Path) -> MediaSample:
     )
 
 
-def extract_midpoint_frame(media_path: Path, output_path: Path) -> Path:
+def extract_midpoint_frame(
+    media_path: Path,
+    output_path: Path,
+    *,
+    duration_seconds: float | None = None,
+) -> Path:
     """Extract one bounded JPEG at the temporal midpoint of a video."""
     try:
         if media_path.resolve(strict=False) == output_path.resolve(strict=False):
             raise ValueError("frame output must differ from source media")
-    except (OSError, RuntimeError) as error:
+    except OSError as error:
         raise ValueError("frame paths could not be validated") from error
 
-    media = probe_media(media_path)
-    duration = _positive_float(media.duration_seconds)
+    if duration_seconds is None:
+        duration_seconds = probe_media(media_path).duration_seconds
+    duration = _positive_float(duration_seconds)
     if duration is None:
         raise ValueError("video duration is unusable")
 
@@ -257,7 +267,7 @@ def extract_midpoint_frame(media_path: Path, output_path: Path) -> Path:
         "-frames:v",
         "1",
         "-vf",
-        "scale=1280:-2:force_original_aspect_ratio=decrease",
+        "scale=1280:1280:force_original_aspect_ratio=decrease",
         str(output_path),
     ]
     try:

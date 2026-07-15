@@ -1942,7 +1942,13 @@ class CameraEvidenceTest(unittest.TestCase):
             for index in range(2)
         ]
 
-        def extract(path: Path, output: Path) -> Path:
+        def extract(
+            path: Path,
+            output: Path,
+            *,
+            duration_seconds: float | None = None,
+        ) -> Path:
+            self.assertEqual(duration_seconds, 10.0)
             if path == media_paths[0]:
                 raise ValueError(f"secret command {path}")
             return self._create_frame(path, output)
@@ -1984,8 +1990,14 @@ class CameraEvidenceTest(unittest.TestCase):
             f"chunk-000/{self.source_key}/episode_000000.mp4",
         )
 
-        def fail_after_write(media_path: Path, output_path: Path) -> Path:
+        def fail_after_write(
+            media_path: Path,
+            output_path: Path,
+            *,
+            duration_seconds: float | None = None,
+        ) -> Path:
             del media_path
+            self.assertEqual(duration_seconds, 10.0)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"partial-frame")
             raise ValueError("failed after partial output")
@@ -2056,6 +2068,80 @@ class CameraEvidenceTest(unittest.TestCase):
                 collect_camera_evidence(
                     self.candidate, self._camera_info(), self.temp_frames
                 )
+
+    def test_collection_real_path_probes_and_extracts_each_video_once(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+        tool_calls: list[str] = []
+
+        def run(command: list[str], **kwargs: object) -> object:
+            self.assertEqual(
+                kwargs,
+                {"capture_output": True, "text": True, "check": False},
+            )
+            tool_calls.append(command[0])
+            if command[0] == "ffprobe":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(self._valid_probe_payload()),
+                    stderr="",
+                )
+            self.assertEqual(command[0], "ffmpeg")
+            Path(command[-1]).write_bytes(b"jpeg-frame")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch("robometanorm.evidence.subprocess.run", side_effect=run):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(tool_calls, ["ffprobe", "ffmpeg"])
+        self.assertTrue(cameras[0].samples[0].frame_path.is_file())
+        self.assertEqual(issues, ())
+
+    def test_collection_real_path_classifies_probe_and_ffmpeg_failures(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+
+        with patch(
+            "robometanorm.evidence.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=1, stdout="", stderr="unsafe probe error"
+            ),
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+        self.assertEqual(cameras[0].samples, ())
+        self.assertEqual([issue.code for issue in issues], ["MEDIA_PROBE_FAILED"])
+
+        def fail_ffmpeg(command: list[str], **kwargs: object) -> object:
+            del kwargs
+            if command[0] == "ffprobe":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(self._valid_probe_payload()),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="unsafe ffmpeg error"
+            )
+
+        with patch(
+            "robometanorm.evidence.subprocess.run", side_effect=fail_ffmpeg
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+        self.assertEqual(len(cameras[0].samples), 1)
+        self.assertIsNone(cameras[0].samples[0].frame_path)
+        self.assertEqual(
+            [issue.code for issue in issues], ["FRAME_EXTRACTION_FAILED"]
+        )
 
         with (
             patch(
@@ -2297,13 +2383,30 @@ class CameraEvidenceTest(unittest.TestCase):
         self.assertEqual(float(command[command.index("-ss") + 1]), 5.0)
         self.assertEqual(
             command[command.index("-vf") + 1],
-            "scale=1280:-2:force_original_aspect_ratio=decrease",
+            "scale=1280:1280:force_original_aspect_ratio=decrease",
         )
         self.assertEqual(command[-1], str(output_path))
         self.assertEqual(
             mocked_run.call_args.kwargs,
             {"capture_output": True, "text": True, "check": False},
         )
+
+    def test_extract_midpoint_frame_propagates_unexpected_resolve_error(self) -> None:
+        with (
+            patch(
+                "pathlib.Path.resolve",
+                side_effect=RuntimeError("unexpected resolve failure"),
+            ),
+            patch("robometanorm.evidence.probe_media") as probe,
+            patch("robometanorm.evidence.subprocess.run") as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected resolve failure"):
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", self.root / "frame.jpg"
+                )
+
+        probe.assert_not_called()
+        run.assert_not_called()
 
     def test_extract_midpoint_frame_rejects_unusable_duration(self) -> None:
         for duration in (None, 0.0, -1.0, float("nan"), float("inf")):
@@ -2745,8 +2848,15 @@ class CameraEvidenceTest(unittest.TestCase):
         )
 
     @staticmethod
-    def _create_frame(media_path: Path, output_path: Path) -> Path:
+    def _create_frame(
+        media_path: Path,
+        output_path: Path,
+        *,
+        duration_seconds: float | None = None,
+    ) -> Path:
         del media_path
+        if duration_seconds is not None and duration_seconds <= 0:
+            raise ValueError("invalid fixture duration")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(b"jpeg-fixture")
         return output_path
