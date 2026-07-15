@@ -56,6 +56,9 @@ class _HttpResponse:
         self.read_error = read_error
         self.enter_error = enter_error
         self.exit_error = exit_error
+        self.read_sizes: list[int] = []
+        self.exit_calls = 0
+        self._stream = BytesIO(self.raw) if type(self.raw) is bytes else None
 
     def __enter__(self) -> "_HttpResponse":
         if self.enter_error is not None:
@@ -65,14 +68,35 @@ class _HttpResponse:
     def __exit__(
         self, exc_type: object, exc: object, traceback: object
     ) -> bool:
+        self.exit_calls += 1
         if self.exit_error is not None:
             raise self.exit_error
         return False
 
-    def read(self) -> bytes | object:
+    def read(self, size: int = -1) -> bytes | object:
+        self.read_sizes.append(size)
         if self.read_error is not None:
             raise self.read_error
+        if self._stream is not None:
+            return self._stream.read(size)
         return self.raw
+
+
+class _SegmentedHttpResponse(_HttpResponse):
+    """HTTP response that deliberately returns short byte chunks."""
+
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        super().__init__(raw=b"")
+        self._chunks = list(chunks)
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        if not self._chunks:
+            return b""
+        chunk = self._chunks.pop(0)
+        if size >= 0 and len(chunk) > size:
+            raise AssertionError("fixture chunk exceeds requested read size")
+        return chunk
 
 
 class _UnreadableHttpBody(BytesIO):
@@ -485,6 +509,302 @@ class VlmTransportTest(unittest.TestCase):
         self.assertNotIn(str(image_path), repr(issue))
         urlopen.assert_not_called()
 
+    def test_final_fifo_is_opened_nonblocking_and_rejected_without_upload(
+        self,
+    ) -> None:
+        if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("FIFO nonblocking flags are unavailable")
+
+        real_open = os.open
+        final_flags: list[int] = []
+        with tempfile.TemporaryDirectory(prefix="private-vlm-fifo-") as directory:
+            image_path = Path(directory) / "frame.png"
+            os.mkfifo(image_path)
+
+            def guarded_open(
+                path: str, flags: int, *, dir_fd: int | None = None
+            ) -> int:
+                effective_flags = flags
+                if path == image_path.name:
+                    final_flags.append(flags)
+                    effective_flags |= os.O_NONBLOCK
+                if dir_fd is None:
+                    return real_open(path, effective_flags)
+                return real_open(path, effective_flags, dir_fd=dir_fd)
+
+            transport = self.make_transport()
+            with (
+                patch("robometanorm.vlm.os.open", side_effect=guarded_open),
+                patch(
+                    "robometanorm.vlm.base64.b64encode",
+                    wraps=base64.b64encode,
+                ) as encode,
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", (image_path,)
+                )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
+        self.assertEqual(
+            issue.evidence,
+            {"file_name": "frame.png", "error_type": "OSError"},
+        )
+        self.assertEqual(len(final_flags), 1)
+        self.assertTrue(final_flags[0] & os.O_NONBLOCK)
+        self.assertTrue(final_flags[0] & os.O_NOFOLLOW)
+        self.assertTrue(final_flags[0] & os.O_CLOEXEC)
+        self.assertNotIn(str(image_path), repr(issue))
+        self.assertNotIn(directory, repr(issue))
+        encode.assert_not_called()
+        urlopen.assert_not_called()
+
+    def test_declared_oversize_image_is_rejected_before_read_or_upload(self) -> None:
+        limit = 8
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "frame.png"
+            image_path.write_bytes(b"x" * (limit + 1))
+            transport = self.make_transport()
+            with (
+                patch.object(
+                    vlm_module, "_IMAGE_BYTES_LIMIT", limit, create=True
+                ),
+                patch(
+                    "robometanorm.vlm.os.read", wraps=os.read
+                ) as read,
+                patch(
+                    "robometanorm.vlm.base64.b64encode",
+                    wraps=base64.b64encode,
+                ) as encode,
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", (image_path,)
+                )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
+        self.assertEqual(
+            issue.evidence,
+            {"file_name": "frame.png", "error_type": "ImageTooLarge"},
+        )
+        read.assert_not_called()
+        encode.assert_not_called()
+        urlopen.assert_not_called()
+
+    def test_image_growth_past_limit_is_rejected_after_bounded_reads(self) -> None:
+        limit = 8
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "frame.png"
+            image_path.write_bytes(b"x")
+            transport = self.make_transport()
+            with (
+                patch.object(
+                    vlm_module, "_IMAGE_BYTES_LIMIT", limit, create=True
+                ),
+                patch(
+                    "robometanorm.vlm.os.read",
+                    side_effect=[b"a" * limit, b"b", b""],
+                ) as read,
+                patch(
+                    "robometanorm.vlm.base64.b64encode",
+                    wraps=base64.b64encode,
+                ) as encode,
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", (image_path,)
+                )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
+        self.assertEqual(
+            issue.evidence,
+            {"file_name": "frame.png", "error_type": "ImageTooLarge"},
+        )
+        self.assertEqual(
+            [read_call.args[1] for read_call in read.call_args_list],
+            [limit + 1, 1],
+        )
+        encode.assert_not_called()
+        urlopen.assert_not_called()
+
+    def test_image_at_exact_limit_is_sent_after_bounded_eof_probe(self) -> None:
+        content = b"exact-boundary-image"
+        limit = len(content)
+        response = _chat_response('{"ok": true}')
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "frame.png"
+            image_path.write_bytes(content)
+            transport = self.make_transport()
+            with (
+                patch.object(
+                    vlm_module, "_IMAGE_BYTES_LIMIT", limit, create=True
+                ),
+                patch(
+                    "robometanorm.vlm.os.read", wraps=os.read
+                ) as read,
+                patch(
+                    "robometanorm.vlm.request.urlopen", return_value=response
+                ) as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", (image_path,)
+                )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+        self.assertEqual(
+            [read_call.args[1] for read_call in read.call_args_list],
+            [limit + 1, 1],
+        )
+        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        image_url = body["messages"][1]["content"][1]["image_url"]["url"]
+        self.assertEqual(
+            image_url,
+            "data:image/png;base64,"
+            + base64.b64encode(content).decode("ascii"),
+        )
+
+    def test_image_count_and_total_byte_boundaries_allow_small_image_list(
+        self,
+    ) -> None:
+        contents = (b"a", b"bc", b"def")
+        response = _chat_response('{"ok": true}')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = tuple(root / f"frame-{index}.png" for index in range(3))
+            for path, content in zip(paths, contents):
+                path.write_bytes(content)
+            transport = self.make_transport()
+            with (
+                patch.object(
+                    vlm_module, "_IMAGE_COUNT_LIMIT", len(paths), create=True
+                ),
+                patch.object(
+                    vlm_module,
+                    "_TOTAL_IMAGE_BYTES_LIMIT",
+                    sum(map(len, contents)),
+                    create=True,
+                ),
+                patch(
+                    "robometanorm.vlm.base64.b64encode",
+                    wraps=base64.b64encode,
+                ) as encode,
+                patch(
+                    "robometanorm.vlm.request.urlopen", return_value=response
+                ) as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", paths
+                )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+        self.assertEqual(encode.call_count, len(paths))
+        body = json.loads(urlopen.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(len(body["messages"][1]["content"]), len(paths) + 1)
+
+    def test_total_image_byte_overflow_stops_before_encoding_or_later_read(
+        self,
+    ) -> None:
+        contents = (b"a" * 4, b"b" * 5, b"c")
+        limit = 8
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = tuple(
+                root / f"private-frame-{index}.png" for index in range(3)
+            )
+            for path, content in zip(paths, contents):
+                path.write_bytes(content)
+            transport = self.make_transport()
+            with (
+                patch.object(
+                    vlm_module, "_IMAGE_COUNT_LIMIT", len(paths), create=True
+                ),
+                patch.object(
+                    vlm_module,
+                    "_TOTAL_IMAGE_BYTES_LIMIT",
+                    limit,
+                    create=True,
+                ),
+                patch(
+                    "robometanorm.vlm._read_image_bytes_safely",
+                    wraps=vlm_module._read_image_bytes_safely,
+                ) as read_image,
+                patch(
+                    "robometanorm.vlm.base64.b64encode",
+                    wraps=base64.b64encode,
+                ) as encode,
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", paths
+                )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
+        self.assertEqual(
+            issue.evidence,
+            {"error_type": "TotalImageBytesExceeded"},
+        )
+        self.assertEqual(
+            read_image.call_args_list,
+            [call(paths[0]), call(paths[1])],
+        )
+        encode.assert_not_called()
+        urlopen.assert_not_called()
+        for path in paths:
+            self.assertNotIn(path.name, repr(issue))
+
+    def test_image_count_overflow_is_rejected_before_any_file_access(self) -> None:
+        limit = 3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = tuple(
+                root / f"private-frame-{index}.png"
+                for index in range(limit + 1)
+            )
+            for path in paths:
+                path.write_bytes(b"x")
+            transport = self.make_transport()
+            with (
+                patch.object(
+                    vlm_module, "_IMAGE_COUNT_LIMIT", limit, create=True
+                ),
+                patch.object(
+                    vlm_module,
+                    "_TOTAL_IMAGE_BYTES_LIMIT",
+                    1024,
+                    create=True,
+                ),
+                patch(
+                    "robometanorm.vlm._read_image_bytes_safely",
+                    wraps=vlm_module._read_image_bytes_safely,
+                ) as read_image,
+                patch(
+                    "robometanorm.vlm.base64.b64encode",
+                    wraps=base64.b64encode,
+                ) as encode,
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "system", "user", paths
+                )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
+        self.assertEqual(
+            issue.evidence,
+            {"error_type": "ImageCountExceeded"},
+        )
+        read_image.assert_not_called()
+        encode.assert_not_called()
+        urlopen.assert_not_called()
+        for path in paths:
+            self.assertNotIn(path.name, repr(issue))
+
     def test_final_and_parent_symlinks_are_rejected_before_content_or_http(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -719,6 +1039,156 @@ class VlmTransportTest(unittest.TestCase):
                 self.assertIsNone(payload)
                 self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
                 self.assertEqual(urlopen.call_count, 1)
+
+    def test_success_response_over_limit_is_closed_and_not_parsed_or_retried(
+        self,
+    ) -> None:
+        raw = json.dumps(
+            {
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "padding": "x" * 32,
+            }
+        ).encode("utf-8")
+        limit = len(raw) - 1
+        response = _HttpResponse(raw=raw)
+        transport = self.make_transport(max_retries=3)
+        with (
+            patch.object(
+                vlm_module,
+                "_SUCCESS_RESPONSE_BYTES_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch(
+                "robometanorm.vlm._outer_response",
+                wraps=vlm_module._outer_response,
+            ) as outer_parser,
+            patch(
+                "robometanorm.vlm._chat_content",
+                wraps=vlm_module._chat_content,
+            ) as content_parser,
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ) as urlopen,
+        ):
+            payload, issue = transport.request_json("system", "user", ())
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
+        self.assertEqual(
+            issue.evidence,
+            {"stage": "response", "error_type": "_InvalidResponse"},
+        )
+        self.assertEqual(response.read_sizes, [limit + 1])
+        self.assertEqual(response.exit_calls, 1)
+        outer_parser.assert_not_called()
+        content_parser.assert_not_called()
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_success_response_short_reads_are_accumulated_until_eof(self) -> None:
+        raw = json.dumps(
+            {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        ).encode("utf-8")
+        first_end = 7
+        second_end = 19
+        chunks = (raw[:first_end], raw[first_end:second_end], raw[second_end:])
+        limit = len(raw) + 8
+        response = _SegmentedHttpResponse(chunks)
+        transport = self.make_transport(max_retries=3)
+        with (
+            patch.object(
+                vlm_module,
+                "_SUCCESS_RESPONSE_BYTES_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ) as urlopen,
+        ):
+            payload, issue = transport.request_json("system", "user", ())
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+        self.assertEqual(
+            response.read_sizes,
+            [
+                limit + 1,
+                limit + 1 - first_end,
+                limit + 1 - second_end,
+                limit + 1 - len(raw),
+            ],
+        )
+        self.assertEqual(response.exit_calls, 1)
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_valid_first_short_read_does_not_hide_trailing_overflow(self) -> None:
+        valid_raw = json.dumps(
+            {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        ).encode("utf-8")
+        limit = len(valid_raw)
+        response = _SegmentedHttpResponse((valid_raw, b"x"))
+        transport = self.make_transport(max_retries=3)
+        with (
+            patch.object(
+                vlm_module,
+                "_SUCCESS_RESPONSE_BYTES_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch(
+                "robometanorm.vlm._outer_response",
+                wraps=vlm_module._outer_response,
+            ) as outer_parser,
+            patch(
+                "robometanorm.vlm._chat_content",
+                wraps=vlm_module._chat_content,
+            ) as content_parser,
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ) as urlopen,
+        ):
+            payload, issue = transport.request_json("system", "user", ())
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
+        self.assertEqual(
+            issue.evidence,
+            {"stage": "response", "error_type": "_InvalidResponse"},
+        )
+        self.assertEqual(response.read_sizes, [limit + 1, 1])
+        self.assertEqual(response.exit_calls, 1)
+        outer_parser.assert_not_called()
+        content_parser.assert_not_called()
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_success_response_at_exact_limit_is_bounded_parsed_and_closed(
+        self,
+    ) -> None:
+        raw = json.dumps(
+            {"choices": [{"message": {"content": '{"ok": true}'}}]}
+        ).encode("utf-8")
+        limit = len(raw)
+        response = _HttpResponse(raw=raw)
+        transport = self.make_transport(max_retries=3)
+        with (
+            patch.object(
+                vlm_module,
+                "_SUCCESS_RESPONSE_BYTES_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ) as urlopen,
+        ):
+            payload, issue = transport.request_json("system", "user", ())
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+        self.assertEqual(response.read_sizes, [limit + 1, 1])
+        self.assertEqual(response.exit_calls, 1)
+        self.assertEqual(urlopen.call_count, 1)
 
     def test_chat_response_structure_is_strict_and_not_retried(self) -> None:
         malformed_payloads = (

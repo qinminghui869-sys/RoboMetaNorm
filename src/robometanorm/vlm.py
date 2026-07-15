@@ -56,10 +56,18 @@ _ISSUE_MESSAGES = {
 
 _BASE_URL_ERROR = "base_url must be a valid HTTP(S) base URL"
 _HTTP_ERROR_BODY_CLASSIFICATION_LIMIT = 16 * 1024
+_IMAGE_BYTES_LIMIT = 20 * 1024 * 1024
+_IMAGE_COUNT_LIMIT = 32
+_TOTAL_IMAGE_BYTES_LIMIT = 32 * 1024 * 1024
+_SUCCESS_RESPONSE_BYTES_LIMIT = 4 * 1024 * 1024
 
 
 class _InvalidResponse(ValueError):
     """Internal marker for a response that violates the transport contract."""
+
+
+class _ImageTooLarge(OSError):
+    """Internal marker for an image that exceeds the transport safety limit."""
 
 
 def _constant_credential(value: str) -> Callable[[], str]:
@@ -92,7 +100,9 @@ def _read_image_bytes_safely(image_path: Path) -> bytes:
         directory_flags = (
             os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
         )
-        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        file_flags = (
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
     except AttributeError as unsupported_error:
         raise OSError("secure image reads are unavailable") from unsupported_error
 
@@ -123,15 +133,25 @@ def _read_image_bytes_safely(image_path: Path) -> bytes:
             dir_fd=directory_descriptor,
         )
         descriptors.callback(_close_file_descriptor, file_descriptor)
-        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+        file_status = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
             raise OSError("image path is not a regular file")
+        if file_status.st_size > _IMAGE_BYTES_LIMIT:
+            raise _ImageTooLarge("image exceeds the transport safety limit")
 
         chunks: list[bytes] = []
+        remaining = _IMAGE_BYTES_LIMIT + 1
         while True:
-            chunk = os.read(file_descriptor, 1024 * 1024)
+            read_size = min(1024 * 1024, remaining)
+            chunk = os.read(file_descriptor, read_size)
             if not chunk:
                 return b"".join(chunks)
+            if len(chunk) > read_size:
+                raise _ImageTooLarge("image exceeds the transport safety limit")
             chunks.append(chunk)
+            remaining -= len(chunk)
+            if remaining == 0:
+                raise _ImageTooLarge("image exceeds the transport safety limit")
 
 
 def _credential_is_usable(value: str) -> bool:
@@ -451,10 +471,14 @@ class OpenAICompatibleTransport:
             return None, _issue(
                 "VLM_CONFIG_MISSING", {"api_key_env": self.api_key_env}
             )
+        if len(image_paths) > _IMAGE_COUNT_LIMIT:
+            return None, self._image_budget_issue("ImageCountExceeded")
 
         user_content: list[dict[str, object]] = [
             {"type": "text", "text": user_prompt}
         ]
+        image_inputs: list[tuple[str, bytes]] = []
+        total_image_bytes = 0
         for image_path in image_paths:
             mime_type = _IMAGE_MIME_TYPES.get(image_path.suffix.lower())
             if mime_type is None:
@@ -462,11 +486,22 @@ class OpenAICompatibleTransport:
             try:
                 image_bytes = _read_image_bytes_safely(image_path)
             except OSError as image_error:
-                return None, self._image_issue(
-                    image_path, type(image_error).__name__
+                error_type = (
+                    "ImageTooLarge"
+                    if isinstance(image_error, _ImageTooLarge)
+                    else type(image_error).__name__
                 )
+                return None, self._image_issue(image_path, error_type)
             if not image_bytes:
                 return None, self._image_issue(image_path, "EmptyImage")
+            total_image_bytes += len(image_bytes)
+            if total_image_bytes > _TOTAL_IMAGE_BYTES_LIMIT:
+                return None, self._image_budget_issue(
+                    "TotalImageBytesExceeded"
+                )
+            image_inputs.append((mime_type, image_bytes))
+
+        for mime_type, image_bytes in image_inputs:
             encoded = base64.b64encode(image_bytes).decode("ascii")
             user_content.append(
                 {
@@ -528,6 +563,10 @@ class OpenAICompatibleTransport:
             {"file_name": image_path.name, "error_type": error_type},
         )
 
+    @staticmethod
+    def _image_budget_issue(error_type: str) -> Issue:
+        return _issue("VLM_IMAGE_READ_FAILED", {"error_type": error_type})
+
     def _post_json(
         self,
         url: str,
@@ -561,7 +600,26 @@ class OpenAICompatibleTransport:
                 with request.urlopen(
                     http_request, timeout=self.timeout_seconds
                 ) as response:
-                    response_payload = _outer_response(response.read())
+                    response_bytes = bytearray()
+                    remaining = _SUCCESS_RESPONSE_BYTES_LIMIT + 1
+                    while True:
+                        raw_response = response.read(remaining)
+                        if not isinstance(raw_response, bytes):
+                            break
+                        if len(raw_response) > remaining:
+                            raise _InvalidResponse(
+                                "response exceeds the transport safety limit"
+                            )
+                        if not raw_response:
+                            raw_response = bytes(response_bytes)
+                            break
+                        response_bytes.extend(raw_response)
+                        remaining -= len(raw_response)
+                        if remaining == 0:
+                            raise _InvalidResponse(
+                                "response exceeds the transport safety limit"
+                            )
+                    response_payload = _outer_response(raw_response)
                 content = content_parser(response_payload)
                 return _strict_json_object(content), None
             except error.HTTPError as http_error:

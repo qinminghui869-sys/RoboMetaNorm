@@ -13,6 +13,8 @@ EXCLUDED_DIRECTORY_NAMES = {".git", ".cache", "__pycache__"}
 
 def discover_datasets(root: Path, layout: LayoutType = LayoutType.AUTO) -> list[DatasetCandidate]:
     """递归发现以 ``meta/info.json`` 标识的数据集。"""
+    # The explicit CLI root is the user's trust anchor. Resolve it before
+    # traversal; links discovered inside that root remain untrusted.
     root = root.resolve()
     if not root.is_dir():
         raise ValueError(f"输入根目录不存在或不是目录: {root}")

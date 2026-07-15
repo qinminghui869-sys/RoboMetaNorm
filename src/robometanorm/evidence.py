@@ -11,9 +11,12 @@ from fractions import Fraction
 import json
 import math
 from numbers import Number
+import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
+from typing import BinaryIO
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -38,15 +41,165 @@ _VIDEO_SUFFIXES = frozenset({".avi", ".mkv", ".mov", ".mp4", ".webm"})
 _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
 _MEDIA_SUFFIXES = _VIDEO_SUFFIXES | _IMAGE_SUFFIXES
 _MEDIA_TOOL_TIMEOUT_SECONDS = 120.0
+_STATIC_IMAGE_BYTE_LIMIT = 20 * 1024 * 1024
+# Large enough for feature-rich metadata and task manifests, while still
+# bounding every local JSON input before parsing or prompt construction.
+_LOCAL_JSON_BYTE_LIMIT = 8 * 1024 * 1024
+
+
+class _EvidenceFileTooLarge(ValueError):
+    """A local evidence file exceeded its explicit byte budget."""
+
+
+def _directory_open_flags() -> int:
+    try:
+        return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    except AttributeError as error:
+        raise OSError("secure evidence reads are unavailable") from error
+
+
+def _file_open_flags() -> int:
+    try:
+        return (
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+    except AttributeError as error:
+        raise OSError("secure evidence reads are unavailable") from error
+
+
+def _path_start_and_components(path: Path) -> tuple[str, tuple[str, ...]]:
+    path_parts = path.parts
+    if path.is_absolute():
+        start = os.sep
+        components = tuple(path_parts[1:])
+    else:
+        start = "."
+        components = tuple(path_parts)
+    if not components or any(part in {"", ".", ".."} for part in components):
+        raise OSError("unsafe evidence path")
+    return start, components
+
+
+@contextmanager
+def _open_path_fd(path: Path, *, directory: bool) -> Iterator[int]:
+    """Open every component with ``openat`` and validate the live object."""
+    start, components = _path_start_and_components(path)
+    descriptor = os.open(start, _directory_open_flags())
+    descriptors = [descriptor]
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("evidence path parent is not a directory")
+        for index, component in enumerate(components):
+            component_is_directory = directory or index < len(components) - 1
+            descriptor = os.open(
+                component,
+                (
+                    _directory_open_flags()
+                    if component_is_directory
+                    else _file_open_flags()
+                ),
+                dir_fd=descriptor,
+            )
+            descriptors.append(descriptor)
+            component_status = os.fstat(descriptor)
+            if component_is_directory and not stat.S_ISDIR(
+                component_status.st_mode
+            ):
+                raise OSError("evidence path parent is not a directory")
+            if not component_is_directory:
+                if stat.S_ISDIR(component_status.st_mode):
+                    raise IsADirectoryError("evidence path is a directory")
+                if not stat.S_ISREG(component_status.st_mode):
+                    raise OSError("evidence path is not a regular file")
+        yield descriptor
+    finally:
+        for open_descriptor in reversed(descriptors):
+            try:
+                os.close(open_descriptor)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _open_directory_fd(path: Path) -> Iterator[int]:
+    with _open_path_fd(path, directory=True) as descriptor:
+        yield descriptor
+
+
+@contextmanager
+def _open_regular_fd(path: Path) -> Iterator[int]:
+    with _open_path_fd(path, directory=False) as descriptor:
+        yield descriptor
+
+
+@contextmanager
+def _open_regular_binary(path: Path) -> Iterator[BinaryIO]:
+    with _open_regular_fd(path) as descriptor:
+        file_handle = os.fdopen(descriptor, "rb", closefd=False)
+        try:
+            yield file_handle
+        finally:
+            file_handle.close()
+
+
+def _read_bounded_regular(path: Path, byte_limit: int) -> bytes:
+    with _open_regular_fd(path) as descriptor:
+        if os.fstat(descriptor).st_size > byte_limit:
+            raise _EvidenceFileTooLarge("local evidence exceeds byte limit")
+        chunks: list[bytes] = []
+        remaining = byte_limit + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raise _EvidenceFileTooLarge("local evidence exceeds byte limit")
+
+
+def _reject_json_constant(value: str) -> object:
+    del value
+    raise ValueError("non-finite JSON number")
+
+
+def _strict_json_loads(raw_content: bytes) -> object:
+    value = json.loads(
+        raw_content.decode("utf-8"),
+        parse_constant=_reject_json_constant,
+    )
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("JSON contains unsafe text") from error
+        elif type(item) is float and not math.isfinite(item):
+            raise ValueError("JSON contains a non-finite number")
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return value
 
 
 def read_info(candidate: DatasetCandidate) -> dict[str, object]:
     """Read ``info.json`` and require a JSON object at its top level."""
-    with candidate.info_path.open("r", encoding="utf-8") as file_handle:
-        try:
-            source_info = json.load(file_handle)
-        except RecursionError as error:
-            raise ValueError("info.json could not be parsed") from error
+    try:
+        raw_content = _read_bounded_regular(
+            candidate.info_path, _LOCAL_JSON_BYTE_LIMIT
+        )
+    except (OSError, _EvidenceFileTooLarge) as error:
+        raise ValueError("info.json could not be read safely") from error
+    try:
+        source_info = _strict_json_loads(raw_content)
+    except (UnicodeError, ValueError, RecursionError) as error:
+        raise ValueError("info.json could not be parsed") from error
     if not isinstance(source_info, dict):
         raise ValueError("info.json must contain a JSON object")
     return source_info
@@ -59,8 +212,17 @@ def collect_camera_evidence(
 ) -> tuple[tuple[CameraEvidence, ...], tuple[Issue, ...]]:
     """Collect at most two exact-path media samples for each image feature."""
     schemas = _camera_feature_schemas(source_info)
-    discovered_media = _discover_media(candidate)
-    issues: list[Issue] = []
+    discovered_media, unsafe_roots = _discover_media(candidate)
+    issues: list[Issue] = [
+        Issue(
+            code="MEDIA_PATH_UNSAFE",
+            message="A media path could not be traversed without following links",
+            scope="camera",
+            evidence={"logical_root": logical_root},
+        )
+        for logical_root in unsafe_roots
+        if schemas
+    ]
     cameras: list[CameraEvidence] = []
     frame_sequence = 0
 
@@ -85,19 +247,36 @@ def collect_camera_evidence(
         samples: list[MediaSample] = []
         for media_path, relative_path, media_type in matching_media:
             if media_type == "image":
-                samples.append(
-                    MediaSample(
-                        relative_path=relative_path,
-                        media_type="image",
-                        codec=None,
-                        fps=None,
-                        width=None,
-                        height=None,
-                        duration_seconds=None,
-                        pixel_format=None,
-                        frame_path=media_path,
-                    )
+                output_path = temp_frames / (
+                    f"image-{frame_sequence:06d}{media_path.suffix.lower()}"
                 )
+                frame_sequence += 1
+                try:
+                    _copy_static_image(media_path, output_path)
+                    samples.append(
+                        MediaSample(
+                            relative_path=relative_path,
+                            media_type="image",
+                            codec=None,
+                            fps=None,
+                            width=None,
+                            height=None,
+                            duration_seconds=None,
+                            pixel_format=None,
+                            frame_path=output_path,
+                        )
+                    )
+                except (OSError, ValueError) as error:
+                    _discard_frame_output(output_path)
+                    issues.append(
+                        _media_issue(
+                            code="MEDIA_READ_FAILED",
+                            message="A static image could not be read safely",
+                            source_key=schema.source_key,
+                            relative_path=relative_path,
+                            error=error,
+                        )
+                    )
                 continue
 
             try:
@@ -151,27 +330,29 @@ def collect_camera_evidence(
 
 def probe_media(media_path: Path) -> MediaSample:
     """Probe one video with ffprobe without exposing tool diagnostics."""
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        (
-            "stream=codec_type,codec_name,r_frame_rate,width,height,duration,pix_fmt:"
-            "format=duration"
-        ),
-        "-of",
-        "json",
-        str(media_path),
-    ]
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_MEDIA_TOOL_TIMEOUT_SECONDS,
-        )
+        with _open_regular_fd(media_path) as media_descriptor:
+            command = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                (
+                    "stream=codec_type,codec_name,r_frame_rate,width,height,duration,pix_fmt:"
+                    "format=duration"
+                ),
+                "-of",
+                "json",
+                f"/proc/self/fd/{media_descriptor}",
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_MEDIA_TOOL_TIMEOUT_SECONDS,
+                pass_fds=(media_descriptor,),
+            )
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("ffprobe could not be executed") from error
     if completed.returncode != 0:
@@ -240,7 +421,7 @@ def extract_midpoint_frame(
 ) -> Path:
     """Extract one bounded JPEG at the temporal midpoint of a video."""
     try:
-        if media_path.resolve(strict=False) == output_path.resolve(strict=False):
+        if os.path.abspath(media_path) == os.path.abspath(output_path):
             raise ValueError("frame output must differ from source media")
     except OSError as error:
         raise ValueError("frame paths could not be validated") from error
@@ -257,29 +438,31 @@ def extract_midpoint_frame(
     except OSError as error:
         raise ValueError("frame output could not be prepared") from error
 
-    command = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-y",
-        "-ss",
-        str(duration * 0.5),
-        "-i",
-        str(media_path),
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=1280:1280:force_original_aspect_ratio=decrease",
-        str(output_path),
-    ]
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_MEDIA_TOOL_TIMEOUT_SECONDS,
-        )
+        with _open_regular_fd(media_path) as media_descriptor:
+            command = [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-ss",
+                str(duration * 0.5),
+                "-i",
+                f"/proc/self/fd/{media_descriptor}",
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=1280:1280:force_original_aspect_ratio=decrease",
+                str(output_path),
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_MEDIA_TOOL_TIMEOUT_SECONDS,
+                pass_fds=(media_descriptor,),
+            )
     except (OSError, subprocess.SubprocessError) as error:
         _discard_frame_output(output_path)
         raise ValueError("ffmpeg could not be executed") from error
@@ -348,28 +531,112 @@ def _camera_feature_schemas(
     return tuple(schemas)
 
 
+@dataclass(frozen=True)
+class _SecureWalkResult:
+    files: tuple[tuple[Path, Path], ...]
+    unsafe: bool
+
+
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _secure_walk_regular_files(
+    root: Path,
+    suffixes: frozenset[str],
+) -> _SecureWalkResult:
+    """Walk a directory by live descriptors and never enter a link."""
+    discovered: list[tuple[Path, Path]] = []
+    unsafe = False
+
+    def visit(descriptor: int, relative_directory: Path) -> None:
+        nonlocal unsafe
+        try:
+            names = sorted(os.listdir(descriptor))
+        except OSError:
+            unsafe = True
+            return
+        for name in names:
+            relative_path = relative_directory / name
+            try:
+                entry_status = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                unsafe = True
+                continue
+
+            if stat.S_ISLNK(entry_status.st_mode):
+                unsafe = True
+                continue
+            if stat.S_ISDIR(entry_status.st_mode):
+                child_descriptor: int | None = None
+                try:
+                    child_descriptor = os.open(
+                        name,
+                        _directory_open_flags(),
+                        dir_fd=descriptor,
+                    )
+                    opened_status = os.fstat(child_descriptor)
+                    if not stat.S_ISDIR(opened_status.st_mode) or not _same_file(
+                        entry_status, opened_status
+                    ):
+                        raise OSError("directory changed during evidence walk")
+                except OSError:
+                    unsafe = True
+                    if child_descriptor is not None:
+                        try:
+                            os.close(child_descriptor)
+                        except OSError:
+                            pass
+                    continue
+                assert child_descriptor is not None
+                try:
+                    visit(child_descriptor, relative_path)
+                finally:
+                    os.close(child_descriptor)
+                continue
+            if (
+                stat.S_ISREG(entry_status.st_mode)
+                and relative_path.suffix.lower() in suffixes
+            ):
+                discovered.append((root / relative_path, relative_path))
+
+    try:
+        with _open_directory_fd(root) as root_descriptor:
+            visit(root_descriptor, Path())
+    except (OSError, RecursionError):
+        unsafe = True
+        discovered.clear()
+
+    return _SecureWalkResult(
+        tuple(sorted(discovered, key=lambda item: item[1].as_posix())),
+        unsafe,
+    )
+
+
 def _discover_media(
     candidate: DatasetCandidate,
-) -> tuple[tuple[Path, str, str, frozenset[str]], ...]:
+) -> tuple[
+    tuple[tuple[Path, str, str, frozenset[str]], ...],
+    tuple[str, ...],
+]:
     roots = (
         (candidate.video_path, "videos"),
         (candidate.depth_path, "depth"),
     )
     discovered: dict[Path, tuple[str, str, set[str]]] = {}
+    unsafe_roots: list[str] = []
     for root, logical_name in roots:
-        if root is None or not root.is_dir():
+        if root is None:
             continue
-        paths = sorted(
-            (
-                path
-                for path in root.rglob("*")
-                if path.is_file()
-                and path.suffix.lower() in _MEDIA_SUFFIXES
-            ),
-            key=lambda path: path.relative_to(root).as_posix(),
-        )
-        for path in paths:
-            relative_to_root = path.relative_to(root)
+        walk = _secure_walk_regular_files(root, _MEDIA_SUFFIXES)
+        if walk.unsafe:
+            unsafe_roots.append(logical_name)
+            continue
+        for path, relative_to_root in walk.files:
             relative_path = _safe_media_relative_path(
                 candidate, path, relative_to_root, logical_name
             )
@@ -386,12 +653,56 @@ def _discover_media(
             else:
                 previous[2].update(relative_to_root.parent.parts)
 
-    return tuple(
-        (path, relative_path, media_type, frozenset(parent_parts))
-        for path, (relative_path, media_type, parent_parts) in sorted(
-            discovered.items(), key=lambda item: item[1][0]
-        )
+    return (
+        tuple(
+            (path, relative_path, media_type, frozenset(parent_parts))
+            for path, (relative_path, media_type, parent_parts) in sorted(
+                discovered.items(), key=lambda item: item[1][0]
+            )
+        ),
+        tuple(unsafe_roots),
     )
+
+
+def _copy_static_image(source_path: Path, output_path: Path) -> None:
+    output_descriptor: int | None = None
+    with _open_regular_fd(source_path) as source_descriptor:
+        if os.fstat(source_descriptor).st_size > _STATIC_IMAGE_BYTE_LIMIT:
+            raise _EvidenceFileTooLarge("static image exceeds byte limit")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        bytes_left = _STATIC_IMAGE_BYTE_LIMIT + 1
+        try:
+            with _open_directory_fd(output_path.parent) as output_directory:
+                output_descriptor = os.open(
+                    output_path.name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=output_directory,
+                )
+                while bytes_left > 0:
+                    read_size = min(64 * 1024, bytes_left)
+                    chunk = os.read(source_descriptor, read_size)
+                    if not chunk:
+                        return
+                    if len(chunk) > read_size:
+                        raise _EvidenceFileTooLarge(
+                            "static image exceeds byte limit"
+                        )
+                    bytes_left -= len(chunk)
+                    unwritten = memoryview(chunk)
+                    while unwritten:
+                        written = os.write(output_descriptor, unwritten)
+                        if written <= 0:
+                            raise OSError("static image copy made no progress")
+                        unwritten = unwritten[written:]
+                raise _EvidenceFileTooLarge("static image exceeds byte limit")
+        finally:
+            if output_descriptor is not None:
+                os.close(output_descriptor)
 
 
 def _safe_media_relative_path(
@@ -508,6 +819,18 @@ def collect_machine_evidence(
     feature_keys = tuple(schema.source_key for schema in schemas)
     issues: list[Issue] = []
     seen_issues: set[tuple[str, str, str]] = set()
+    parquet_selection = _representative_parquet_selection(candidate)
+    if parquet_selection.unsafe:
+        for feature in feature_keys:
+            _append_parquet_issue(
+                issues,
+                seen_issues,
+                code="PARQUET_PATH_UNSAFE",
+                message="A Parquet path could not be traversed without following links",
+                relative_path="data",
+                feature=feature,
+            )
+        return (), tuple(issues)
     episodes = tuple(
         _inspect_parquet_episode(
             candidate,
@@ -516,8 +839,10 @@ def collect_machine_evidence(
             issues,
             seen_issues,
         )
-        for parquet_path in _representative_parquet_paths(candidate)
+        for parquet_path in parquet_selection.paths
     )
+    if any(issue.code == "PARQUET_PATH_UNSAFE" for issue in issues):
+        return (), tuple(issues)
 
     machines: list[MachineEvidence] = []
     for schema in schemas:
@@ -662,8 +987,21 @@ def collect_mapped_gripper_ranges(
     }
     parquet_issues_seen: set[tuple[str, str, str]] = set()
     expected_widths: dict[str, int] = {}
+    parquet_selection = _representative_parquet_selection(candidate)
+    if parquet_selection.unsafe:
+        for feature in stats:
+            _append_parquet_issue(
+                issues,
+                parquet_issues_seen,
+                code="PARQUET_PATH_UNSAFE",
+                message="Mapped gripper source path could not be opened safely",
+                relative_path="data",
+                feature=feature,
+            )
+        return replace(evidence, machines=()), tuple(issues)
+
     for feature, feature_stats in stats.items():
-        for parquet_path in _representative_parquet_paths(candidate):
+        for parquet_path in parquet_selection.paths:
             _collect_mapped_feature_ranges(
                 candidate,
                 parquet_path,
@@ -673,6 +1011,9 @@ def collect_mapped_gripper_ranges(
                 issues,
                 parquet_issues_seen,
             )
+
+    if any(issue.code == "PARQUET_PATH_UNSAFE" for issue in issues):
+        return replace(evidence, machines=()), tuple(issues)
 
     machines = tuple(
         replace(
@@ -706,11 +1047,29 @@ def _collect_mapped_feature_ranges(
 ) -> None:
     relative_path = _relative_parquet_path(candidate, parquet_path)
     try:
-        parquet_file = pq.ParquetFile(parquet_path)
-        schema_columns = tuple(parquet_file.schema_arrow.names)
+        with _open_parquet_file(parquet_path) as parquet_file:
+            _collect_mapped_open_parquet(
+                parquet_file,
+                relative_path,
+                feature,
+                stats,
+                expected_widths,
+                issues,
+                seen_issues,
+            )
+    except OSError as error:
+        _mark_mapped_targets_unusable(stats)
+        _append_parquet_issue(
+            issues,
+            seen_issues,
+            code="PARQUET_PATH_UNSAFE",
+            message="Mapped gripper source path could not be opened safely",
+            relative_path=relative_path,
+            feature=feature,
+            error_type=type(error).__name__,
+        )
     except (
         ValueError,
-        OSError,
         pa.ArrowCapacityError,
         pa.ArrowNotImplementedError,
     ) as error:
@@ -724,7 +1083,25 @@ def _collect_mapped_feature_ranges(
             feature=feature,
             error_type=type(error).__name__,
         )
-        return
+
+
+@contextmanager
+def _open_parquet_file(path: Path) -> Iterator[object]:
+    """Keep the validated source descriptor alive for all PyArrow reads."""
+    with _open_regular_binary(path) as file_handle:
+        yield pq.ParquetFile(file_handle)
+
+
+def _collect_mapped_open_parquet(
+    parquet_file: object,
+    relative_path: str,
+    feature: str,
+    stats: dict[int, _MappedGripperStats],
+    expected_widths: dict[str, int],
+    issues: list[Issue],
+    seen_issues: set[tuple[str, str, str]],
+) -> None:
+    schema_columns = tuple(parquet_file.schema_arrow.names)
 
     column_count = schema_columns.count(feature)
     if column_count == 0:
@@ -916,23 +1293,25 @@ def _machine_feature_schemas(
     return tuple(schemas)
 
 
-def _representative_parquet_paths(
+@dataclass(frozen=True)
+class _ParquetSelection:
+    paths: tuple[Path, ...]
+    unsafe: bool
+
+
+def _representative_parquet_selection(
     candidate: DatasetCandidate,
-) -> tuple[Path, ...]:
+) -> _ParquetSelection:
     data_path = candidate.data_path
-    if data_path is None or not data_path.is_dir():
-        return ()
-    parquet_paths = sorted(
-        (
-            path
-            for path in data_path.rglob("*")
-            if path.is_file() and path.suffix == ".parquet"
-        ),
-        key=lambda path: path.relative_to(data_path).as_posix(),
-    )
+    if data_path is None:
+        return _ParquetSelection((), False)
+    walk = _secure_walk_regular_files(data_path, frozenset({".parquet"}))
+    parquet_paths = [path for path, _ in walk.files]
     if len(parquet_paths) <= 2:
-        return tuple(parquet_paths)
-    return parquet_paths[0], parquet_paths[-1]
+        selected = tuple(parquet_paths)
+    else:
+        selected = (parquet_paths[0], parquet_paths[-1])
+    return _ParquetSelection(selected, walk.unsafe)
 
 
 def _inspect_parquet_episode(
@@ -945,11 +1324,29 @@ def _inspect_parquet_episode(
     relative_path = _relative_parquet_path(candidate, parquet_path)
     vector_lengths: dict[str, int | None] = dict.fromkeys(feature_keys)
     try:
-        parquet_file = pq.ParquetFile(parquet_path)
-        schema_columns = tuple(parquet_file.schema_arrow.names)
+        with _open_parquet_file(parquet_path) as parquet_file:
+            return _inspect_open_parquet_episode(
+                parquet_file,
+                relative_path,
+                feature_keys,
+                vector_lengths,
+                issues,
+                seen_issues,
+            )
+    except OSError as error:
+        for feature in feature_keys:
+            _append_parquet_issue(
+                issues,
+                seen_issues,
+                code="PARQUET_PATH_UNSAFE",
+                message="Parquet source path could not be opened safely",
+                relative_path=relative_path,
+                feature=feature,
+                error_type=type(error).__name__,
+            )
+        return ParquetEpisodeEvidence(relative_path, (), vector_lengths)
     except (
         ValueError,
-        OSError,
         pa.ArrowCapacityError,
         pa.ArrowNotImplementedError,
     ) as error:
@@ -965,6 +1362,16 @@ def _inspect_parquet_episode(
             )
         return ParquetEpisodeEvidence(relative_path, (), vector_lengths)
 
+
+def _inspect_open_parquet_episode(
+    parquet_file: object,
+    relative_path: str,
+    feature_keys: tuple[str, ...],
+    vector_lengths: dict[str, int | None],
+    issues: list[Issue],
+    seen_issues: set[tuple[str, str, str]],
+) -> ParquetEpisodeEvidence:
+    schema_columns = tuple(parquet_file.schema_arrow.names)
     for feature in feature_keys:
         if feature not in schema_columns:
             _append_parquet_issue(
@@ -1090,9 +1497,23 @@ def _append_parquet_issue(
 
 def _read_common_record(path: Path) -> tuple[str, object | None, Issue | None]:
     try:
-        raw_content = path.read_bytes()
+        raw_content = _read_bounded_regular(path, _LOCAL_JSON_BYTE_LIMIT)
     except FileNotFoundError:
         return "missing", None, None
+    except _EvidenceFileTooLarge as error:
+        return (
+            "invalid",
+            None,
+            Issue(
+                code="COMMON_RECORD_INVALID",
+                message="common_record.json is not valid bounded UTF-8 JSON",
+                scope="identity.common_record",
+                evidence={
+                    "file_name": path.name,
+                    "error_type": type(error).__name__,
+                },
+            ),
+        )
     except OSError as error:
         return (
             "unreadable",
@@ -1109,8 +1530,8 @@ def _read_common_record(path: Path) -> tuple[str, object | None, Issue | None]:
         )
 
     try:
-        common_record = json.loads(raw_content.decode("utf-8"))
-    except (ValueError, RecursionError) as error:
+        common_record = _strict_json_loads(raw_content)
+    except (UnicodeError, ValueError, RecursionError) as error:
         return (
             "invalid",
             None,
@@ -1129,9 +1550,24 @@ def _read_common_record(path: Path) -> tuple[str, object | None, Issue | None]:
 
 def _read_tasks(path: Path) -> tuple[str, tuple[object, ...], Issue | None]:
     try:
-        raw_content = path.read_bytes()
+        raw_content = _read_bounded_regular(path, _LOCAL_JSON_BYTE_LIMIT)
     except FileNotFoundError:
         return "missing", (), None
+    except _EvidenceFileTooLarge as error:
+        return (
+            "invalid",
+            (),
+            Issue(
+                code="TASKS_INVALID",
+                message="tasks.jsonl exceeds the bounded UTF-8 JSON input limit",
+                scope="identity.tasks",
+                evidence={
+                    "file_name": path.name,
+                    "line_numbers": [],
+                    "error_types": [type(error).__name__],
+                },
+            ),
+        )
     except OSError as error:
         return (
             "unreadable",
@@ -1152,9 +1588,8 @@ def _read_tasks(path: Path) -> tuple[str, tuple[object, ...], Issue | None]:
     error_types: set[str] = set()
     for line_number, raw_line in enumerate(raw_content.splitlines(), start=1):
         try:
-            line = raw_line.decode("utf-8")
-            records.append(json.loads(line))
-        except (ValueError, RecursionError) as error:
+            records.append(_strict_json_loads(raw_line))
+        except (UnicodeError, ValueError, RecursionError) as error:
             invalid_line_numbers.append(line_number)
             error_types.add(type(error).__name__)
 

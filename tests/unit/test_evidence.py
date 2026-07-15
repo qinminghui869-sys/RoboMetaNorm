@@ -5,8 +5,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
+import gc
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,7 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
+import robometanorm.evidence as evidence_module
 from robometanorm.evidence import (
     collect_camera_evidence,
     collect_dataset_evidence,
@@ -1010,7 +1013,7 @@ class MappedGripperRangeTest(unittest.TestCase):
             ),
         )
         real_parquet_file = pq.ParquetFile(parquet_path)
-        constructor_calls: list[Path] = []
+        constructor_calls: list[object] = []
         batch_calls: list[tuple[list[str], int]] = []
 
         class TrackingParquetFile:
@@ -1024,8 +1027,10 @@ class MappedGripperRangeTest(unittest.TestCase):
                     columns=columns, batch_size=batch_size
                 )
 
-        def open_tracking(path: Path) -> TrackingParquetFile:
-            constructor_calls.append(path)
+        def open_tracking(file_handle: object) -> TrackingParquetFile:
+            self.assertFalse(file_handle.closed)
+            self.assertIsInstance(file_handle.fileno(), int)
+            constructor_calls.append(file_handle)
             return TrackingParquetFile()
 
         with patch(
@@ -1036,7 +1041,7 @@ class MappedGripperRangeTest(unittest.TestCase):
             )
 
         self.assertEqual(issues, ())
-        self.assertEqual(constructor_calls, [parquet_path])
+        self.assertEqual(len(constructor_calls), 1)
         self.assertEqual(batch_calls, [(["action"], 512)])
         self.assertEqual(
             collected.machines[0].gripper_ranges,
@@ -1045,6 +1050,67 @@ class MappedGripperRangeTest(unittest.TestCase):
                 self._range(2, 0.1, 0.9, 2, 0),
             ),
         )
+
+    def test_multiple_mapped_features_select_representative_paths_once(self) -> None:
+        self._write_parquet(
+            "episode.parquet",
+            {
+                "action": [[0.1], [0.9]],
+                "observation.state": [[2.0], [4.0]],
+            },
+        )
+        evidence, profile, mapping = self._two_feature_range_inputs()
+
+        with patch(
+            "robometanorm.evidence._representative_parquet_selection",
+            wraps=evidence_module._representative_parquet_selection,
+        ) as selection:
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        selection.assert_called_once_with(self.candidate)
+        self.assertEqual(issues, ())
+        self.assertEqual(
+            collected.machines[0].gripper_ranges,
+            (self._range(0, 0.1, 0.9, 2, 0),),
+        )
+        self.assertEqual(
+            collected.machines[1].gripper_ranges,
+            (self._range(0, 2.0, 4.0, 2, 0),),
+        )
+
+    def test_unsafe_range_selection_reviews_each_feature_without_pyarrow(self) -> None:
+        evidence, profile, mapping = self._two_feature_range_inputs()
+        held_data = self.dataset_path / "held-data"
+        outside_data = self.dataset_path / "outside-data"
+        outside_data.mkdir()
+        (outside_data / "sentinel.parquet").write_bytes(
+            b"OUTSIDE-RANGE-SELECTION-SENTINEL"
+        )
+        self.data_path.rename(held_data)
+        self.data_path.symlink_to(outside_data, target_is_directory=True)
+
+        with patch(
+            "robometanorm.evidence.pq.ParquetFile",
+            side_effect=AssertionError("unsafe selection reached PyArrow"),
+        ) as parquet_file:
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        parquet_file.assert_not_called()
+        self.assertEqual(collected.machines, ())
+        self.assertEqual(len(evidence.machines), 2)
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["PARQUET_PATH_UNSAFE", "PARQUET_PATH_UNSAFE"],
+        )
+        self.assertEqual(
+            [issue.evidence["feature"] for issue in issues],
+            ["action", "observation.state"],
+        )
+        self.assertNotIn("OUTSIDE-RANGE-SELECTION-SENTINEL", repr(issues))
 
     def test_non_gripper_unknown_and_absent_mappings_do_not_open_parquet(self) -> None:
         self._write_parquet("episode.parquet", {"action": [[1.0]]})
@@ -1412,6 +1478,42 @@ class MappedGripperRangeTest(unittest.TestCase):
             }
         }
 
+    def _two_feature_range_inputs(
+        self,
+    ) -> tuple[DatasetEvidence, HardwareProfile, DatasetMapping]:
+        source_info = {
+            "features": {
+                "action": {"dtype": "float64", "shape": [1], "names": ["a"]},
+                "observation.state": {
+                    "dtype": "float64",
+                    "shape": [1],
+                    "names": ["s"],
+                },
+            }
+        }
+        action = self._direct_evidence(source_info, "action")
+        state = self._direct_evidence(source_info, "observation.state")
+        evidence = replace(
+            action,
+            machines=(action.machines[0], state.machines[0]),
+        )
+        profile = self._profile(
+            self._component("action-grip", "gripper_open"),
+            self._component("state-grip", "gripper_open"),
+        )
+        mapping = DatasetMapping(
+            cameras=(),
+            machines=(
+                self._assignment(
+                    "action", self._slice(0, "action-grip")
+                ),
+                self._assignment(
+                    "observation.state", self._slice(0, "state-grip")
+                ),
+            ),
+        )
+        return evidence, profile, mapping
+
     def _structural_evidence(
         self, source_info: dict[str, object]
     ) -> DatasetEvidence:
@@ -1582,6 +1684,7 @@ class CameraEvidenceTest(unittest.TestCase):
             directory.mkdir(parents=True)
         self.info_path = self.meta_path / "info.json"
         self.info_path.write_text("{}", encoding="utf-8")
+        (self.video_path / "fictional.mp4").write_bytes(b"media-fixture")
         self.source_key = "observation.images.source_camera"
         self.candidate = DatasetCandidate(
             dataset_name=self.dataset_path.name,
@@ -1842,7 +1945,7 @@ class CameraEvidenceTest(unittest.TestCase):
         self.assertNotIn(str(external_root), cameras[0].samples[0].relative_path)
         self.assertEqual(issues, ())
 
-    def test_static_image_is_used_directly_without_media_tools(self) -> None:
+    def test_static_image_is_copied_safely_without_media_tools(self) -> None:
         image_path = self._write_media(
             self.depth_path,
             f"chunk-000/{self.source_key}/episode_000000.JPG",
@@ -1860,7 +1963,9 @@ class CameraEvidenceTest(unittest.TestCase):
 
         sample = cameras[0].samples[0]
         self.assertEqual(sample.media_type, "image")
-        self.assertEqual(sample.frame_path, image_path)
+        self.assertNotEqual(sample.frame_path, image_path)
+        self.assertEqual(sample.frame_path.parent, self.temp_frames)
+        self.assertEqual(sample.frame_path.read_bytes(), image_path.read_bytes())
         self.assertEqual(sample.relative_path, "depth/chunk-000/" + self.source_key + "/episode_000000.JPG")
         self.assertIsNone(sample.codec)
         self.assertIsNone(sample.duration_seconds)
@@ -1868,6 +1973,122 @@ class CameraEvidenceTest(unittest.TestCase):
         self.assertEqual(issues, ())
         probe.assert_not_called()
         extract.assert_not_called()
+
+    def test_static_image_exact_limit_uses_bounded_eof_probe(self) -> None:
+        limit = 64
+        image_path = self._write_media(
+            self.depth_path,
+            f"chunk-000/{self.source_key}/episode_000000.png",
+            payload=b"x" * limit,
+        )
+        real_read = os.read
+        read_sizes: list[int] = []
+
+        def tracking_read(descriptor: int, size: int) -> bytes:
+            read_sizes.append(size)
+            return real_read(descriptor, size)
+
+        with (
+            patch.object(
+                evidence_module,
+                "_STATIC_IMAGE_BYTE_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch("robometanorm.evidence.os.read", side_effect=tracking_read),
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(issues, ())
+        self.assertEqual(read_sizes, [limit + 1, 1])
+        frame_path = cameras[0].samples[0].frame_path
+        self.assertIsNotNone(frame_path)
+        assert frame_path is not None
+        self.assertEqual(frame_path.read_bytes(), image_path.read_bytes())
+
+    def test_declared_oversize_static_image_is_not_created_or_read(self) -> None:
+        limit = 64
+        self._write_media(
+            self.depth_path,
+            f"chunk-000/{self.source_key}/episode_000000.png",
+            payload=b"x" * (limit + 1),
+        )
+        real_read = os.read
+
+        with (
+            patch.object(
+                evidence_module,
+                "_STATIC_IMAGE_BYTE_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch(
+                "robometanorm.evidence.os.read",
+                wraps=real_read,
+            ) as read,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        read.assert_not_called()
+        self.assertFalse(self.temp_frames.exists())
+        self.assertEqual(cameras[0].samples, ())
+        self.assertEqual([issue.code for issue in issues], ["MEDIA_READ_FAILED"])
+
+    def test_growing_static_image_is_removed_and_never_exposes_frame_path(self) -> None:
+        limit = 64
+        self._write_media(
+            self.depth_path,
+            f"chunk-000/{self.source_key}/episode_000000.png",
+            payload=b"x" * limit,
+        )
+        chunks = iter((b"x" * limit, b"y", b""))
+
+        with (
+            patch.object(
+                evidence_module,
+                "_STATIC_IMAGE_BYTE_LIMIT",
+                limit,
+                create=True,
+            ),
+            patch(
+                "robometanorm.evidence.os.read",
+                side_effect=lambda descriptor, size: next(chunks),
+            ),
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(cameras[0].samples, ())
+        self.assertEqual([issue.code for issue in issues], ["MEDIA_READ_FAILED"])
+        self.assertEqual(list(self.temp_frames.glob("*")), [])
+        self.assertEqual(
+            tuple(
+                sample.frame_path
+                for camera in cameras
+                for sample in camera.samples
+            ),
+            (),
+        )
+
+    def test_static_image_read_memory_error_propagates(self) -> None:
+        self._write_media(
+            self.depth_path,
+            f"chunk-000/{self.source_key}/episode_000000.png",
+        )
+
+        with patch(
+            "robometanorm.evidence.os.read",
+            side_effect=MemoryError("out of memory"),
+        ):
+            with self.assertRaises(MemoryError):
+                collect_camera_evidence(
+                    self.candidate, self._camera_info(), self.temp_frames
+                )
 
     def test_missing_exact_media_is_review_without_alias_guess(self) -> None:
         self._write_media(
@@ -2077,6 +2298,9 @@ class CameraEvidenceTest(unittest.TestCase):
         tool_calls: list[str] = []
 
         def run(command: list[str], **kwargs: object) -> object:
+            pass_fds = kwargs.pop("pass_fds")
+            self.assertEqual(len(pass_fds), 1)
+            self.assertIn(f"/proc/self/fd/{pass_fds[0]}", command)
             self.assertEqual(
                 kwargs,
                 {
@@ -2207,7 +2431,9 @@ class CameraEvidenceTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIs(type(command), list)
         self.assertEqual(command[0], "ffprobe")
-        self.assertEqual(command[-1], str(self.video_path / "fictional.mp4"))
+        pass_fds = run.call_args.kwargs["pass_fds"]
+        self.assertEqual(len(pass_fds), 1)
+        self.assertEqual(command[-1], f"/proc/self/fd/{pass_fds[0]}")
         self.assertEqual(
             run.call_args.kwargs,
             {
@@ -2215,6 +2441,7 @@ class CameraEvidenceTest(unittest.TestCase):
                 "text": True,
                 "check": False,
                 "timeout": 120.0,
+                "pass_fds": pass_fds,
             },
         )
 
@@ -2396,6 +2623,12 @@ class CameraEvidenceTest(unittest.TestCase):
             "scale=1280:1280:force_original_aspect_ratio=decrease",
         )
         self.assertEqual(command[-1], str(output_path))
+        pass_fds = mocked_run.call_args.kwargs["pass_fds"]
+        self.assertEqual(len(pass_fds), 1)
+        self.assertEqual(
+            command[command.index("-i") + 1],
+            f"/proc/self/fd/{pass_fds[0]}",
+        )
         self.assertEqual(
             mocked_run.call_args.kwargs,
             {
@@ -2403,25 +2636,30 @@ class CameraEvidenceTest(unittest.TestCase):
                 "text": True,
                 "check": False,
                 "timeout": 120.0,
+                "pass_fds": pass_fds,
             },
         )
 
-    def test_extract_midpoint_frame_propagates_unexpected_resolve_error(self) -> None:
+    def test_extract_midpoint_frame_never_resolves_source_links(self) -> None:
         with (
             patch(
                 "pathlib.Path.resolve",
                 side_effect=RuntimeError("unexpected resolve failure"),
-            ),
-            patch("robometanorm.evidence.probe_media") as probe,
-            patch("robometanorm.evidence.subprocess.run") as run,
+            ) as resolve,
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+            ) as run,
         ):
-            with self.assertRaisesRegex(RuntimeError, "unexpected resolve failure"):
+            with self.assertRaises(ValueError):
                 extract_midpoint_frame(
-                    self.video_path / "fictional.mp4", self.root / "frame.jpg"
+                    self.video_path / "fictional.mp4",
+                    self.root / "frame.jpg",
+                    duration_seconds=1.0,
                 )
 
-        probe.assert_not_called()
-        run.assert_not_called()
+        resolve.assert_not_called()
+        run.assert_called_once()
 
     def test_extract_midpoint_frame_rejects_unusable_duration(self) -> None:
         for duration in (None, 0.0, -1.0, float("nan"), float("inf")):
@@ -2693,9 +2931,14 @@ class CameraEvidenceTest(unittest.TestCase):
         with collect_dataset_evidence(
             self.candidate, self._camera_info()
         ) as evidence:
-            self.assertEqual(evidence.cameras[0].samples[0].frame_path, image_path)
+            frame_path = evidence.cameras[0].samples[0].frame_path
+            self.assertNotEqual(frame_path, image_path)
+            self.assertIsNotNone(frame_path)
+            assert frame_path is not None
+            self.assertEqual(frame_path.read_bytes(), image_path.read_bytes())
             self.assertTrue(image_path.is_file())
 
+        self.assertFalse(frame_path.exists())
         self.assertTrue(image_path.is_file())
         self.assertEqual(self._sha256(image_path), before_hash)
 
@@ -2912,6 +3155,338 @@ class CameraEvidenceTest(unittest.TestCase):
     @staticmethod
     def _sha256(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class SecureEvidenceBoundaryTest(unittest.TestCase):
+    """Reject links and non-portable JSON before their contents reach consumers."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.dataset = self.root / "dataset"
+        self.meta = self.dataset / "meta"
+        self.meta.mkdir(parents=True)
+        self.info = self.meta / "info.json"
+        self.info.write_text("{}", encoding="utf-8")
+
+    def _candidate(
+        self,
+        *,
+        source_path: Path | None = None,
+        info_path: Path | None = None,
+        data_path: Path | None = None,
+        video_path: Path | None = None,
+        depth_path: Path | None = None,
+    ) -> DatasetCandidate:
+        source = source_path or self.dataset
+        return DatasetCandidate(
+            dataset_name=source.name,
+            task_name=None,
+            source_path=source,
+            layout_type=LayoutType.FLAT,
+            info_path=info_path or source / "meta" / "info.json",
+            data_path=data_path,
+            video_path=video_path,
+            depth_path=depth_path,
+        )
+
+    def test_info_rejects_nonfinite_constants_and_isolated_surrogates(self) -> None:
+        candidate = self._candidate()
+        payloads = (
+            b'{"robot_type": NaN}',
+            b'{"robot_type": Infinity}',
+            b'{"robot_type": -Infinity}',
+            b'{"robot_type": "\\ud800"}',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.info.write_bytes(payload)
+                with self.assertRaises(ValueError):
+                    read_info(candidate)
+
+    def test_optional_identity_rejects_constants_and_surrogates_per_record(self) -> None:
+        (self.meta / "common_record.json").write_bytes(b'{"value": NaN}')
+        (self.meta / "tasks.jsonl").write_bytes(
+            b'{"task":"first"}\n'
+            b'{"value":-Infinity}\n'
+            b'{"task":"\\udfff"}\n'
+            b'{"task":"last"}\n'
+        )
+
+        identity = collect_identity_evidence(self.meta, {})
+
+        self.assertEqual(identity.common_record_state, "invalid")
+        self.assertIsNone(identity.common_record)
+        self.assertEqual(identity.tasks_state, "invalid")
+        self.assertEqual(
+            identity.tasks,
+            ({"task": "first"}, {"task": "last"}),
+        )
+        self.assertEqual(
+            [issue.code for issue in identity.issues],
+            ["COMMON_RECORD_INVALID", "TASKS_INVALID"],
+        )
+
+    def test_local_json_limit_accepts_exact_boundary_and_rejects_one_more(self) -> None:
+        limit = 128
+        exact = b'{"x":"' + b"a" * (limit - len(b'{"x":""}')) + b'"}'
+        self.assertEqual(len(exact), limit)
+        candidate = self._candidate()
+
+        with patch.object(
+            evidence_module, "_LOCAL_JSON_BYTE_LIMIT", limit, create=True
+        ):
+            self.info.write_bytes(exact)
+            self.assertEqual(read_info(candidate), {"x": "a" * (limit - 8)})
+            self.info.write_bytes(exact + b" ")
+            with self.assertRaises(ValueError):
+                read_info(candidate)
+
+            (self.meta / "common_record.json").write_bytes(exact)
+            (self.meta / "tasks.jsonl").write_bytes(exact)
+            identity = collect_identity_evidence(self.meta, {})
+            self.assertEqual(identity.common_record_state, "present")
+            self.assertEqual(identity.tasks_state, "present")
+
+            (self.meta / "common_record.json").write_bytes(exact + b" ")
+            (self.meta / "tasks.jsonl").write_bytes(exact + b" ")
+            identity = collect_identity_evidence(self.meta, {})
+            self.assertEqual(identity.common_record_state, "invalid")
+            self.assertEqual(identity.tasks_state, "invalid")
+            self.assertEqual(identity.tasks, ())
+
+    def test_oversized_local_json_is_not_read_or_parsed(self) -> None:
+        limit = 128
+        oversized = b"x" * (limit + 1)
+        self.info.write_bytes(oversized)
+        (self.meta / "common_record.json").write_bytes(oversized)
+        (self.meta / "tasks.jsonl").write_bytes(oversized)
+
+        with (
+            patch.object(evidence_module, "_LOCAL_JSON_BYTE_LIMIT", limit),
+            patch(
+                "robometanorm.evidence.os.read",
+                side_effect=AssertionError("oversized JSON must not be read"),
+            ) as read,
+            patch(
+                "robometanorm.evidence._strict_json_loads",
+                side_effect=AssertionError("oversized JSON must not be parsed"),
+            ) as loads,
+        ):
+            with self.assertRaises(ValueError):
+                read_info(self._candidate())
+            identity = collect_identity_evidence(self.meta, {})
+
+        read.assert_not_called()
+        loads.assert_not_called()
+        self.assertEqual(identity.common_record_state, "invalid")
+        self.assertEqual(identity.tasks_state, "invalid")
+
+    def test_identity_final_symlinks_never_read_outside_content(self) -> None:
+        sentinel = "OUTSIDE-IDENTITY-SENTINEL"
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside_info = outside / "info.json"
+        outside_common = outside / "common_record.json"
+        outside_tasks = outside / "tasks.jsonl"
+        outside_info.write_text(json.dumps({"robot_type": sentinel}))
+        outside_common.write_text(json.dumps({"secret": sentinel}))
+        outside_tasks.write_text(json.dumps({"task": sentinel}) + "\n")
+
+        self.info.unlink()
+        self.info.symlink_to(outside_info)
+        (self.meta / "common_record.json").symlink_to(outside_common)
+        (self.meta / "tasks.jsonl").symlink_to(outside_tasks)
+
+        with self.assertRaises(ValueError) as caught:
+            read_info(self._candidate())
+        identity = collect_identity_evidence(self.meta, {})
+
+        self.assertNotIn(sentinel, str(caught.exception))
+        self.assertEqual(identity.common_record_state, "unreadable")
+        self.assertEqual(identity.tasks_state, "unreadable")
+        self.assertNotIn(sentinel, repr(identity))
+
+    def test_info_rejects_dataset_root_and_meta_parent_symlinks(self) -> None:
+        real = self.root / "real"
+        real_meta = real / "meta"
+        real_meta.mkdir(parents=True)
+        (real_meta / "info.json").write_text('{"robot_type":"outside"}')
+
+        root_link = self.root / "root-link"
+        root_link.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            read_info(self._candidate(source_path=root_link))
+
+        dataset = self.root / "meta-link-dataset"
+        dataset.mkdir()
+        (dataset / "meta").symlink_to(real_meta, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            read_info(self._candidate(source_path=dataset))
+
+    def test_data_root_and_selected_parquet_symlinks_never_reach_pyarrow(self) -> None:
+        outside = self.root / "outside-data"
+        outside.mkdir()
+        outside_parquet = outside / "episode.parquet"
+        pq.write_table(pa.table({"action": [[1.0]]}), outside_parquet)
+        source_info = {"features": {"action": {"shape": [1]}}}
+
+        cases: list[tuple[str, Path]] = []
+        linked_root = self.dataset / "linked-data"
+        linked_root.symlink_to(outside, target_is_directory=True)
+        cases.append(("root", linked_root))
+
+        regular_root = self.dataset / "regular-data"
+        regular_root.mkdir()
+        (regular_root / "episode.parquet").symlink_to(outside_parquet)
+        cases.append(("file", regular_root))
+
+        for label, data_path in cases:
+            with self.subTest(label=label), patch(
+                "robometanorm.evidence.pq.ParquetFile",
+                side_effect=AssertionError("unsafe parquet reached pyarrow"),
+            ) as parquet_file:
+                machines, issues = collect_machine_evidence(
+                    self._candidate(data_path=data_path), source_info
+                )
+                parquet_file.assert_not_called()
+                self.assertEqual(machines, ())
+                self.assertIn("PARQUET_PATH_UNSAFE", {item.code for item in issues})
+
+    def test_parquet_parent_or_file_swap_is_rejected_and_closes_descriptors(self) -> None:
+        outside = self.root / "race-outside"
+        outside.mkdir()
+        outside_file = outside / "episode.parquet"
+        outside_file.write_bytes(b"OUTSIDE-RACE-SENTINEL")
+        source_info = {"features": {"action": {"shape": [1]}}}
+        real_open = os.open
+
+        for label in ("parent", "file"):
+            with self.subTest(label=label):
+                data_path = self.dataset / f"race-{label}"
+                selected_parent = data_path / "selected"
+                selected_parent.mkdir(parents=True)
+                selected_file = selected_parent / "episode.parquet"
+                pq.write_table(pa.table({"action": [[1.0]]}), selected_file)
+                held = data_path / f"held-{label}"
+                swapped = False
+
+                def racing_open(
+                    path: object,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal swapped
+                    if not swapped and (
+                        (label == "parent" and path == "selected" and flags & os.O_DIRECTORY)
+                        or (
+                            label == "file"
+                            and path == "episode.parquet"
+                            and not flags & os.O_DIRECTORY
+                        )
+                    ):
+                        swapped = True
+                        if label == "parent":
+                            selected_parent.rename(held)
+                            selected_parent.symlink_to(outside, target_is_directory=True)
+                        else:
+                            selected_file.rename(held)
+                            selected_file.symlink_to(outside_file)
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+
+                gc.collect()
+                descriptor_count = len(os.listdir("/proc/self/fd"))
+                with (
+                    patch("robometanorm.evidence.os.open", side_effect=racing_open),
+                    patch(
+                        "robometanorm.evidence.pq.ParquetFile",
+                        side_effect=AssertionError("raced path reached PyArrow"),
+                    ) as parquet_file,
+                ):
+                    machines, issues = collect_machine_evidence(
+                        self._candidate(data_path=data_path), source_info
+                    )
+
+                self.assertTrue(swapped)
+                parquet_file.assert_not_called()
+                self.assertEqual(machines, ())
+                self.assertIn("PARQUET_PATH_UNSAFE", {item.code for item in issues})
+                self.assertEqual(len(os.listdir("/proc/self/fd")), descriptor_count)
+                self.assertNotIn("OUTSIDE-RACE-SENTINEL", repr(issues))
+
+    def test_video_root_and_selected_video_symlinks_never_reach_media_tools(self) -> None:
+        sentinel = "OUTSIDE-MEDIA-SENTINEL"
+        source_key = "observation.images.camera"
+        outside = self.root / "outside-videos"
+        outside_media = outside / source_key / "episode.mp4"
+        outside_media.parent.mkdir(parents=True)
+        outside_media.write_bytes(sentinel.encode())
+        source_info = {"features": {source_key: {"dtype": "video"}}}
+
+        linked_root = self.dataset / "linked-videos"
+        linked_root.symlink_to(outside, target_is_directory=True)
+        regular_root = self.dataset / "regular-videos"
+        selected = regular_root / source_key / "episode.mp4"
+        selected.parent.mkdir(parents=True)
+        selected.symlink_to(outside_media)
+
+        for label, video_path in (("root", linked_root), ("file", regular_root)):
+            with (
+                self.subTest(label=label),
+                patch(
+                    "robometanorm.evidence.probe_media",
+                    side_effect=AssertionError("unsafe media reached ffprobe"),
+                ) as probe,
+                patch(
+                    "robometanorm.evidence.extract_midpoint_frame",
+                    side_effect=AssertionError("unsafe media reached ffmpeg"),
+                ) as extract,
+            ):
+                cameras, issues = collect_camera_evidence(
+                    self._candidate(video_path=video_path),
+                    source_info,
+                    self.root / "frames",
+                )
+                probe.assert_not_called()
+                extract.assert_not_called()
+                self.assertEqual(cameras[0].samples, ())
+                self.assertIn("MEDIA_PATH_UNSAFE", {item.code for item in issues})
+                self.assertNotIn(sentinel, repr((cameras, issues)))
+
+    def test_depth_root_and_selected_image_symlinks_never_reach_frame_inputs(self) -> None:
+        sentinel = b"OUTSIDE-DEPTH-SENTINEL"
+        source_key = "observation.images.depth_camera"
+        outside = self.root / "outside-depth"
+        outside_image = outside / source_key / "episode.png"
+        outside_image.parent.mkdir(parents=True)
+        outside_image.write_bytes(sentinel)
+        source_info = {"features": {source_key: {"dtype": "image"}}}
+
+        linked_root = self.dataset / "linked-depth"
+        linked_root.symlink_to(outside, target_is_directory=True)
+        regular_root = self.dataset / "regular-depth"
+        selected = regular_root / source_key / "episode.png"
+        selected.parent.mkdir(parents=True)
+        selected.symlink_to(outside_image)
+
+        for label, depth_path in (("root", linked_root), ("file", regular_root)):
+            with self.subTest(label=label), patch(
+                "robometanorm.evidence._copy_static_image",
+                side_effect=AssertionError("unsafe depth reached frame input"),
+            ) as copy_image:
+                cameras, issues = collect_camera_evidence(
+                    self._candidate(depth_path=depth_path),
+                    source_info,
+                    self.root / "frames",
+                )
+
+            copy_image.assert_not_called()
+            self.assertEqual(cameras[0].samples, ())
+            self.assertIn("MEDIA_PATH_UNSAFE", {item.code for item in issues})
+            self.assertNotIn(sentinel.decode(), repr((cameras, issues)))
 
 
 if __name__ == "__main__":

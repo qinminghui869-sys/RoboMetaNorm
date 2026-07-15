@@ -363,6 +363,211 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertFalse((meta / "info_norm.json").exists())
         self.assertFalse((meta / "info_norm_review.json").exists())
 
+    def test_linked_info_is_error_with_zero_outputs_and_no_vlm_content_leak(self) -> None:
+        sentinel = "OUTSIDE-INFO-SENTINEL"
+        outside_info = self.root / "outside-info.json"
+        outside_info.write_text(
+            json.dumps({"robot_type": sentinel, "features": {}}),
+            encoding="utf-8",
+        )
+        self.fixture.candidate.info_path.unlink()
+        self.fixture.candidate.info_path.symlink_to(outside_info)
+        vlm = self._success_vlm()
+
+        result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.ERROR)
+        self.assertIsNone(result.source_info)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertNotIn(sentinel, repr(result))
+        meta = self.fixture.candidate.info_path.parent
+        self.assertFalse((meta / "info_norm.json").exists())
+        self.assertFalse((meta / "info_norm_review.json").exists())
+
+    def test_explicit_linked_root_is_resolved_as_the_user_trust_anchor(self) -> None:
+        linked_root = self.root.parent / f"{self.root.name}-linked"
+        linked_root.symlink_to(self.root, target_is_directory=True)
+        self.addCleanup(linked_root.unlink, missing_ok=True)
+        vlm = self._success_vlm()
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            result = normalize_datasets(
+                linked_root,
+                vlm=vlm,
+                confidence_threshold=0.85,
+            )[0]
+
+        self.assertEqual(result.status, DatasetStatus.PASS)
+        self.assertEqual(result.candidate.source_path, self.fixture.candidate.source_path)
+        self.assertIsNotNone(result.source_info)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 1))
+        meta = self.fixture.candidate.info_path.parent
+        self.assertTrue((meta / "info_norm.json").is_file())
+        self.assertTrue((meta / "info_norm_review.json").is_file())
+
+    def test_linked_optional_identity_is_review_with_two_safe_outputs(self) -> None:
+        sentinel = "OUTSIDE-OPTIONAL-IDENTITY-SENTINEL"
+        outside_common = self.root / "outside-common.json"
+        outside_common.write_text(json.dumps({"secret": sentinel}), encoding="utf-8")
+        common_path = self.fixture.candidate.info_path.parent / "common_record.json"
+        common_path.symlink_to(outside_common)
+        vlm = self._success_vlm()
+
+        with patch.object(
+            vlm,
+            "research_hardware",
+            wraps=vlm.research_hardware,
+        ) as research:
+            result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.REVIEW)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 1))
+        self.assertNotIn(sentinel, repr(research.call_args.args[0]))
+        normalized = self._read_output(self.fixture, "info_norm.json")
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertIsInstance(normalized, dict)
+        self.assertIn("COMMON_RECORD_UNREADABLE", {item["code"] for item in review["issues"]})
+        self.assertNotIn(sentinel, json.dumps(review, ensure_ascii=False))
+
+    def test_optional_identity_invalid_forms_are_review_with_exact_two_outputs(self) -> None:
+        meta = self.fixture.candidate.info_path.parent
+        common_path = meta / "common_record.json"
+        tasks_path = meta / "tasks.jsonl"
+        outside_common = self.root / "outside-common-matrix.json"
+        outside_tasks = self.root / "outside-tasks-matrix.jsonl"
+        sentinel = "OUTSIDE-OPTIONAL-MATRIX-SENTINEL"
+        outside_common.write_text(json.dumps({"secret": sentinel}), encoding="utf-8")
+        outside_tasks.write_text(json.dumps({"task": sentinel}) + "\n", encoding="utf-8")
+        local_limit = 4096
+        oversized = b"x" * (local_limit + 1)
+
+        def write_common(payload: bytes) -> None:
+            common_path.write_bytes(payload)
+
+        def write_tasks(payload: bytes) -> None:
+            tasks_path.write_bytes(payload)
+
+        cases = (
+            ("common_nan", lambda: write_common(b'{"value":NaN}'), "COMMON_RECORD_INVALID"),
+            ("tasks_nan", lambda: write_tasks(b'{"task":"ok"}\n{"value":Infinity}\n'), "TASKS_INVALID"),
+            ("common_oversize", lambda: write_common(oversized), "COMMON_RECORD_INVALID"),
+            ("tasks_oversize", lambda: write_tasks(oversized), "TASKS_INVALID"),
+            ("common_link", lambda: common_path.symlink_to(outside_common), "COMMON_RECORD_UNREADABLE"),
+            ("tasks_link", lambda: tasks_path.symlink_to(outside_tasks), "TASKS_UNREADABLE"),
+        )
+
+        for label, prepare, expected_code in cases:
+            with self.subTest(label=label):
+                for path in (common_path, tasks_path, meta / "info_norm.json", meta / "info_norm_review.json"):
+                    path.unlink(missing_ok=True)
+                prepare()
+                vlm = self._success_vlm()
+                with (
+                    patch(
+                        "robometanorm.evidence._LOCAL_JSON_BYTE_LIMIT",
+                        local_limit,
+                    ),
+                    patch.object(
+                        vlm,
+                        "research_hardware",
+                        wraps=vlm.research_hardware,
+                    ) as research,
+                ):
+                    result = self._normalize(vlm)[0]
+
+                self.assertEqual(result.status, DatasetStatus.REVIEW)
+                self.assertTrue((meta / "info_norm.json").is_file())
+                self.assertTrue((meta / "info_norm_review.json").is_file())
+                review = self._read_output(self.fixture, "info_norm_review.json")
+                self.assertIn(expected_code, {item["code"] for item in review["issues"]})
+                self.assertNotIn(sentinel, repr(research.call_args.args[0]))
+                self.assertNotIn(sentinel, json.dumps(review, ensure_ascii=False))
+
+    def test_strict_info_failures_are_error_with_zero_outputs(self) -> None:
+        meta = self.fixture.candidate.info_path.parent
+        payloads = (
+            b'{"robot_type":NaN}',
+            b'{"robot_type":"\\ud800"}',
+            b"x" * 129,
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload[:24]):
+                self.fixture.candidate.info_path.unlink(missing_ok=True)
+                self.fixture.candidate.info_path.write_bytes(payload)
+                for name in ("info_norm.json", "info_norm_review.json"):
+                    (meta / name).unlink(missing_ok=True)
+                vlm = self._success_vlm()
+
+                with patch("robometanorm.evidence._LOCAL_JSON_BYTE_LIMIT", 128):
+                    result = self._normalize(vlm)[0]
+
+                self.assertEqual(result.status, DatasetStatus.ERROR)
+                self.assertIsNone(result.source_info)
+                self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+                self.assertFalse((meta / "info_norm.json").exists())
+                self.assertFalse((meta / "info_norm_review.json").exists())
+
+    def test_linked_data_root_never_reaches_pyarrow_vlm_or_changes_names(self) -> None:
+        data_path = self.fixture.candidate.data_path
+        assert data_path is not None
+        outside_data = self.root / "outside-data"
+        data_path.rename(outside_data)
+        data_path.symlink_to(outside_data, target_is_directory=True)
+        vlm = self._success_vlm()
+
+        with patch(
+            "robometanorm.evidence.pq.ParquetFile",
+            side_effect=AssertionError("linked data reached PyArrow"),
+        ) as parquet_file:
+            result = self._normalize(vlm)[0]
+
+        parquet_file.assert_not_called()
+        self.assertEqual(result.status, DatasetStatus.BLOCKED)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(
+            self._read_output(self.fixture, "info_norm.json"),
+            self._source_info(),
+        )
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertIn("PARQUET_PATH_UNSAFE", {item["code"] for item in review["issues"]})
+
+    def test_linked_video_root_never_reaches_tools_vlm_or_changes_names(self) -> None:
+        video_path = self.fixture.candidate.video_path
+        assert video_path is not None
+        outside_videos = self.root / "outside-videos"
+        video_path.rename(outside_videos)
+        video_path.symlink_to(outside_videos, target_is_directory=True)
+        vlm = self._success_vlm()
+        from robometanorm.pipeline import normalize_datasets
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                side_effect=AssertionError("linked video reached ffprobe"),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=AssertionError("linked video reached ffmpeg"),
+            ) as extract,
+        ):
+            result = normalize_datasets(
+                self.root,
+                vlm=vlm,
+                confidence_threshold=0.85,
+            )[0]
+
+        probe.assert_not_called()
+        extract.assert_not_called()
+        self.assertEqual(result.status, DatasetStatus.BLOCKED)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(
+            self._read_output(self.fixture, "info_norm.json"),
+            self._source_info(),
+        )
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertIn("MEDIA_PATH_UNSAFE", {item["code"] for item in review["issues"]})
+
     def test_writer_failure_is_not_retried_and_next_dataset_still_completes(self) -> None:
         second = self._create_dataset("dataset-b")
         vlm = self._success_vlm()
