@@ -2079,7 +2079,12 @@ class CameraEvidenceTest(unittest.TestCase):
         def run(command: list[str], **kwargs: object) -> object:
             self.assertEqual(
                 kwargs,
-                {"capture_output": True, "text": True, "check": False},
+                {
+                    "capture_output": True,
+                    "text": True,
+                    "check": False,
+                    "timeout": 120.0,
+                },
             )
             tool_calls.append(command[0])
             if command[0] == "ffprobe":
@@ -2205,7 +2210,12 @@ class CameraEvidenceTest(unittest.TestCase):
         self.assertEqual(command[-1], str(self.video_path / "fictional.mp4"))
         self.assertEqual(
             run.call_args.kwargs,
-            {"capture_output": True, "text": True, "check": False},
+            {
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 120.0,
+            },
         )
 
     def test_probe_media_falls_back_to_positive_stream_duration(self) -> None:
@@ -2388,7 +2398,12 @@ class CameraEvidenceTest(unittest.TestCase):
         self.assertEqual(command[-1], str(output_path))
         self.assertEqual(
             mocked_run.call_args.kwargs,
-            {"capture_output": True, "text": True, "check": False},
+            {
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 120.0,
+            },
         )
 
     def test_extract_midpoint_frame_propagates_unexpected_resolve_error(self) -> None:
@@ -2532,6 +2547,32 @@ class CameraEvidenceTest(unittest.TestCase):
                     self.video_path / "fictional.mp4", stat_error_output
                 )
         self.assertFalse(stat_error_output.exists())
+
+    def test_extract_midpoint_frame_converts_timeout_and_discards_partial(self) -> None:
+        output_path = self.root / "partial-timeout.jpg"
+
+        def write_then_timeout(command: list[str], **kwargs: object) -> object:
+            self.assertEqual(kwargs["timeout"], 120.0)
+            Path(command[-1]).write_bytes(b"partial-timeout-output")
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                side_effect=write_then_timeout,
+            ),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", output_path
+                )
+
+        self.assertFalse(output_path.exists())
+        self.assertNotIn(str(output_path), str(caught.exception))
 
     def test_extract_midpoint_frame_never_uses_source_media_as_output(self) -> None:
         media_path = self._write_media(

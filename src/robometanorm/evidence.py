@@ -37,6 +37,7 @@ from robometanorm.models import (
 _VIDEO_SUFFIXES = frozenset({".avi", ".mkv", ".mov", ".mp4", ".webm"})
 _IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
 _MEDIA_SUFFIXES = _VIDEO_SUFFIXES | _IMAGE_SUFFIXES
+_MEDIA_TOOL_TIMEOUT_SECONDS = 120.0
 
 
 def read_info(candidate: DatasetCandidate) -> dict[str, object]:
@@ -169,6 +170,7 @@ def probe_media(media_path: Path) -> MediaSample:
             capture_output=True,
             text=True,
             check=False,
+            timeout=_MEDIA_TOOL_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("ffprobe could not be executed") from error
@@ -276,6 +278,7 @@ def extract_midpoint_frame(
             capture_output=True,
             text=True,
             check=False,
+            timeout=_MEDIA_TOOL_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as error:
         _discard_frame_output(output_path)
