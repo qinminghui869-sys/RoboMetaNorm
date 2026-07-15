@@ -1,380 +1,376 @@
-"""P0 命令行端到端测试。"""
+"""End-to-end tests for the intentionally small mini CLI."""
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+import argparse
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from dataclasses import replace
+import hashlib
 import io
 import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
-
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.cli.main import main
-from robometanorm.camera.vlm import OpenAICompatibleVlmClassifier
+from robometanorm.cli.main import (
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    _build_parser,
+    _build_vlm,
+    main,
+)
+from robometanorm.models import DatasetMapping, DatasetStatus, Issue, MediaSample
+from tests.mini_fixtures import DatasetFixture, FakeVlm, PipelineFixture
 
 
 class CliIntegrationTest(unittest.TestCase):
-    """验证命令边界和基础输出。"""
+    """Run scan and normalize against complete, fictional local datasets."""
 
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name) / "collect_data"
-        self.dataset_path = self.root / "dataset_001"
-        (self.dataset_path / "meta").mkdir(parents=True)
-        (self.dataset_path / "data").mkdir()
-        (self.dataset_path / "videos" / "front").mkdir(parents=True)
-        (self.dataset_path / "videos" / "front" / "episode_000000.mp4").touch()
-        info = {
-            "fps": 20,
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.fixture = self._create_dataset("dataset-a")
+        builder = PipelineFixture()
+        self.profile = builder.hardware_profile()
+        state_assignment = builder.dataset_mapping().machines[0]
+        self.mapping = DatasetMapping(
+            cameras=builder.dataset_mapping().cameras,
+            machines=(
+                replace(state_assignment, source_feature="action"),
+                state_assignment,
+            ),
+        )
+
+    @staticmethod
+    def _source_info() -> dict[str, object]:
+        raw_names = [f"raw_joint_{index}" for index in range(6)]
+        return {
+            "robot_type": "acme_testbot",
+            "fps": 30,
             "features": {
-                "action": {"dtype": "float32", "shape": [2]},
-                "observation.state": {"dtype": "float32", "shape": [2]},
-                "observation.images.image_left": {
+                "observation.images.wrist": {
                     "dtype": "video",
                     "shape": [480, 640, 3],
+                    "names": ["height", "width", "channel"],
+                    "fps": 30,
+                    "codec": "av1",
                 },
-            },
-        }
-        (self.dataset_path / "meta" / "info.json").write_text(
-            json.dumps(info), encoding="utf-8"
-        )
-        self.source_info = info
-
-    def tearDown(self) -> None:
-        self.temp_dir.cleanup()
-
-    def test_scan_prints_summary_without_creating_output_files(self) -> None:
-        output = self._run("scan", "--root", str(self.root))
-
-        self.assertIn("Dataset", output)
-        self.assertIn("dataset_001", output)
-        self.assertIn("PASS", output)
-        self.assertFalse((self.dataset_path / "meta" / "info_norm.json").exists())
-        self.assertFalse((self.dataset_path / "meta" / "info_norm_review.json").exists())
-
-    def test_normalize_writes_two_p0_files_and_prints_summary(self) -> None:
-        output = self._run("normalize", "--root", str(self.root))
-
-        self.assertIn("dataset_001", output)
-        self.assertIn("Cam C/I/U", output)
-        self.assertIn("Topology Errors", output)
-        self.assertIn("0/0/1", output)
-        self.assertTrue((self.dataset_path / "meta" / "info_norm.json").is_file())
-        self.assertTrue((self.dataset_path / "meta" / "info_norm_review.json").is_file())
-        normalized = json.loads(
-            (self.dataset_path / "meta" / "info_norm.json").read_text(encoding="utf-8")
-        )
-        source = json.loads(
-            (self.dataset_path / "meta" / "info.json").read_text(encoding="utf-8")
-        )
-        normalized_feature = normalized["features"]["observation.images.image_left"]
-        self.assertEqual(normalized_feature["codec"], "av1")
-        self.assertNotIn("observation.images.cam_left_rgb", normalized["features"])
-        self.assertEqual(source, self.source_info)
-
-    def test_airbot_keeps_unverified_camera_names_and_records_identity(self) -> None:
-        info = {
-            "robot_type": "Airbot_MMK2",
-            "fps": 20,
-            "features": {
                 "action": {
                     "dtype": "float32",
-                    "shape": [2],
-                    "names": ["left_hand_joint_1_rad", "right_hand_joint_1_rad"],
+                    "shape": [6],
+                    "names": list(raw_names),
                 },
                 "observation.state": {
                     "dtype": "float32",
-                    "shape": [2],
-                    "names": ["left_hand_joint_1_rad", "right_hand_joint_1_rad"],
-                },
-                "observation.images.cam_high_rgb": {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
-                },
-                "observation.images.cam_left_wrist_rgb": {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
-                },
-                "observation.images.cam_right_wrist_rgb": {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
-                },
-                "observation.images.cam_third_view": {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
+                    "shape": [6],
+                    "names": list(raw_names),
                 },
             },
         }
-        (self.dataset_path / "meta" / "info.json").write_text(
-            json.dumps(info), encoding="utf-8"
-        )
-        (self.dataset_path / "meta" / "common_record.json").write_text(
-            json.dumps({"machine_id": "sample_galbot_g1"}), encoding="utf-8"
-        )
 
-        self._run("normalize", "--root", str(self.root))
-
-        normalized = json.loads(
-            (self.dataset_path / "meta" / "info_norm.json").read_text(
-                encoding="utf-8"
-            )
+    def _create_dataset(self, name: str) -> DatasetFixture:
+        fixture = DatasetFixture.create(
+            self.root,
+            dataset_name=name,
+            info=self._source_info(),
+            with_data=True,
+            with_videos=True,
         )
-        review = json.loads(
-            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        features = normalized["features"]
-        self.assertIn("observation.images.cam_high_rgb", features)
-        self.assertIn("observation.images.cam_third_view", features)
-        self.assertNotIn("observation.images.cam_front_top_rgb", features)
-        self.assertNotIn("observation.images.cam_top_side_rgb", features)
-        self.assertEqual(features["observation.images.cam_high_rgb"]["codec"], "av1")
-        self.assertEqual(features["observation.images.cam_third_view"]["codec"], "av1")
-        self.assertEqual(review["robot_identity"]["canonical_id"], "airbot_mmk2")
-        self.assertIn(
-            "ROBOT_IDENTITY_CONFLICT",
-            {item["category"] for item in review["review_items"]},
-        )
-        unresolved = {
-            item["source_key"]
-            for item in review["camera_review_items"]
-            if item["evidence"].get("inference_level") == "UNRESOLVED"
+        rows = {
+            "action": [[0.0, 0.1, 0.2, 0.3, 0.4, 0.5]],
+            "observation.state": [[0.5, 0.4, 0.3, 0.2, 0.1, 0.0]],
         }
-        self.assertEqual(
-            unresolved,
-            {
-                "observation.images.cam_high_rgb",
-                "observation.images.cam_third_view",
-            },
+        fixture.write_parquet(rows, relative_path="chunk-000/episode_000000.parquet")
+        fixture.write_parquet(rows, relative_path="chunk-001/episode_000001.parquet")
+        fixture.write_media_placeholder(
+            relative_path="chunk-000/observation.images.wrist/episode_000000.mp4",
+            payload=b"immutable-source-video",
+        )
+        return fixture
+
+    @staticmethod
+    def _probe_media(*args: object, **kwargs: object) -> MediaSample:
+        return MediaSample(
+            relative_path="",
+            media_type="video",
+            codec="av1",
+            fps=30.0,
+            width=640,
+            height=480,
+            duration_seconds=1.0,
+            pixel_format="yuv420p",
+            frame_path=None,
         )
 
-    def test_normalize_uses_default_vlm_and_topology_resolver(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            with patch("robometanorm.cli.main.normalize_datasets", return_value=[]) as normalize:
-                self._run("normalize", "--root", str(self.root))
+    @staticmethod
+    def _extract_frame(
+        media_path: Path,
+        output_path: Path,
+        *,
+        duration_seconds: float | None = None,
+    ) -> Path:
+        output_path.write_bytes(b"ephemeral-frame")
+        return output_path
 
-        classifier = normalize.call_args.kwargs["vlm_classifier"]
-        self.assertIsInstance(classifier, OpenAICompatibleVlmClassifier)
-        self.assertEqual(
-            classifier.endpoint,
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    def _success_vlm(self) -> FakeVlm:
+        return FakeVlm(
+            research_result=(self.profile, None),
+            mapping_result=(self.mapping, None),
         )
-        self.assertEqual(classifier.model, "qwen3.7-plus")
-        self.assertEqual(classifier.api_key_env, "DASHSCOPE_API_KEY")
-        self.assertIsNotNone(normalize.call_args.kwargs["camera_topology_resolver"])
 
-    def test_normalize_allows_explicit_vlm_overrides(self) -> None:
-        with patch.dict(os.environ, {"P1_TEST_VLM_KEY": "test-key"}):
-            with patch("robometanorm.cli.main.normalize_datasets", return_value=[]) as normalize:
-                self._run(
-                    "normalize",
-                    "--root",
-                    str(self.root),
-                    "--vlm-endpoint",
-                    "http://127.0.0.1:8002/v1",
-                    "--vlm-model",
-                    "test-vlm",
-                    "--vlm-api-key-env",
-                    "P1_TEST_VLM_KEY",
-                    "--confidence-threshold",
-                    "0.9",
-                    "--vlm-timeout-seconds",
-                    "90",
-                    "--vlm-max-retries",
-                    "3",
-                    "--vlm-retry-backoff-seconds",
-                    "0.5",
-                    "--vlm-max-tokens",
-                    "2048",
+    def _run(
+        self,
+        *arguments: str,
+        vlm: object | None = None,
+        use_real_builder: bool = False,
+    ) -> tuple[str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("robometanorm.evidence.probe_media", side_effect=self._probe_media)
+            )
+            stack.enter_context(
+                patch(
+                    "robometanorm.evidence.extract_midpoint_frame",
+                    side_effect=self._extract_frame,
                 )
-
-        classifier = normalize.call_args.kwargs["vlm_classifier"]
-        self.assertIsInstance(classifier, OpenAICompatibleVlmClassifier)
-        self.assertEqual(normalize.call_args.kwargs["confidence_threshold"], 0.9)
-        self.assertEqual(classifier.timeout_seconds, 90)
-        self.assertEqual(classifier.max_retries, 3)
-        self.assertEqual(classifier.retry_backoff_seconds, 0.5)
-        self.assertEqual(classifier.max_tokens, 2048)
-        self.assertIsNotNone(normalize.call_args.kwargs["camera_topology_resolver"])
-
-    def test_normalize_applies_safe_p2_machine_names_from_parquet(self) -> None:
-        info = {
-            "fps": 20,
-            "features": {
-                "action": self._head_quaternion_feature(),
-                "observation.state": self._head_quaternion_feature(),
-                "observation.images.image_left": {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
-                },
-            },
-        }
-        (self.dataset_path / "meta" / "info.json").write_text(
-            json.dumps(info), encoding="utf-8"
-        )
-        pq.write_table(
-            pa.table(
-                {
-                    "action": [[0.0, 0.0, 0.0, 1.0]],
-                    "observation.state": [[0.0, 0.0, 0.0, 1.0]],
-                }
-            ),
-            self.dataset_path / "data" / "episode_000000.parquet",
-        )
-
-        self._run("normalize", "--root", str(self.root))
-
-        normalized = json.loads(
-            (self.dataset_path / "meta" / "info_norm.json").read_text(encoding="utf-8")
-        )
-        review = json.loads(
-            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
-                encoding="utf-8"
             )
-        )
-        expected_names = [
-            "head_orient_quat_x",
-            "head_orient_quat_y",
-            "head_orient_quat_z",
-            "head_orient_quat_w",
-        ]
-        self.assertEqual(normalized["features"]["action"]["names"], expected_names)
-        self.assertEqual(
-            normalized["features"]["observation.state"]["names"], expected_names
-        )
-        self.assertEqual(review["generator"]["phase"], "P2")
-        self.assertIn("machine_review_items", review)
-        self.assertEqual(
-            json.loads((self.dataset_path / "meta" / "info.json").read_text(encoding="utf-8")),
-            info,
-        )
-
-    def test_normalize_profiles_first_and_last_episode_then_hits_cache(self) -> None:
-        for index in range(4):
-            self._write_two_dimensional_parquet(
-                f"episode_{index:06d}.parquet", float(index)
-            )
-
-        _, first_stderr = self._run_captured(
-            "normalize", "--root", str(self.root)
-        )
-        middle_path = self.dataset_path / "data" / "episode_000001.parquet"
-        stat = middle_path.stat()
-        os.utime(
-            middle_path,
-            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
-        )
-        _, second_stderr = self._run_captured(
-            "normalize", "--root", str(self.root)
-        )
-
-        self.assertIn(
-            "正在分析 episode 1/2: episode_000000.parquet", first_stderr
-        )
-        self.assertIn(
-            "正在分析 episode 2/2: episode_000003.parquet", first_stderr
-        )
-        self.assertNotIn("episode_000001.parquet", first_stderr)
-        self.assertNotIn("episode_000002.parquet", first_stderr)
-        self.assertIn("已加载 Parquet 画像缓存，共 2 episodes", second_stderr)
-
-    def test_normalize_writes_non_destructive_gripper_transform_proposal(self) -> None:
-        source_name = "leader_left_gripper_degree_mm.pos"
-        info = {
-            "fps": 20,
-            "features": {
-                "action": {
-                    "dtype": "float32",
-                    "shape": [1],
-                    "names": [source_name],
-                },
-                "observation.images.image_left": {
-                    "dtype": "video",
-                    "shape": [480, 640, 3],
-                },
-            },
-        }
-        (self.dataset_path / "meta" / "info.json").write_text(
-            json.dumps(info), encoding="utf-8"
-        )
-        pq.write_table(
-            pa.table({"action": [[0.0], [25.0], [50.0], [75.0], [100.0]]}),
-            self.dataset_path / "data" / "episode_000000.parquet",
-        )
-
-        self._run("normalize", "--root", str(self.root))
-
-        normalized = json.loads(
-            (self.dataset_path / "meta" / "info_norm.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        review = json.loads(
-            (self.dataset_path / "meta" / "info_norm_review.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(normalized["features"]["action"]["names"], [source_name])
-        proposal = review["gripper_transform_proposals"][0]
-        self.assertEqual(proposal["target_name"], "left_gripper_open")
-        self.assertEqual(proposal["formula"], "clip(x / 100, 0, 1)")
-        self.assertTrue(proposal["transform_required"])
-        self.assertEqual(
-            json.loads(
-                (self.dataset_path / "meta" / "info.json").read_text(
-                    encoding="utf-8"
+            if not use_real_builder and arguments[0] == "normalize":
+                stack.enter_context(
+                    patch(
+                        "robometanorm.cli.main._build_vlm",
+                        return_value=vlm if vlm is not None else self._success_vlm(),
+                    )
                 )
-            ),
-            info,
-        )
-
-    def _write_two_dimensional_parquet(self, filename: str, offset: float) -> None:
-        pq.write_table(
-            pa.table(
-                {
-                    "action": [[offset, offset + 1.0]],
-                    "observation.state": [[offset, offset + 1.0]],
-                }
-            ),
-            self.dataset_path / "data" / filename,
-        )
-
-    @staticmethod
-    def _head_quaternion_feature() -> dict[str, object]:
-        return {
-            "dtype": "float32",
-            "shape": [4],
-            "names": [
-                "head_rotation_quat_x",
-                "head_rotation_quat_y",
-                "head_rotation_quat_z",
-                "head_rotation_quat_w",
-            ],
-        }
-
-    @staticmethod
-    def _run(*arguments: str) -> str:
-        stdout, _ = CliIntegrationTest._run_captured(*arguments)
-        return stdout
-
-    @staticmethod
-    def _run_captured(*arguments: str) -> tuple[str, str]:
-        output = io.StringIO()
-        errors = io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
+            stack.enter_context(redirect_stdout(stdout))
+            stack.enter_context(redirect_stderr(stderr))
             exit_code = main(list(arguments))
-        if exit_code != 0:
-            raise AssertionError(f"命令返回非零状态: {exit_code}")
-        return output.getvalue(), errors.getvalue()
+        self.assertEqual(exit_code, 0)
+        return stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def _hash(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_scan_is_read_only_and_uses_only_the_four_summary_columns(self) -> None:
+        output, _ = self._run("scan", "--root", str(self.root))
+
+        self.assertEqual(
+            output.splitlines()[0],
+            "Dataset | Status | Changed Fields | Issues",
+        )
+        self.assertIn("dataset-a", output)
+        self.assertIn("PASS", output)
+        for obsolete in ("Cameras", "Machine Fields", "Cam C/I/U", "Topology Errors"):
+            self.assertNotIn(obsolete, output)
+        meta = self.fixture.candidate.info_path.parent
+        self.assertFalse((meta / "info_norm.json").exists())
+        self.assertFalse((meta / "info_norm_review.json").exists())
+
+    def test_normalize_changes_only_two_outputs_and_preserves_all_sources(self) -> None:
+        source_paths = tuple(
+            sorted(
+                (
+                    self.fixture.candidate.info_path,
+                    *self.fixture.candidate.data_path.rglob("*.parquet"),
+                    *self.fixture.candidate.video_path.rglob("*.mp4"),
+                )
+            )
+        )
+        before = {path: self._hash(path) for path in source_paths}
+        before_files = set(self.fixture.candidate.source_path.rglob("*"))
+
+        output, _ = self._run(
+            "normalize", "--root", str(self.root), vlm=self._success_vlm()
+        )
+
+        self.assertIn("dataset-a | PASS | 4 | 0", output)
+        self.assertEqual({path: self._hash(path) for path in source_paths}, before)
+        after_files = set(self.fixture.candidate.source_path.rglob("*"))
+        new_files = {path for path in after_files - before_files if path.is_file()}
+        meta = self.fixture.candidate.info_path.parent
+        self.assertEqual(
+            new_files,
+            {meta / "info_norm.json", meta / "info_norm_review.json"},
+        )
+        normalized = json.loads((meta / "info_norm.json").read_text(encoding="utf-8"))
+        self.assertEqual(normalized["robot_type"], "acme_robotics_testbot_one")
+        features = normalized["features"]
+        self.assertIn("observation.images.cam_front_wrist_rgb", features)
+        expected = [f"left_arm_joint_{index}_rad" for index in range(6)]
+        self.assertEqual(features["action"]["names"], expected)
+        self.assertEqual(features["observation.state"]["names"], expected)
+
+    def test_missing_api_key_never_opens_network_and_degrades_to_review(self) -> None:
+        key_name = "ROBOMETANORM_TEST_MISSING_KEY"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("urllib.request.urlopen", side_effect=AssertionError("network used")),
+        ):
+            output, _ = self._run(
+                "normalize",
+                "--root",
+                str(self.root),
+                "--vlm-api-key-env",
+                key_name,
+                use_real_builder=True,
+            )
+
+        self.assertIn("REVIEW", output)
+        meta = self.fixture.candidate.info_path.parent
+        normalized = json.loads((meta / "info_norm.json").read_text(encoding="utf-8"))
+        review = json.loads(
+            (meta / "info_norm_review.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(normalized, self._source_info())
+        self.assertIn("VLM_CONFIG_MISSING", {item["code"] for item in review["issues"]})
+
+    def test_network_failure_from_vlm_keeps_source_and_records_reason(self) -> None:
+        failure = Issue("VLM_NETWORK_ERROR", "offline", "vlm")
+        vlm = FakeVlm(research_result=(None, failure))
+        output, _ = self._run("normalize", "--root", str(self.root), vlm=vlm)
+
+        self.assertIn("REVIEW", output)
+        meta = self.fixture.candidate.info_path.parent
+        self.assertEqual(
+            json.loads((meta / "info_norm.json").read_text(encoding="utf-8")),
+            self._source_info(),
+        )
+        review = json.loads(
+            (meta / "info_norm_review.json").read_text(encoding="utf-8")
+        )
+        self.assertIn("VLM_NETWORK_ERROR", {item["code"] for item in review["issues"]})
+
+    def test_blocked_dataset_still_writes_exactly_two_source_preserving_outputs(self) -> None:
+        source = self._source_info()
+        del source["features"]["action"]
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+        vlm = self._success_vlm()
+
+        output, _ = self._run("normalize", "--root", str(self.root), vlm=vlm)
+
+        self.assertIn("BLOCKED", output)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        meta = self.fixture.candidate.info_path.parent
+        self.assertEqual(
+            json.loads((meta / "info_norm.json").read_text(encoding="utf-8")), source
+        )
+        self.assertTrue((meta / "info_norm_review.json").is_file())
+
+    def test_writer_failure_is_isolated_and_second_dataset_completes(self) -> None:
+        second = self._create_dataset("dataset-b")
+        from robometanorm.writer import write_outputs as real_write
+
+        calls = 0
+
+        def fail_first(*args: object, **kwargs: object):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("disk failure")
+            return real_write(*args, **kwargs)
+
+        with patch("robometanorm.pipeline.write_outputs", side_effect=fail_first):
+            output, _ = self._run(
+                "normalize", "--root", str(self.root), vlm=self._success_vlm()
+            )
+
+        self.assertEqual(calls, 2)
+        self.assertIn("dataset-a | ERROR", output)
+        self.assertIn("dataset-b | PASS", output)
+        self.assertTrue(
+            (second.candidate.info_path.parent / "info_norm_review.json").is_file()
+        )
+
+    def test_builder_has_one_transport_wrapper_and_forwards_all_arguments(self) -> None:
+        arguments = argparse.Namespace(
+            vlm_endpoint="https://vlm.invalid/v1",
+            vlm_model="fictional-model",
+            vlm_api_key_env="FICTIONAL_KEY",
+            confidence_threshold=0.9,
+            vlm_timeout_seconds=90,
+            vlm_max_retries=3,
+            vlm_retry_backoff_seconds=0.5,
+            vlm_max_tokens=2048,
+        )
+        parser = _build_parser()
+        transport = object()
+        service = object()
+        with (
+            patch.dict(os.environ, {"FICTIONAL_KEY": "test-secret"}),
+            patch(
+                "robometanorm.cli.main.OpenAICompatibleTransport",
+                return_value=transport,
+            ) as transport_type,
+            patch(
+                "robometanorm.cli.main.OpenAICompatibleDatasetVlm",
+                return_value=service,
+            ) as service_type,
+        ):
+            built = _build_vlm(arguments, parser)
+
+        self.assertIs(built, service)
+        transport_type.assert_called_once_with(
+            "https://vlm.invalid/v1",
+            "fictional-model",
+            "test-secret",
+            api_key_env="FICTIONAL_KEY",
+            timeout_seconds=90,
+            max_retries=3,
+            retry_backoff_seconds=0.5,
+            max_tokens=2048,
+        )
+        service_type.assert_called_once_with(transport)
+
+    def test_nonfinite_out_of_range_and_direct_bool_thresholds_are_rejected(self) -> None:
+        for value in ("nan", "inf", "-inf", "-0.1", "1.1"):
+            with self.subTest(value=value):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    main(
+                        [
+                            "normalize",
+                            "--root",
+                            str(self.root),
+                            "--confidence-threshold",
+                            value,
+                        ]
+                    )
+
+        arguments = _build_parser().parse_args(
+            ["normalize", "--root", str(self.root)]
+        )
+        arguments.confidence_threshold = True
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            _build_vlm(arguments, _build_parser())
+
+        source = Path(__file__).parents[2] / "src" / "robometanorm" / "cli" / "main.py"
+        self.assertEqual(source.read_text(encoding="utf-8").count("0.85"), 1)
+        self.assertEqual(DEFAULT_CONFIDENCE_THRESHOLD, 0.85)
+
+    def test_module_help_is_runnable_without_network_or_dataset_access(self) -> None:
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        completed = subprocess.run(
+            [sys.executable, "-m", "robometanorm", "--help"],
+            cwd=self.root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("scan", completed.stdout)
+        self.assertIn("normalize", completed.stdout)
 
 
 if __name__ == "__main__":
