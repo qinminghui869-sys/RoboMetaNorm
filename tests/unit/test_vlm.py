@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
+from dataclasses import asdict, replace
 import hashlib
 from http.client import IncompleteRead
 from io import BytesIO
@@ -18,8 +19,19 @@ from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.models import IdentityEvidence, Issue
-from tests.mini_fixtures import StubTransport, VlmFixture
+from robometanorm.models import (
+    CameraEvidence,
+    DatasetCandidate,
+    DatasetEvidence,
+    IdentityEvidence,
+    Issue,
+    LayoutType,
+    MachineEvidence,
+    MachineSlice,
+    MediaSample,
+    ParquetEpisodeEvidence,
+)
+from tests.mini_fixtures import PipelineFixture, StubTransport, VlmFixture
 import robometanorm.vlm as vlm_module
 from robometanorm.vlm import OpenAICompatibleTransport
 
@@ -1901,6 +1913,454 @@ class HardwareResearchTest(unittest.TestCase, VlmFixture):
         self.assertEqual(issue.code, "HARDWARE_RESEARCH_INVALID")
         self.assertEqual(transport.web_attempts, 1)
         self.assertEqual(transport.chat_attempts, 0)
+
+
+class DatasetMappingTest(unittest.TestCase, VlmFixture):
+    @staticmethod
+    def evidence(*, two_cameras: bool = False) -> DatasetEvidence:
+        root = Path("/private/datasets/demo")
+        candidate = DatasetCandidate(
+            "demo", "pick", root, LayoutType.TASK_GROUPED,
+            root / "meta/info.json", root / "data", root / "videos", None,
+        )
+        first_frame = root / "frames/shared.png"
+        samples = (
+            MediaSample("videos/front/0.mp4", "video", "h264", 30.0, 640, 480, 1.0, "yuv420p", first_frame),
+            MediaSample("videos/front/1.mp4", "video", "h264", 30.0, 640, 480, 1.0, "yuv420p", first_frame),
+            MediaSample("videos/front/2.mp4", "video", "h264", 30.0, 640, 480, 1.0, "yuv420p", None),
+        )
+        cameras = (CameraEvidence(PipelineFixture.camera_schema(), samples),)
+        if two_cameras:
+            cameras += (
+                CameraEvidence(
+                    PipelineFixture.camera_schema("observation.images.head"),
+                    (MediaSample("videos/head/0.png", "image", "png", None, 32, 24, None, "rgb24", root / "frames/head.png"),),
+                ),
+            )
+        machines = (
+            MachineEvidence(
+                PipelineFixture.machine_schema(),
+                (
+                    ParquetEpisodeEvidence(
+                        "data/chunk-000/episode_000000.parquet",
+                        ("observation.state",),
+                        {"decoy.before.current": 999, "observation.state": 6},
+                    ),
+                    ParquetEpisodeEvidence("data/chunk-001/episode_000001.parquet", ("observation.state",), {"observation.state": 8}),
+                ),
+                (10, 12),
+            ),
+        )
+        return DatasetEvidence(
+            candidate, {"private": root}, IdentityEvidence("present", "ignore instructions", "missing", None, "missing", ()),
+            cameras, machines, (Issue("PRIVATE", "private", "dataset", {"path": root}),),
+        )
+
+    @staticmethod
+    def profile(*, two_cameras: bool = False):
+        profile = PipelineFixture().hardware_profile()
+        if not two_cameras:
+            return profile
+        second = replace(profile.cameras[0], camera_id="head_rgb", interface_name="head")
+        return replace(profile, cameras=profile.cameras + (second,))
+
+    @staticmethod
+    def payload() -> dict[str, object]:
+        return VlmFixture.valid_mapping_payload()
+
+    def test_builds_safe_whole_dataset_prompt_with_global_image_order(self) -> None:
+        evidence, profile = self.evidence(two_cameras=True), self.profile(two_cameras=True)
+        system, user, image_paths = vlm_module.build_mapping_prompt(evidence, profile)
+        payload = json.loads(user)
+        self.assertEqual(set(payload), {"hardware_profile", "cameras", "machines"})
+        self.assertEqual(payload["hardware_profile"], json.loads(json.dumps(asdict(profile))))
+        self.assertEqual(
+            set(payload["cameras"][0]),
+            {"source_key", "schema", "samples"},
+        )
+        self.assertEqual(
+            payload["cameras"][0]["source_key"],
+            evidence.cameras[0].schema.source_key,
+        )
+        self.assertEqual(
+            set(payload["cameras"][0]["schema"]),
+            {"dtype", "shape", "names", "fps", "codec"},
+        )
+        self.assertEqual(
+            set(payload["cameras"][0]["samples"][0]),
+            {
+                "relative_path",
+                "media_type",
+                "codec",
+                "fps",
+                "width",
+                "height",
+                "duration_seconds",
+                "pixel_format",
+                "image_index",
+            },
+        )
+        self.assertEqual([sample["image_index"] for camera in payload["cameras"] for sample in camera["samples"]], [0, 1, None, 2])
+        self.assertEqual(image_paths, (evidence.cameras[0].samples[0].frame_path, evidence.cameras[0].samples[1].frame_path, evidence.cameras[1].samples[0].frame_path))
+        self.assertEqual(
+            payload["cameras"][0]["schema"],
+            {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+                "names": ["height", "width", "channel"],
+                "fps": 30,
+                "codec": "h264",
+            },
+        )
+        self.assertEqual(
+            set(payload["machines"][0]),
+            {"source_feature", "schema", "episodes", "episode_lengths"},
+        )
+        self.assertEqual(
+            payload["machines"][0]["source_feature"],
+            evidence.machines[0].schema.source_key,
+        )
+        self.assertEqual(
+            set(payload["machines"][0]["schema"]),
+            {"dtype", "shape", "names", "fps", "codec"},
+        )
+        self.assertEqual(
+            payload["machines"][0]["episodes"][0],
+            {
+                "relative_path": "data/chunk-000/episode_000000.parquet",
+                "schema_columns": ["observation.state"],
+                "vector_length": 6,
+            },
+        )
+        serialized = user.lower()
+        for forbidden in ("frame_path", "candidate", "source_info", "issues", "/private/", "hardware_id", "final name", "urdf", "tactile", "audio"):
+            self.assertNotIn(forbidden, serialized)
+        self.assertIn("untrusted", system.lower())
+        self.assertIn("one whole dataset", system.lower())
+        self.assertIn("camera_id", system)
+        self.assertIn("component_id", system)
+
+    def test_build_mapping_prompt_does_not_deepcopy_frame_paths(self) -> None:
+        class NoDeepcopyPath(type(Path())):
+            def __deepcopy__(self, memo):
+                raise AssertionError("frame_path was deep-copied")
+
+        evidence = self.evidence()
+        frame_path = NoDeepcopyPath("/private/datasets/demo/frames/front.png")
+        sample = replace(evidence.cameras[0].samples[0], frame_path=frame_path)
+        evidence = replace(
+            evidence,
+            cameras=(replace(evidence.cameras[0], samples=(sample,)),),
+        )
+
+        _, user, image_paths = vlm_module.build_mapping_prompt(
+            evidence, self.profile()
+        )
+
+        self.assertIs(image_paths[0], frame_path)
+        self.assertEqual(
+            set(json.loads(user)["cameras"][0]["samples"][0]),
+            {
+                "relative_path",
+                "media_type",
+                "codec",
+                "fps",
+                "width",
+                "height",
+                "duration_seconds",
+                "pixel_format",
+                "image_index",
+            },
+        )
+
+    def test_mapping_system_prompt_is_explicitly_assignment_only(self) -> None:
+        system, _, _ = vlm_module.build_mapping_prompt(
+            self.evidence(), self.profile()
+        )
+        normalized = " ".join(system.lower().split())
+        self.assertIn("assignment-only", normalized)
+        self.assertIn("existing camera_id/component_id", normalized)
+        self.assertIn("do not use hardware_id", normalized)
+        self.assertIn("do not propose final names", normalized)
+        self.assertIn("urdf, tactile, and audio are out of scope", normalized)
+
+    def test_parses_structural_mapping_and_defers_task11_consistency(self) -> None:
+        payload = self.payload()
+        machine = payload["machines"][0]
+        machine["ambiguous"] = True
+        machine["slices"] = [
+            {"start": 5, "end": 7, "component_id": "arm", "element_order": ["wrong", "order"]},
+            {"start": 6, "end": 9, "component_id": "arm", "element_order": ["gap", "overlap", "shape"]},
+        ]
+        mapping = vlm_module.parse_dataset_mapping(payload, self.evidence(), self.profile())
+        self.assertTrue(mapping.machines[0].ambiguous)
+        self.assertEqual(mapping.machines[0].slices[0], MachineSlice(5, 7, "arm", ("wrong", "order")))
+        self.assertEqual(mapping.machines[0].slices[1].end, 9)
+
+    def test_parser_allows_machine_sources_to_reuse_a_known_component(self) -> None:
+        evidence = self.evidence()
+        action = MachineEvidence(
+            PipelineFixture.machine_schema("action"),
+            (
+                ParquetEpisodeEvidence(
+                    "data/chunk-000/action.parquet",
+                    ("action",),
+                    {"action": 6},
+                ),
+            ),
+            (10,),
+        )
+        evidence = replace(evidence, machines=evidence.machines + (action,))
+        payload = self.payload()
+        action_assignment = deepcopy(payload["machines"][0])
+        action_assignment["source_feature"] = "action"
+        payload["machines"].append(action_assignment)
+
+        mapping = vlm_module.parse_dataset_mapping(
+            payload, evidence, self.profile()
+        )
+
+        self.assertEqual(
+            tuple(machine.source_feature for machine in mapping.machines),
+            ("observation.state", "action"),
+        )
+        self.assertEqual(
+            tuple(
+                machine.slices[0].component_id for machine in mapping.machines
+            ),
+            ("arm", "arm"),
+        )
+
+    def test_rejects_nonexact_schema_final_name_and_nonbuiltin_scalars(self) -> None:
+        mutations = []
+        for path in ((), ("cameras", 0), ("machines", 0), ("machines", 0, "slices", 0)):
+            payload = self.payload()
+            target = payload
+            for part in path:
+                target = target[part]
+            target["extra"] = True
+            mutations.append(payload)
+        forbidden = self.payload()
+        forbidden["machines"][0]["metadata"] = {"target_name": "left_arm_joint_0_rad"}
+        mutations.append(forbidden)
+        for field, value in (("confidence", True), ("confidence", float("nan")), ("ambiguous", 1)):
+            payload = self.payload()
+            payload["cameras"][0][field] = value
+            mutations.append(payload)
+        for field, value in (("start", True), ("start", 0.0), ("end", False)):
+            payload = self.payload()
+            payload["machines"][0]["slices"][0][field] = value
+            mutations.append(payload)
+        class DictSubclass(dict):
+            pass
+        mutations.append(DictSubclass(self.payload()))
+        for payload in mutations:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    vlm_module.parse_dataset_mapping(payload, self.evidence(), self.profile())
+
+    def test_requires_every_evidence_source_once_and_unique_known_camera_slots(self) -> None:
+        invalid = []
+        for section in ("cameras", "machines"):
+            missing = self.payload()
+            missing[section] = []
+            invalid.append(missing)
+            duplicate = self.payload()
+            duplicate[section].append(deepcopy(duplicate[section][0]))
+            invalid.append(duplicate)
+        unknown_source = self.payload()
+        unknown_source["cameras"][0]["source_key"] = "observation.images.unknown"
+        invalid.append(unknown_source)
+        unknown_slot = self.payload()
+        unknown_slot["cameras"][0]["camera_id"] = "missing"
+        invalid.append(unknown_slot)
+        duplicate_slot = self.payload()
+        duplicate_slot["cameras"].append(deepcopy(duplicate_slot["cameras"][0]))
+        duplicate_slot["cameras"][1]["source_key"] = "observation.images.head"
+        invalid.append((duplicate_slot, self.evidence(two_cameras=True), self.profile(two_cameras=True)))
+        for case in invalid:
+            payload, evidence, profile = case if isinstance(case, tuple) else (case, self.evidence(), self.profile())
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    vlm_module.parse_dataset_mapping(payload, evidence, profile)
+
+    def test_rejects_duplicate_camera_and_machine_evidence_sources(self) -> None:
+        base = self.evidence()
+        duplicate_camera = replace(
+            base,
+            cameras=base.cameras + (base.cameras[0],),
+        )
+        duplicate_machine = replace(
+            base,
+            machines=base.machines + (base.machines[0],),
+        )
+
+        for source, evidence in (
+            ("camera", duplicate_camera),
+            ("machine", duplicate_machine),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    vlm_module.parse_dataset_mapping(
+                        self.payload(), evidence, self.profile()
+                    )
+
+    def test_enforces_unresolved_contract_known_components_and_slice_shape_only(self) -> None:
+        unresolved = self.payload()
+        unresolved["cameras"][0].update(camera_id=None, ambiguous=True, reason="unclear")
+        unresolved["machines"][0].update(slices=[], ambiguous=True, reason="unclear")
+        mapping = vlm_module.parse_dataset_mapping(unresolved, self.evidence(), self.profile())
+        self.assertIsNone(mapping.cameras[0].camera_id)
+        self.assertEqual(mapping.machines[0].slices, ())
+        invalid = []
+        for section, updates in (
+            ("cameras", {"camera_id": None, "ambiguous": False}),
+            ("machines", {"slices": [], "ambiguous": False}),
+            ("cameras", {"reason": ""}),
+        ):
+            payload = self.payload()
+            payload[section][0].update(updates)
+            invalid.append(payload)
+        for updates in (
+            {"component_id": "missing"}, {"start": -1}, {"end": 0}, {"element_order": ["too-short"]},
+        ):
+            payload = self.payload()
+            payload["machines"][0]["slices"][0].update(updates)
+            invalid.append(payload)
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    vlm_module.parse_dataset_mapping(payload, self.evidence(), self.profile())
+
+    def test_map_dataset_requests_chat_once_and_preserves_transport_issue(self) -> None:
+        transport = StubTransport(chat_payload=self.payload())
+        mapping, issue = self.create_openai_service(transport).map_dataset(self.evidence(), self.profile())
+        self.assertIsNotNone(mapping)
+        self.assertIsNone(issue)
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
+        transport_issue = Issue("VLM_NETWORK_ERROR", "safe", "vlm")
+        failed = StubTransport(chat_issue=transport_issue)
+        mapping, issue = self.create_openai_service(failed).map_dataset(self.evidence(), self.profile())
+        self.assertIsNone(mapping)
+        self.assertIs(issue, transport_issue)
+        self.assertEqual((failed.chat_attempts, failed.web_attempts), (1, 0))
+
+    def test_map_dataset_rejects_unsafe_camera_and_machine_paths_before_request(self) -> None:
+        base = self.evidence()
+        camera_sample = replace(
+            base.cameras[0].samples[0],
+            relative_path="videos/\ud800/front.mp4",
+        )
+        camera_evidence = replace(
+            base,
+            cameras=(
+                replace(base.cameras[0], samples=(camera_sample,)),
+            ),
+        )
+        machine_episode = replace(
+            base.machines[0].episodes[0],
+            relative_path="data/\udfff/episode.parquet",
+        )
+        machine_evidence = replace(
+            base,
+            machines=(
+                replace(base.machines[0], episodes=(machine_episode,)),
+            ),
+        )
+        traversal_episode = replace(
+            base.machines[0].episodes[0],
+            relative_path="data/../escape.parquet",
+        )
+        traversal_evidence = replace(
+            base,
+            machines=(
+                replace(base.machines[0], episodes=(traversal_episode,)),
+            ),
+        )
+
+        for source, evidence in (
+            ("camera surrogate", camera_evidence),
+            ("machine surrogate", machine_evidence),
+            ("machine traversal", traversal_evidence),
+        ):
+            with self.subTest(source=source):
+                transport = StubTransport(chat_payload=self.payload())
+                mapping, issue = self.create_openai_service(transport).map_dataset(
+                    evidence, self.profile()
+                )
+
+                self.assertIsNone(mapping)
+                self.assertEqual(issue.code, "DATASET_MAPPING_INVALID")
+                self.assertEqual((transport.chat_attempts, transport.web_attempts), (0, 0))
+
+    def test_map_dataset_accepts_normal_unicode_relative_paths(self) -> None:
+        evidence = self.evidence()
+        camera_sample = replace(
+            evidence.cameras[0].samples[0],
+            relative_path="视频/前视/片段.mp4",
+        )
+        machine_episode = replace(
+            evidence.machines[0].episodes[0],
+            relative_path="数据/首段/episode.parquet",
+        )
+        evidence = replace(
+            evidence,
+            cameras=(
+                replace(evidence.cameras[0], samples=(camera_sample,)),
+            ),
+            machines=(
+                replace(evidence.machines[0], episodes=(machine_episode,)),
+            ),
+        )
+        transport = StubTransport(chat_payload=self.payload())
+
+        mapping, issue = self.create_openai_service(transport).map_dataset(
+            evidence, self.profile()
+        )
+
+        self.assertIsNotNone(mapping)
+        self.assertIsNone(issue)
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
+
+    def test_map_dataset_contains_expected_errors_but_propagates_runtime_failures(self) -> None:
+        for error in (TypeError("prompt"), ValueError("prompt"), OverflowError("prompt"), RecursionError("prompt")):
+            transport = StubTransport()
+            with patch("robometanorm.vlm.build_mapping_prompt", side_effect=error):
+                mapping, issue = self.create_openai_service(transport).map_dataset(self.evidence(), self.profile())
+            self.assertIsNone(mapping)
+            self.assertEqual(issue.code, "DATASET_MAPPING_INVALID")
+            self.assertEqual(transport.chat_attempts, 0)
+        transport = StubTransport(chat_payload=self.payload())
+        with patch("robometanorm.vlm.parse_dataset_mapping", side_effect=ValueError("schema")):
+            mapping, issue = self.create_openai_service(transport).map_dataset(self.evidence(), self.profile())
+        self.assertIsNone(mapping)
+        self.assertEqual(issue.code, "DATASET_MAPPING_INVALID")
+        self.assertEqual(transport.chat_attempts, 1)
+        missing = StubTransport()
+        mapping, issue = self.create_openai_service(missing).map_dataset(self.evidence(), self.profile())
+        self.assertIsNone(mapping)
+        self.assertEqual(issue.code, "DATASET_MAPPING_INVALID")
+        self.assertEqual(missing.chat_attempts, 1)
+        for relative_path in ("/absolute/file", "C:/drive/file", "//unc/share", "a\\b", "a//b", "a/./b", "a/../b", "a\x80b"):
+            unsafe = self.evidence()
+            unsafe = replace(
+                unsafe,
+                cameras=(
+                    replace(
+                        unsafe.cameras[0],
+                        samples=(replace(unsafe.cameras[0].samples[0], relative_path=relative_path),),
+                    ),
+                ),
+            )
+            transport = StubTransport(chat_payload=self.payload())
+            mapping, issue = self.create_openai_service(transport).map_dataset(unsafe, self.profile())
+            self.assertIsNone(mapping)
+            self.assertEqual(issue.code, "DATASET_MAPPING_INVALID")
+            self.assertEqual(transport.chat_attempts, 0)
+        for error in (MemoryError("memory"), RuntimeError("bug")):
+            with patch("robometanorm.vlm.parse_dataset_mapping", side_effect=error):
+                with self.assertRaises(type(error)):
+                    self.create_openai_service(StubTransport(chat_payload=self.payload())).map_dataset(self.evidence(), self.profile())
 
 
 if __name__ == "__main__":
