@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import date, time, timedelta
 from decimal import Decimal
 import json
+import math
 from numbers import Number
 from pathlib import Path
 
@@ -14,7 +16,11 @@ import pyarrow.parquet as pq
 
 from robometanorm.models import (
     DatasetCandidate,
+    DatasetEvidence,
+    DatasetMapping,
     FeatureSchema,
+    GripperRange,
+    HardwareProfile,
     IdentityEvidence,
     Issue,
     MachineEvidence,
@@ -138,6 +144,324 @@ def collect_machine_evidence(
             )
         )
     return tuple(machines), tuple(issues)
+
+
+@dataclass
+class _MappedGripperStats:
+    minimum: float | None = None
+    maximum: float | None = None
+    finite_count: int = 0
+    nonfinite_count: int = 0
+
+    def observe(self, value: object) -> None:
+        finite_value = _finite_number(value)
+        if finite_value is None:
+            self.nonfinite_count += 1
+            return
+        self.finite_count += 1
+        if self.minimum is None or finite_value < self.minimum:
+            self.minimum = finite_value
+        if self.maximum is None or finite_value > self.maximum:
+            self.maximum = finite_value
+
+    def mark_unusable(self) -> None:
+        self.nonfinite_count += 1
+
+
+def collect_mapped_gripper_ranges(
+    candidate: DatasetCandidate,
+    evidence: DatasetEvidence,
+    profile: HardwareProfile,
+    mapping: DatasetMapping,
+) -> tuple[DatasetEvidence, tuple[Issue, ...]]:
+    """Collect ranges only for single-value grippers confirmed by ``mapping``."""
+    issues: list[Issue] = []
+    gripper_components = {
+        component.component_id: component
+        for component in profile.components
+        if component.kind in {"gripper_open", "gripper_open_scale"}
+    }
+    mapped_targets: dict[str, dict[int, str]] = {}
+
+    for assignment in mapping.machines:
+        for source_slice in assignment.slices:
+            component = gripper_components.get(source_slice.component_id)
+            if component is None:
+                continue
+            if not (
+                type(source_slice.start) is int
+                and type(source_slice.end) is int
+                and source_slice.start >= 0
+                and source_slice.end - source_slice.start == 1
+                and type(component.count) is int
+                and component.count == 1
+            ):
+                issues.append(
+                    Issue(
+                        code="MAPPED_GRIPPER_SLICE_INVALID",
+                        message="Mapped gripper must use one safe non-negative index",
+                        scope=f"machine.{assignment.source_feature}",
+                        evidence={
+                            "source_feature": _safe_issue_value(
+                                assignment.source_feature
+                            ),
+                            "component_id": _safe_issue_value(
+                                source_slice.component_id
+                            ),
+                            "start": _safe_issue_value(source_slice.start),
+                            "end": _safe_issue_value(source_slice.end),
+                        },
+                    )
+                )
+                continue
+            targets = mapped_targets.setdefault(assignment.source_feature, {})
+            targets.setdefault(source_slice.start, source_slice.component_id)
+
+    machine_features = {machine.schema.source_key for machine in evidence.machines}
+    readable_targets: dict[str, dict[int, str]] = {}
+    for feature, targets in mapped_targets.items():
+        if feature in machine_features:
+            readable_targets[feature] = targets
+            continue
+        for component_id in targets.values():
+            issues.append(
+                Issue(
+                    code="MAPPED_GRIPPER_SOURCE_MISSING",
+                    message="Mapped gripper source feature is absent from evidence",
+                    scope=f"machine.{feature}",
+                    evidence={
+                        "source_feature": _safe_issue_value(feature),
+                        "component_id": _safe_issue_value(component_id),
+                    },
+                )
+            )
+
+    if not readable_targets:
+        return evidence, tuple(issues)
+
+    stats = {
+        feature: {index: _MappedGripperStats() for index in targets}
+        for feature, targets in readable_targets.items()
+    }
+    parquet_issues_seen: set[tuple[str, str, str]] = set()
+    expected_widths: dict[str, int] = {}
+    for feature, feature_stats in stats.items():
+        for parquet_path in _representative_parquet_paths(candidate):
+            _collect_mapped_feature_ranges(
+                candidate,
+                parquet_path,
+                feature,
+                feature_stats,
+                expected_widths,
+                issues,
+                parquet_issues_seen,
+            )
+
+    machines = tuple(
+        replace(
+            machine,
+            gripper_ranges=tuple(
+                GripperRange(
+                    index=index,
+                    minimum=feature_stats[index].minimum,
+                    maximum=feature_stats[index].maximum,
+                    finite_count=feature_stats[index].finite_count,
+                    nonfinite_count=feature_stats[index].nonfinite_count,
+                )
+                for index in sorted(feature_stats)
+            ),
+        )
+        if (feature_stats := stats.get(machine.schema.source_key)) is not None
+        else machine
+        for machine in evidence.machines
+    )
+    return replace(evidence, machines=machines), tuple(issues)
+
+
+def _collect_mapped_feature_ranges(
+    candidate: DatasetCandidate,
+    parquet_path: Path,
+    feature: str,
+    stats: dict[int, _MappedGripperStats],
+    expected_widths: dict[str, int],
+    issues: list[Issue],
+    seen_issues: set[tuple[str, str, str]],
+) -> None:
+    relative_path = _relative_parquet_path(candidate, parquet_path)
+    try:
+        parquet_file = pq.ParquetFile(parquet_path)
+        schema_columns = tuple(parquet_file.schema_arrow.names)
+    except (
+        ValueError,
+        OSError,
+        pa.ArrowCapacityError,
+        pa.ArrowNotImplementedError,
+    ) as error:
+        _mark_mapped_targets_unusable(stats)
+        _append_parquet_issue(
+            issues,
+            seen_issues,
+            code="PARQUET_READ_FAILED",
+            message="Mapped gripper feature could not be read",
+            relative_path=relative_path,
+            feature=feature,
+            error_type=type(error).__name__,
+        )
+        return
+
+    column_count = schema_columns.count(feature)
+    if column_count == 0:
+        _mark_mapped_targets_unusable(stats)
+        _append_parquet_issue(
+            issues,
+            seen_issues,
+            code="PARQUET_COLUMN_MISSING",
+            message="Mapped gripper feature is missing from Parquet schema",
+            relative_path=relative_path,
+            feature=feature,
+        )
+        return
+    if column_count != 1:
+        _mark_mapped_targets_unusable(stats)
+        _append_parquet_issue(
+            issues,
+            seen_issues,
+            code="PARQUET_COLUMN_AMBIGUOUS",
+            message="Mapped gripper feature is ambiguous in Parquet schema",
+            relative_path=relative_path,
+            feature=feature,
+        )
+        return
+
+    ambiguous_projection = False
+    read_error: Exception | None = None
+    try:
+        for batch in parquet_file.iter_batches(columns=[feature], batch_size=512):
+            if batch.num_columns != 1 or tuple(batch.schema.names) != (feature,):
+                ambiguous_projection = True
+                continue
+            for row in batch.column(0).to_pylist():
+                width = _parquet_value_width(row)
+                if width is not None:
+                    expected_width = expected_widths.setdefault(feature, width)
+                    if width != expected_width:
+                        _append_parquet_issue(
+                            issues,
+                            seen_issues,
+                            code="PARQUET_VECTOR_LENGTH_INCONSISTENT",
+                            message="Mapped gripper source vector length is inconsistent",
+                            relative_path=relative_path,
+                            feature=feature,
+                            length=width,
+                        )
+                _observe_mapped_row(
+                    row,
+                    stats,
+                    relative_path,
+                    feature,
+                    issues,
+                    seen_issues,
+                )
+    except (
+        ValueError,
+        OSError,
+        pa.ArrowCapacityError,
+        pa.ArrowNotImplementedError,
+    ) as error:
+        read_error = error
+
+    if ambiguous_projection:
+        _mark_mapped_targets_unusable(stats)
+        _append_parquet_issue(
+            issues,
+            seen_issues,
+            code="PARQUET_COLUMN_AMBIGUOUS",
+            message="Parquet projection did not resolve to one exact top-level column",
+            relative_path=relative_path,
+            feature=feature,
+        )
+    if read_error is not None:
+        _mark_mapped_targets_unusable(stats)
+        _append_parquet_issue(
+            issues,
+            seen_issues,
+            code="PARQUET_READ_FAILED",
+            message="Mapped gripper feature could not be read",
+            relative_path=relative_path,
+            feature=feature,
+            error_type=type(read_error).__name__,
+        )
+
+
+def _observe_mapped_row(
+    row: object,
+    stats: dict[int, _MappedGripperStats],
+    relative_path: str,
+    feature: str,
+    issues: list[Issue],
+    seen_issues: set[tuple[str, str, str]],
+) -> None:
+    if row is None:
+        _mark_mapped_targets_unusable(stats)
+        return
+    if isinstance(row, (list, tuple)):
+        for index, target_stats in stats.items():
+            if index >= len(row):
+                target_stats.mark_unusable()
+                _append_parquet_issue(
+                    issues,
+                    seen_issues,
+                    code="PARQUET_VECTOR_LENGTH_INCONSISTENT",
+                    message="Mapped gripper index is outside the source vector",
+                    relative_path=relative_path,
+                    feature=feature,
+                    length=len(row),
+                )
+            else:
+                target_stats.observe(row[index])
+        return
+
+    for index, target_stats in stats.items():
+        if index == 0:
+            target_stats.observe(row)
+        else:
+            target_stats.mark_unusable()
+            _append_parquet_issue(
+                issues,
+                seen_issues,
+                code="PARQUET_VECTOR_LENGTH_INCONSISTENT",
+                message="Mapped gripper index is outside a scalar source value",
+                relative_path=relative_path,
+                feature=feature,
+                length=1,
+            )
+
+
+def _mark_mapped_targets_unusable(
+    stats: dict[int, _MappedGripperStats],
+) -> None:
+    for target_stats in stats.values():
+        target_stats.mark_unusable()
+
+
+def _finite_number(value: object) -> float | None:
+    if type(value) not in {int, float}:
+        return None
+    try:
+        finite_value = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return finite_value if math.isfinite(finite_value) else None
+
+
+def _safe_issue_value(value: object) -> object:
+    if value is None or type(value) in {bool, int}:
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    if type(value) is str:
+        return value
+    return {"value_type": type(value).__name__}
 
 
 def _machine_feature_schemas(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal
 import hashlib
 import json
 import sys
@@ -18,10 +19,25 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.evidence import (
     collect_identity_evidence,
+    collect_mapped_gripper_ranges,
     collect_machine_evidence,
     read_info,
 )
-from robometanorm.models import DatasetCandidate, Issue, LayoutType
+from robometanorm.models import (
+    DatasetCandidate,
+    DatasetEvidence,
+    DatasetMapping,
+    FeatureSchema,
+    HardwareProfile,
+    IdentityEvidence,
+    Issue,
+    LayoutType,
+    MachineAssignment,
+    MachineComponent,
+    MachineEvidence,
+    MachineSlice,
+    RobotIdentityFact,
+)
 
 
 class IdentityEvidenceTest(unittest.TestCase):
@@ -892,6 +908,610 @@ class ParquetEvidenceTest(unittest.TestCase):
         )
         serialized = json.dumps(issue.evidence, ensure_ascii=False)
         self.assertNotIn(str(self.dataset_path), serialized)
+
+
+class MappedGripperRangeTest(unittest.TestCase):
+    """Verify only mapped single-dimension grippers expose bounded ranges."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.dataset_path = Path(self.temporary_directory.name) / "acme_dataset"
+        self.meta_path = self.dataset_path / "meta"
+        self.data_path = self.dataset_path / "data"
+        self.meta_path.mkdir(parents=True)
+        self.data_path.mkdir()
+        self.candidate = self._candidate(self.dataset_path)
+
+    def test_collects_opaque_mapped_range_from_only_first_and_last(self) -> None:
+        first = self._write_parquet(
+            "a/episode_000000.parquet",
+            {"action": [[100.0, 0.2], [101.0, 0.4]]},
+        )
+        middle = self._write_parquet(
+            "m/episode_000001.parquet",
+            {"action": [[102.0, -999.0], [103.0, 999.0]]},
+        )
+        last = self._write_parquet(
+            "z/episode_000002.parquet",
+            {"action": [[104.0, 0.8], [105.0, 1.2]]},
+        )
+        source_info = self._source_info(
+            "action", shape=[2], names=["opaque_alpha", "opaque_beta"]
+        )
+        evidence = self._structural_evidence(source_info)
+        original = deepcopy(evidence)
+        self.assertEqual(evidence.machines[0].gripper_ranges, ())
+        profile = self._profile(
+            self._component("arm", "arm_joint"),
+            self._component("finger", "gripper_open"),
+        )
+        mapping = self._mapping(
+            "action",
+            self._slice(0, "arm"),
+            self._slice(1, "finger"),
+        )
+
+        collected, issues = collect_mapped_gripper_ranges(
+            self.candidate, evidence, profile, mapping
+        )
+
+        self.assertEqual(issues, ())
+        self.assertEqual(evidence, original)
+        self.assertEqual(evidence.machines[0].gripper_ranges, ())
+        self.assertEqual(
+            collected.machines[0].gripper_ranges,
+            (
+                self._range(
+                    index=1,
+                    minimum=0.2,
+                    maximum=1.2,
+                    finite_count=4,
+                    nonfinite_count=0,
+                ),
+            ),
+        )
+        selected_paths = {
+            item.relative_path for item in collected.machines[0].episodes
+        }
+        self.assertIn(first.relative_to(self.dataset_path).as_posix(), selected_paths)
+        self.assertIn(last.relative_to(self.dataset_path).as_posix(), selected_paths)
+        self.assertNotIn(
+            middle.relative_to(self.dataset_path).as_posix(), selected_paths
+        )
+
+    def test_supports_scale_deduplicates_sorts_and_reads_feature_once(self) -> None:
+        parquet_path = self._write_parquet(
+            "episode.parquet",
+            {"action": [[4.0, 100.0, 0.1], [2.0, 101.0, 0.9]]},
+        )
+        source_info = self._source_info("action", shape=[3], names=["x", "y", "z"])
+        evidence = self._structural_evidence(source_info)
+        profile = self._profile(
+            self._component("scale", "gripper_open_scale"),
+            self._component("open", "gripper_open"),
+        )
+        mapping = DatasetMapping(
+            cameras=(),
+            machines=(
+                self._assignment(
+                    "action", self._slice(2, "scale"), self._slice(0, "open")
+                ),
+                self._assignment("action", self._slice(2, "scale")),
+            ),
+        )
+        real_parquet_file = pq.ParquetFile(parquet_path)
+        constructor_calls: list[Path] = []
+        batch_calls: list[tuple[list[str], int]] = []
+
+        class TrackingParquetFile:
+            schema_arrow = real_parquet_file.schema_arrow
+
+            def iter_batches(
+                self, *, columns: list[str], batch_size: int
+            ) -> object:
+                batch_calls.append((columns, batch_size))
+                return real_parquet_file.iter_batches(
+                    columns=columns, batch_size=batch_size
+                )
+
+        def open_tracking(path: Path) -> TrackingParquetFile:
+            constructor_calls.append(path)
+            return TrackingParquetFile()
+
+        with patch(
+            "robometanorm.evidence.pq.ParquetFile", side_effect=open_tracking
+        ):
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        self.assertEqual(issues, ())
+        self.assertEqual(constructor_calls, [parquet_path])
+        self.assertEqual(batch_calls, [(["action"], 512)])
+        self.assertEqual(
+            collected.machines[0].gripper_ranges,
+            (
+                self._range(0, 2.0, 4.0, 2, 0),
+                self._range(2, 0.1, 0.9, 2, 0),
+            ),
+        )
+
+    def test_non_gripper_unknown_and_absent_mappings_do_not_open_parquet(self) -> None:
+        self._write_parquet("episode.parquet", {"action": [[1.0]]})
+        source_info = self._source_info(
+            "action", shape=[1], names=["definitely_gripper_open"]
+        )
+        evidence = self._structural_evidence(source_info)
+        cases = (
+            (
+                self._profile(self._component("arm", "arm_joint")),
+                self._mapping("action", self._slice(0, "arm")),
+            ),
+            (
+                self._profile(self._component("grip", "gripper_open")),
+                self._mapping("action", self._slice(0, "unknown-component")),
+            ),
+            (
+                self._profile(self._component("grip", "gripper_open")),
+                DatasetMapping(cameras=(), machines=()),
+            ),
+        )
+
+        for profile, mapping in cases:
+            with self.subTest(profile=profile, mapping=mapping):
+                with patch("robometanorm.evidence.pq.ParquetFile") as parquet_file:
+                    collected, issues = collect_mapped_gripper_ranges(
+                        self.candidate, evidence, profile, mapping
+                    )
+
+                parquet_file.assert_not_called()
+                self.assertIs(collected, evidence)
+                self.assertEqual(issues, ())
+
+    def test_rejects_all_non_builtin_finite_values(self) -> None:
+        parquet_path = self.data_path / "episode.parquet"
+        parquet_path.write_bytes(b"reader is replaced by a deterministic fake")
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("action", self._slice(0, "grip"))
+        values = (
+            [float("nan")],
+            [float("inf")],
+            [float("-inf")],
+            [True],
+            [None],
+            ["0.5"],
+            [Decimal("0.5")],
+        )
+
+        with patch(
+            "robometanorm.evidence.pq.ParquetFile",
+            return_value=self._fake_parquet_file("action", values),
+        ):
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        self.assertEqual(issues, ())
+        self.assertEqual(
+            collected.machines[0].gripper_ranges,
+            (self._range(0, None, None, 0, len(values)),),
+        )
+
+    def test_out_of_bounds_and_null_rows_are_unusable_and_reviewable(self) -> None:
+        self._write_parquet(
+            "episode.parquet", {"action": [[1.0, 2.0], [3.0], None, [4.0]]}
+        )
+        source_info = self._source_info("action", shape=[2], names=["x", "y"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("action", self._slice(1, "grip"))
+
+        collected, issues = collect_mapped_gripper_ranges(
+            self.candidate, evidence, profile, mapping
+        )
+
+        self.assertEqual(
+            collected.machines[0].gripper_ranges,
+            (self._range(1, 2.0, 2.0, 1, 3),),
+        )
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["PARQUET_VECTOR_LENGTH_INCONSISTENT"],
+        )
+        self._assert_safe_parquet_issue(issues[0])
+
+    def test_scalar_rows_are_supported_only_for_index_zero(self) -> None:
+        self._write_parquet("episode.parquet", {"action": [1.0, None, 2.5]})
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("action", self._slice(0, "grip"))
+
+        collected, issues = collect_mapped_gripper_ranges(
+            self.candidate, evidence, profile, mapping
+        )
+
+        self.assertEqual(issues, ())
+        self.assertEqual(
+            collected.machines[0].gripper_ranges,
+            (self._range(0, 1.0, 2.5, 2, 1),),
+        )
+
+    def test_invalid_gripper_slices_are_safe_and_never_read(self) -> None:
+        self._write_parquet("episode.parquet", {"action": [[1.0, 2.0]]})
+        source_info = self._source_info("action", shape=[2], names=["x", "y"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(
+            self._component("bool-start", "gripper_open"),
+            self._component("bool-end", "gripper_open"),
+            self._component("negative", "gripper_open"),
+            self._component("wide", "gripper_open"),
+            self._component("count-two", "gripper_open", count=2),
+        )
+        invalid_slices = (
+            MachineSlice(True, 1, "bool-start", ()),
+            MachineSlice(0, True, "bool-end", ()),
+            MachineSlice(-1, 0, "negative", ()),
+            MachineSlice(0, 2, "wide", ()),
+            MachineSlice(1, 2, "count-two", ()),
+        )
+        mapping = self._mapping("action", *invalid_slices)
+
+        with patch("robometanorm.evidence.pq.ParquetFile") as parquet_file:
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        parquet_file.assert_not_called()
+        self.assertIs(collected, evidence)
+        self.assertEqual(
+            [issue.code for issue in issues],
+            ["MAPPED_GRIPPER_SLICE_INVALID"] * len(invalid_slices),
+        )
+        for issue, source_slice in zip(issues, invalid_slices):
+            self.assertEqual(issue.severity, "review")
+            self.assertEqual(
+                set(issue.evidence),
+                {"source_feature", "component_id", "start", "end"},
+            )
+            self.assertEqual(issue.evidence["source_feature"], "action")
+            self.assertEqual(issue.evidence["component_id"], source_slice.component_id)
+            self.assertEqual(issue.evidence["start"], source_slice.start)
+            self.assertEqual(issue.evidence["end"], source_slice.end)
+            json.dumps(issue.evidence)
+
+    def test_missing_mapped_source_is_reviewed_without_reading(self) -> None:
+        self._write_parquet("episode.parquet", {"action": [[1.0]]})
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("ghost.feature", self._slice(0, "grip"))
+
+        with patch("robometanorm.evidence.pq.ParquetFile") as parquet_file:
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        parquet_file.assert_not_called()
+        self.assertIs(collected, evidence)
+        self.assertEqual(
+            [issue.code for issue in issues], ["MAPPED_GRIPPER_SOURCE_MISSING"]
+        )
+        self.assertEqual(
+            issues[0].evidence,
+            {"source_feature": "ghost.feature", "component_id": "grip"},
+        )
+
+    def test_missing_corrupt_and_ambiguous_columns_mark_ranges_unsafe(self) -> None:
+        cases: list[tuple[str, DatasetCandidate, dict[str, object], str, str]] = []
+
+        missing_candidate = self._case_candidate("missing")
+        self._write_candidate_parquet(
+            missing_candidate, "episode.parquet", {"other": [[1.0]]}
+        )
+        cases.append(
+            (
+                "missing",
+                missing_candidate,
+                self._source_info("action", shape=[1], names=["opaque"]),
+                "action",
+                "PARQUET_COLUMN_MISSING",
+            )
+        )
+
+        corrupt_candidate = self._case_candidate("corrupt")
+        assert corrupt_candidate.data_path is not None
+        (corrupt_candidate.data_path / "episode.parquet").write_bytes(
+            b"sensitive corrupt parquet payload"
+        )
+        cases.append(
+            (
+                "corrupt",
+                corrupt_candidate,
+                self._source_info("action", shape=[1], names=["opaque"]),
+                "action",
+                "PARQUET_READ_FAILED",
+            )
+        )
+
+        ambiguous_candidate = self._case_candidate("ambiguous")
+        nested = pa.array(
+            [{"state": [1.0]}],
+            type=pa.struct([("state", pa.list_(pa.float64()))]),
+        )
+        self._write_candidate_parquet(
+            ambiguous_candidate,
+            "episode.parquet",
+            {"observation": nested, "observation.state": [[2.0]]},
+        )
+        cases.append(
+            (
+                "ambiguous",
+                ambiguous_candidate,
+                self._source_info(
+                    "observation.state", shape=[1], names=["opaque"]
+                ),
+                "observation.state",
+                "PARQUET_COLUMN_AMBIGUOUS",
+            )
+        )
+
+        profile = self._profile(self._component("grip", "gripper_open"))
+        for name, candidate, source_info, feature, issue_code in cases:
+            with self.subTest(name=name):
+                evidence = self._direct_evidence(source_info, feature, candidate)
+                mapping = self._mapping(feature, self._slice(0, "grip"))
+
+                collected, issues = collect_mapped_gripper_ranges(
+                    candidate, evidence, profile, mapping
+                )
+
+                gripper_range = collected.machines[0].gripper_ranges[0]
+                self.assertEqual(gripper_range.finite_count, 0)
+                self.assertGreater(gripper_range.nonfinite_count, 0)
+                self.assertIsNone(gripper_range.minimum)
+                self.assertIsNone(gripper_range.maximum)
+                self.assertIn(issue_code, [issue.code for issue in issues])
+                issue = next(item for item in issues if item.code == issue_code)
+                self._assert_safe_parquet_issue(issue, candidate=candidate)
+                self.assertNotIn("sensitive", repr(issue.evidence))
+
+    def test_memory_error_propagates(self) -> None:
+        (self.data_path / "episode.parquet").write_bytes(b"placeholder")
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("action", self._slice(0, "grip"))
+
+        with patch(
+            "robometanorm.evidence.pq.ParquetFile",
+            side_effect=MemoryError("out of memory"),
+        ):
+            with self.assertRaises(MemoryError):
+                collect_mapped_gripper_ranges(
+                    self.candidate, evidence, profile, mapping
+                )
+
+    def test_collection_preserves_bytes_inputs_and_creates_no_cache(self) -> None:
+        paths = (
+            self._write_parquet("a/episode.parquet", {"action": [[0.1]]}),
+            self._write_parquet("m/episode.parquet", {"action": [[-99.0]]}),
+            self._write_parquet("z/episode.parquet", {"action": [[0.9]]}),
+        )
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        original_info = deepcopy(source_info)
+        original_evidence = deepcopy(evidence)
+        hashes_before = {
+            path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths
+        }
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("action", self._slice(0, "grip"))
+
+        collect_mapped_gripper_ranges(self.candidate, evidence, profile, mapping)
+
+        self.assertEqual(source_info, original_info)
+        self.assertEqual(evidence, original_evidence)
+        self.assertEqual(
+            {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths},
+            hashes_before,
+        )
+        self.assertEqual(list(self.dataset_path.rglob(".robometanorm_cache")), [])
+
+    def _candidate(self, dataset_path: Path) -> DatasetCandidate:
+        return DatasetCandidate(
+            dataset_name=dataset_path.name,
+            task_name=None,
+            source_path=dataset_path,
+            layout_type=LayoutType.FLAT,
+            info_path=dataset_path / "meta" / "info.json",
+            data_path=dataset_path / "data",
+            video_path=None,
+            depth_path=None,
+        )
+
+    def _case_candidate(self, name: str) -> DatasetCandidate:
+        dataset_path = self.dataset_path / name
+        (dataset_path / "meta").mkdir(parents=True)
+        (dataset_path / "data").mkdir()
+        return self._candidate(dataset_path)
+
+    def _write_parquet(
+        self, relative_path: str, columns: dict[str, object]
+    ) -> Path:
+        return self._write_candidate_parquet(self.candidate, relative_path, columns)
+
+    def _write_candidate_parquet(
+        self,
+        candidate: DatasetCandidate,
+        relative_path: str,
+        columns: dict[str, object],
+    ) -> Path:
+        assert candidate.data_path is not None
+        parquet_path = candidate.data_path / relative_path
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.table(columns), parquet_path)
+        return parquet_path
+
+    def _source_info(
+        self, feature: str, *, shape: list[int], names: list[str]
+    ) -> dict[str, object]:
+        return {
+            "features": {
+                feature: {"dtype": "float64", "shape": shape, "names": names}
+            }
+        }
+
+    def _structural_evidence(
+        self, source_info: dict[str, object]
+    ) -> DatasetEvidence:
+        machines, issues = collect_machine_evidence(self.candidate, source_info)
+        self.assertEqual(issues, ())
+        return DatasetEvidence(
+            candidate=self.candidate,
+            source_info=source_info,
+            identity=self._identity_evidence(),
+            cameras=(),
+            machines=machines,
+        )
+
+    def _direct_evidence(
+        self,
+        source_info: dict[str, object],
+        feature: str,
+        candidate: DatasetCandidate | None = None,
+    ) -> DatasetEvidence:
+        selected_candidate = candidate or self.candidate
+        feature_data = source_info["features"]
+        assert isinstance(feature_data, dict)
+        raw_schema = feature_data[feature]
+        assert isinstance(raw_schema, dict)
+        machine = MachineEvidence(
+            schema=FeatureSchema(
+                source_key=feature,
+                dtype=raw_schema.get("dtype"),
+                shape=tuple(raw_schema.get("shape", ())),
+                names=tuple(raw_schema.get("names", ())),
+                fps=None,
+                codec=None,
+            ),
+            episodes=(),
+            episode_lengths=(),
+            gripper_ranges=(),
+        )
+        return DatasetEvidence(
+            candidate=selected_candidate,
+            source_info=source_info,
+            identity=self._identity_evidence(),
+            cameras=(),
+            machines=(machine,),
+        )
+
+    @staticmethod
+    def _identity_evidence() -> IdentityEvidence:
+        return IdentityEvidence("missing", None, "missing", None, "missing", ())
+
+    def _profile(self, *components: MachineComponent) -> HardwareProfile:
+        identity = RobotIdentityFact(
+            manufacturer="Acme Robotics",
+            model="TestBot",
+            confidence=1.0,
+            ambiguous=False,
+            reason="fictional fixture",
+            local_evidence_status="consistent",
+            source_ids=(),
+            assessments=(),
+        )
+        return HardwareProfile(identity, (), (), components)
+
+    @staticmethod
+    def _component(
+        component_id: str, kind: str, *, count: int = 1
+    ) -> MachineComponent:
+        return MachineComponent(
+            component_id=component_id,
+            kind=kind,
+            side=None,
+            count=count,
+            element_order=(),
+            representation="scalar",
+            unit="normalized",
+            open_range=None,
+            open_direction=None,
+            confidence=1.0,
+            ambiguous=False,
+            reason="fictional fixture",
+            source_ids=(),
+        )
+
+    @staticmethod
+    def _slice(index: int, component_id: str) -> MachineSlice:
+        return MachineSlice(index, index + 1, component_id, ())
+
+    @staticmethod
+    def _assignment(
+        feature: str, *slices: MachineSlice
+    ) -> MachineAssignment:
+        return MachineAssignment(feature, slices, 0.01, True, "mapping fixture")
+
+    def _mapping(self, feature: str, *slices: MachineSlice) -> DatasetMapping:
+        return DatasetMapping(cameras=(), machines=(self._assignment(feature, *slices),))
+
+    @staticmethod
+    def _range(
+        index: int,
+        minimum: float | None,
+        maximum: float | None,
+        finite_count: int,
+        nonfinite_count: int,
+    ) -> object:
+        from robometanorm.models import GripperRange
+
+        return GripperRange(index, minimum, maximum, finite_count, nonfinite_count)
+
+    @staticmethod
+    def _fake_parquet_file(feature: str, values: tuple[object, ...]) -> object:
+        class Schema:
+            names = (feature,)
+
+        class Column:
+            def to_pylist(self) -> list[object]:
+                return list(values)
+
+        class Batch:
+            num_columns = 1
+            schema = Schema()
+
+            def column(self, index: int) -> Column:
+                if index != 0:
+                    raise IndexError(index)
+                return Column()
+
+        class ParquetFile:
+            schema_arrow = Schema()
+
+            def iter_batches(
+                self, *, columns: list[str], batch_size: int
+            ) -> object:
+                self.columns = columns
+                self.batch_size = batch_size
+                yield Batch()
+
+        return ParquetFile()
+
+    def _assert_safe_parquet_issue(
+        self, issue: Issue, *, candidate: DatasetCandidate | None = None
+    ) -> None:
+        self.assertLessEqual(
+            set(issue.evidence),
+            {"relative_path", "feature", "length", "error_type"},
+        )
+        serialized = json.dumps(issue.evidence, ensure_ascii=False)
+        selected_candidate = candidate or self.candidate
+        self.assertNotIn(str(selected_candidate.source_path), serialized)
 
 
 if __name__ == "__main__":
