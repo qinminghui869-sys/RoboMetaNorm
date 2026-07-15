@@ -183,6 +183,7 @@ class VlmTransportTest(unittest.TestCase):
             "https://example.test/v1\x00segment",
             "https://example.test/v1\x1fsegment",
             "https://example.test/v1\u2003segment",
+            "https://example.test\\evil/v1",
             "https://[::1/v1",
             "https://:443/v1",
             "https://example.test/v1?",
@@ -404,18 +405,20 @@ class VlmTransportTest(unittest.TestCase):
             self.assertNotIn(str(path), serialized_body)
 
     def test_image_read_failure_is_local_safe_and_does_not_send_http(self) -> None:
-        transport = self.make_transport()
-        image_path = Path("/private/dataset/frame.png")
-        with (
-            patch(
-                "pathlib.Path.read_bytes",
-                side_effect=OSError("private filesystem detail"),
-            ),
-            patch("robometanorm.vlm.request.urlopen") as urlopen,
-        ):
-            payload, issue = transport.request_json(
-                "private-system", "private-user", (image_path,)
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "frame.png"
+            image_path.write_bytes(b"fixture image")
+            transport = self.make_transport()
+            with (
+                patch(
+                    "robometanorm.vlm.os.open",
+                    side_effect=OSError("private filesystem detail"),
+                ),
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                payload, issue = transport.request_json(
+                    "private-system", "private-user", (image_path,)
+                )
 
         self.assertIsNone(payload)
         self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
@@ -425,6 +428,46 @@ class VlmTransportTest(unittest.TestCase):
         self.assertNotIn("private", issue.message.lower())
         self.assertNotIn(str(image_path), repr(issue))
         urlopen.assert_not_called()
+
+    def test_final_and_parent_symlinks_are_rejected_before_content_or_http(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target_directory = root / "target-directory"
+            target_directory.mkdir()
+            target = target_directory / "secret-target.png"
+            secret_content = b"never-upload-this-symlink-target"
+            target.write_bytes(secret_content)
+
+            final_link = root / "final-link.png"
+            final_link.symlink_to(target)
+            parent_link = root / "parent-link"
+            parent_link.symlink_to(target_directory, target_is_directory=True)
+            image_paths = (final_link, parent_link / target.name)
+
+            for image_path in image_paths:
+                with self.subTest(image_path=image_path.name):
+                    transport = self.make_transport()
+                    with (
+                        patch(
+                            "robometanorm.vlm.base64.b64encode",
+                            wraps=base64.b64encode,
+                        ) as encode,
+                        patch("robometanorm.vlm.request.urlopen") as urlopen,
+                    ):
+                        payload, issue = transport.request_json(
+                            "private-system", "private-user", (image_path,)
+                        )
+
+                    self.assertIsNone(payload)
+                    self.assertEqual(issue.code, "VLM_IMAGE_READ_FAILED")
+                    self.assertEqual(set(issue.evidence), {"file_name", "error_type"})
+                    self.assertEqual(issue.evidence["file_name"], image_path.name)
+                    self.assertIsInstance(issue.evidence["error_type"], str)
+                    self.assertNotIn(str(image_path), repr(issue))
+                    self.assertNotIn(str(target), repr(issue))
+                    self.assertNotIn(secret_content.decode("ascii"), repr(issue))
+                    encode.assert_not_called()
+                    urlopen.assert_not_called()
 
     def test_unknown_image_extension_and_empty_image_are_not_uploaded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -451,13 +494,16 @@ class VlmTransportTest(unittest.TestCase):
                     urlopen.assert_not_called()
 
     def test_image_read_memory_error_propagates_without_http(self) -> None:
-        transport = self.make_transport()
-        with (
-            patch("pathlib.Path.read_bytes", side_effect=MemoryError("memory")),
-            patch("robometanorm.vlm.request.urlopen") as urlopen,
-        ):
-            with self.assertRaises(MemoryError):
-                transport.request_json("system", "user", (Path("frame.png"),))
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "frame.png"
+            image_path.write_bytes(b"fixture image")
+            transport = self.make_transport()
+            with (
+                patch("robometanorm.vlm.os.open", side_effect=MemoryError("memory")),
+                patch("robometanorm.vlm.request.urlopen") as urlopen,
+            ):
+                with self.assertRaises(MemoryError):
+                    transport.request_json("system", "user", (image_path,))
         urlopen.assert_not_called()
 
     def test_web_request_uses_responses_web_search_and_nested_output_text(self) -> None:
@@ -538,6 +584,65 @@ class VlmTransportTest(unittest.TestCase):
                 self.assertEqual(issue.scope, "vlm")
                 self.assertEqual(attempts, 1)
                 json.dumps(issue.evidence, allow_nan=False)
+
+    def test_chat_rejects_duplicate_keys_in_outer_and_model_json(self) -> None:
+        outer_bodies = (
+            b'{"choices":[],"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}',
+            b'{"choices":[{"message":{"content":"{\\"ignored\\":true}","content":"{\\"ok\\":true}"}}]}',
+        )
+        for raw in outer_bodies:
+            with self.subTest(layer="outer", raw=raw):
+                transport = self.make_transport(max_retries=3)
+                with patch(
+                    "robometanorm.vlm.request.urlopen",
+                    return_value=_HttpResponse(raw=raw),
+                ) as urlopen:
+                    payload, issue = transport.request_json("system", "user", ())
+                self.assertIsNone(payload)
+                self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
+                self.assertEqual(urlopen.call_count, 1)
+
+        for content in (
+            '{"value":1,"value":2}',
+            '{"nested":{"value":1,"value":2}}',
+        ):
+            with self.subTest(layer="model", content=content):
+                payload, issue, attempts = self.request_chat_content(content)
+                self.assertIsNone(payload)
+                self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
+                self.assertEqual(attempts, 1)
+
+    def test_responses_rejects_duplicate_keys_in_outer_and_model_json(self) -> None:
+        outer_bodies = (
+            b'{"output":[],"output":[{"content":[{"type":"output_text","text":"{\\"ok\\":true}"}]}]}',
+            b'{"output":[{"content":[{"type":"output_text","text":"{\\"ignored\\":true}","text":"{\\"ok\\":true}"}]}]}',
+        )
+        for raw in outer_bodies:
+            with self.subTest(layer="outer", raw=raw):
+                transport = self.make_transport(max_retries=3)
+                with patch(
+                    "robometanorm.vlm.request.urlopen",
+                    return_value=_HttpResponse(raw=raw),
+                ) as urlopen:
+                    payload, issue = transport.request_web_json("system", "user")
+                self.assertIsNone(payload)
+                self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
+                self.assertEqual(urlopen.call_count, 1)
+
+        for content in (
+            '{"value":1,"value":2}',
+            '{"nested":{"value":1,"value":2}}',
+        ):
+            with self.subTest(layer="model", content=content):
+                transport = self.make_transport(max_retries=3)
+                with patch(
+                    "robometanorm.vlm.request.urlopen",
+                    return_value=_responses_response(content),
+                ) as urlopen:
+                    payload, issue = transport.request_web_json("system", "user")
+                self.assertIsNone(payload)
+                self.assertEqual(issue.code, "VLM_RESPONSE_INVALID")
+                self.assertEqual(urlopen.call_count, 1)
 
     def test_outer_response_requires_utf8_strict_json_object(self) -> None:
         invalid_raw_values: tuple[bytes | object, ...] = (

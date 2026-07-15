@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from http.client import IncompleteRead
 import json
 import math
 import os
 from pathlib import Path
+import stat
 import time
 from urllib import error, request
 from urllib.parse import urlsplit
@@ -57,6 +59,60 @@ def _issue(code: str, evidence: Mapping[str, object] | None = None) -> Issue:
     )
 
 
+def _close_file_descriptor(file_descriptor: int) -> None:
+    try:
+        os.close(file_descriptor)
+    except OSError:
+        pass
+
+
+def _read_image_bytes_safely(image_path: Path) -> bytes:
+    try:
+        directory_flags = (
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    except AttributeError as unsupported_error:
+        raise OSError("secure image reads are unavailable") from unsupported_error
+
+    path_parts = image_path.parts
+    if image_path.is_absolute():
+        starting_directory = os.sep
+        components = path_parts[1:]
+    else:
+        starting_directory = "."
+        components = path_parts
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise OSError("unsafe image path")
+
+    with ExitStack() as descriptors:
+        directory_descriptor = os.open(starting_directory, directory_flags)
+        descriptors.callback(_close_file_descriptor, directory_descriptor)
+        for component in components[:-1]:
+            directory_descriptor = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_descriptor,
+            )
+            descriptors.callback(_close_file_descriptor, directory_descriptor)
+
+        file_descriptor = os.open(
+            components[-1],
+            file_flags,
+            dir_fd=directory_descriptor,
+        )
+        descriptors.callback(_close_file_descriptor, file_descriptor)
+        if not stat.S_ISREG(os.fstat(file_descriptor).st_mode):
+            raise OSError("image path is not a regular file")
+
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+
 def _credential_is_usable(value: str) -> bool:
     return bool(value.strip()) and "\r" not in value and "\n" not in value
 
@@ -75,7 +131,7 @@ def _normalize_base_url(value: object) -> str:
         or ord(character) < 32
         or 127 <= ord(character) <= 159
         for character in value
-    ):
+    ) or "\\" in value:
         raise ValueError(_BASE_URL_ERROR)
 
     normalized = value.rstrip("/")
@@ -138,6 +194,15 @@ def _reject_json_constant(value: str) -> object:
     raise _InvalidResponse("non-standard JSON constant")
 
 
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise _InvalidResponse("duplicate JSON object key")
+        parsed[key] = value
+    return parsed
+
+
 def _require_finite_json(value: object) -> None:
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -157,6 +222,7 @@ def _strict_json_object(text: str) -> dict[str, object]:
         text,
         parse_constant=_reject_json_constant,
         parse_float=_strict_float,
+        object_pairs_hook=_unique_json_object,
     )
     _require_finite_json(parsed)
     if not isinstance(parsed, dict):
@@ -274,7 +340,7 @@ class OpenAICompatibleTransport:
             if mime_type is None:
                 return None, self._image_issue(image_path, "UnsupportedImageType")
             try:
-                image_bytes = image_path.read_bytes()
+                image_bytes = _read_image_bytes_safely(image_path)
             except OSError as image_error:
                 return None, self._image_issue(
                     image_path, type(image_error).__name__
