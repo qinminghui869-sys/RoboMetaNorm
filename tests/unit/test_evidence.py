@@ -1183,6 +1183,44 @@ class MappedGripperRangeTest(unittest.TestCase):
             self.assertEqual(issue.evidence["end"], source_slice.end)
             json.dumps(issue.evidence)
 
+    def test_invalid_huge_integer_slice_bounds_remain_json_safe(self) -> None:
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        huge_integer = 10**5_000
+        mapping = self._mapping(
+            "action", MachineSlice(huge_integer, huge_integer, "grip", ())
+        )
+
+        with patch("robometanorm.evidence.pq.ParquetFile") as parquet_file:
+            collected, issues = collect_mapped_gripper_ranges(
+                self.candidate, evidence, profile, mapping
+            )
+
+        parquet_file.assert_not_called()
+        self.assertIs(collected, evidence)
+        self.assertEqual(
+            [issue.code for issue in issues], ["MAPPED_GRIPPER_SLICE_INVALID"]
+        )
+        json.dumps(issues[0].evidence)
+        self.assertEqual(issues[0].evidence["start"], {"value_type": "int"})
+        self.assertEqual(issues[0].evidence["end"], {"value_type": "int"})
+
+    def test_memory_error_while_checking_integer_json_safety_propagates(self) -> None:
+        source_info = self._source_info("action", shape=[1], names=["opaque"])
+        evidence = self._direct_evidence(source_info, "action")
+        profile = self._profile(self._component("grip", "gripper_open"))
+        mapping = self._mapping("action", MachineSlice(0, 2, "grip", ()))
+
+        with patch(
+            "robometanorm.evidence.json.dumps",
+            side_effect=MemoryError("out of memory"),
+        ):
+            with self.assertRaises(MemoryError):
+                collect_mapped_gripper_ranges(
+                    self.candidate, evidence, profile, mapping
+                )
+
     def test_missing_mapped_source_is_reviewed_without_reading(self) -> None:
         self._write_parquet("episode.parquet", {"action": [[1.0]]})
         source_info = self._source_info("action", shape=[1], names=["opaque"])

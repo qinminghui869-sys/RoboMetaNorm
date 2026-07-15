@@ -455,7 +455,13 @@ def _finite_number(value: object) -> float | None:
 
 
 def _safe_issue_value(value: object) -> object:
-    if value is None or type(value) in {bool, int}:
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is int:
+        try:
+            json.dumps(value)
+        except ValueError:
+            return {"value_type": "int"}
         return value
     if type(value) is float and math.isfinite(value):
         return value
