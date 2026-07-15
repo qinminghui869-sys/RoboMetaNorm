@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.adapters.filesystem import discover_datasets
-from robometanorm.domain.models import LayoutType
+from robometanorm.models import LayoutType
 
 
 class DatasetDiscoveryTest(unittest.TestCase):

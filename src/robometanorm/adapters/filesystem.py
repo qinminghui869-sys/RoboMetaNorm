@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from robometanorm.domain.models import DatasetCandidate, LayoutType
+from robometanorm.models import DatasetCandidate, LayoutType
 
 
 EXCLUDED_DIRECTORY_NAMES = {".git", ".cache", "__pycache__"}
@@ -64,4 +64,4 @@ def _build_candidate(root: Path, dataset_path: Path) -> DatasetCandidate | None:
 
 def _matches_requested_layout(candidate: DatasetCandidate, layout: LayoutType) -> bool:
     """在显式布局模式下仅保留对应候选。"""
-    return layout is LayoutType.AUTO or candidate.layout_type is layout
+    return layout == LayoutType.AUTO or candidate.layout_type == layout
