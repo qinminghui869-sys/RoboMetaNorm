@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ from robometanorm.models import (
     DatasetEvidence,
     DatasetMapping,
     FeatureSchema,
+    GripperRange,
     HardwareProfile,
     IdentityAssessment,
     IdentityEvidence,
@@ -27,8 +29,10 @@ from robometanorm.models import (
     MachineAssignment,
     MachineComponent,
     MachineEvidence,
+    MachineSlice,
     MediaSample,
     NormalizationResult,
+    ParquetEpisodeEvidence,
     RobotIdentityFact,
     SourceReference,
 )
@@ -1433,7 +1437,10 @@ class StandardApplicationTest(unittest.TestCase):
                     cast(dict[str, dict[str, object]], result.normalized_info["features"])[self.TARGET_KEY],
                 )
                 self.assertEqual([item.code for item in result.issues[:2]], ["EVIDENCE_FIRST", "EXTRA_SECOND"])
-                self.assertEqual(result.machine_mappings, ())
+                self.assertEqual(
+                    [record.source_address for record in result.machine_mappings],
+                    ["features.action.names", "features.observation.state.names"],
+                )
                 self.assertEqual(result.robot_identity.output, "raw-model")
 
     def test_threshold_is_explicit_finite_builtin_and_equality_passes(self) -> None:
@@ -2153,7 +2160,10 @@ class StandardApplicationTest(unittest.TestCase):
         )
         self.assertEqual(result.normalized_info["untouched"], {"nested": [1, 2, 3]})
         self.assertEqual(cast(dict[str, object], result.normalized_info["features"])["action"], before_action)
-        self.assertEqual(result.machine_mappings, ())
+        self.assertEqual(
+            [record.source_address for record in result.machine_mappings],
+            ["features.action.names", "features.observation.state.names"],
+        )
 
     def test_manual_nan_bool_and_duplicate_values_fail_closed_without_crashing(self) -> None:
         profiles_and_mappings = (
@@ -2210,6 +2220,981 @@ class StandardApplicationTest(unittest.TestCase):
         codes = [item.code for item in result.issues]
         self.assertEqual(codes[:2], ["EVIDENCE", "EXTRA"])
         self.assertLess(codes.index("ROBOT_IDENTITY_UNRESOLVED"), codes.index("CAMERA_MAPPING_UNRESOLVED"))
+
+
+class MachineApplicationTest(unittest.TestCase):
+    """Verify feature-atomic machine naming and conservative gripper handling."""
+
+    @staticmethod
+    def _candidate() -> DatasetCandidate:
+        root = Path("/fixture/machine-dataset")
+        return DatasetCandidate(
+            "machine-dataset",
+            None,
+            root,
+            LayoutType.FLAT,
+            root / "meta/info.json",
+            root / "data",
+            None,
+            None,
+        )
+
+    @staticmethod
+    def _identity_evidence() -> IdentityEvidence:
+        return IdentityEvidence(
+            "present",
+            "raw-model",
+            "missing",
+            None,
+            "missing",
+            (),
+        )
+
+    @staticmethod
+    def _identity_fact() -> RobotIdentityFact:
+        return RobotIdentityFact(
+            "Fixture Robotics",
+            "Model One",
+            0.95,
+            False,
+            "official identity",
+            "consistent",
+            ("official-identity",),
+            (
+                IdentityAssessment("info_robot_type", "supports", "agrees"),
+                IdentityAssessment("common_record", "missing", "absent"),
+                IdentityAssessment("tasks", "missing", "absent"),
+            ),
+        )
+
+    @staticmethod
+    def _source(
+        source_id: str,
+        *,
+        kind: str = "official_product",
+    ) -> SourceReference:
+        return SourceReference(
+            source_id,
+            f"Fixture source {source_id}",
+            f"https://fixtures.invalid/{source_id}",
+            kind,
+        )
+
+    @classmethod
+    def _machine(
+        cls,
+        source_feature: str = "action",
+        *,
+        names: tuple[object, ...] = ("raw_0", "raw_1"),
+        shape: tuple[object, ...] = (2,),
+        episode_lengths: tuple[object, ...] = (2, 2),
+        gripper_ranges: tuple[GripperRange, ...] = (),
+    ) -> MachineEvidence:
+        episodes = tuple(
+            ParquetEpisodeEvidence(
+                f"data/chunk-000/episode_{index:06d}.parquet",
+                (source_feature,),
+                {source_feature: length if type(length) is int else None},
+            )
+            for index, length in enumerate(episode_lengths)
+        )
+        return MachineEvidence(
+            FeatureSchema(source_feature, "float32", shape, names, None, None),
+            episodes,
+            cast(tuple[int, ...], episode_lengths),
+            gripper_ranges,
+        )
+
+    @classmethod
+    def _evidence(
+        cls,
+        machines: tuple[MachineEvidence, ...] | None = None,
+    ) -> DatasetEvidence:
+        actual_machines = machines or (cls._machine(),)
+        features: dict[str, object] = {}
+        for machine in actual_machines:
+            features[machine.schema.source_key] = {
+                "dtype": machine.schema.dtype,
+                "shape": list(machine.schema.shape),
+                "names": list(machine.schema.names),
+                "values": [0.25, 0.75],
+                "custom": {"keep": True},
+            }
+        return DatasetEvidence(
+            cls._candidate(),
+            {
+                "robot_type": "raw-model",
+                "features": features,
+                "statistics": {"minimum": -7.0, "maximum": 9.0},
+            },
+            cls._identity_evidence(),
+            (),
+            actual_machines,
+        )
+
+    @classmethod
+    def _component(
+        cls,
+        component_id: str = "left-arm",
+        *,
+        kind: str = "arm_joint",
+        side: str | None = "left",
+        count: object = 2,
+        element_order: object = ("shoulder", "elbow"),
+        representation: str = "joint_vector",
+        unit: str = "rad",
+        open_range: object = None,
+        open_direction: object = None,
+        confidence: object = 0.85,
+        ambiguous: object = False,
+        reason: object = "official component order",
+        source_ids: object = ("official-component",),
+    ) -> MachineComponent:
+        return MachineComponent(
+            component_id,
+            kind,
+            side,
+            cast(int, count),
+            cast(tuple[str, ...], element_order),
+            representation,
+            unit,
+            cast(tuple[float, float] | None, open_range),
+            cast(str | None, open_direction),
+            cast(float, confidence),
+            cast(bool, ambiguous),
+            cast(str, reason),
+            cast(tuple[str, ...], source_ids),
+        )
+
+    @classmethod
+    def _gripper_component(
+        cls,
+        *,
+        component_id: str = "left-gripper",
+        open_range: object = (0.0, 100.0),
+        open_direction: object = "increasing",
+        confidence: object = 0.85,
+        ambiguous: object = False,
+        source_ids: object = ("official-gripper",),
+    ) -> MachineComponent:
+        return cls._component(
+            component_id,
+            kind="gripper_open",
+            count=1,
+            element_order=("opening",),
+            representation="scalar",
+            unit="unitless",
+            open_range=open_range,
+            open_direction=open_direction,
+            confidence=confidence,
+            ambiguous=ambiguous,
+            source_ids=source_ids,
+        )
+
+    @classmethod
+    def _profile(
+        cls,
+        components: tuple[MachineComponent, ...],
+        *,
+        component_sources: tuple[SourceReference, ...] | None = None,
+    ) -> HardwareProfile:
+        sources = component_sources or (
+            cls._source("official-identity"),
+            cls._source("official-component"),
+            cls._source("official-gripper", kind="official_manual"),
+            cls._source("unused-third-party", kind="third_party"),
+        )
+        return HardwareProfile(cls._identity_fact(), sources, (), components)
+
+    @staticmethod
+    def _assignment(
+        source_feature: str = "action",
+        *,
+        slices: object = (MachineSlice(0, 2, "left-arm", ("shoulder", "elbow")),),
+        confidence: object = 0.85,
+        ambiguous: object = False,
+        reason: object = "whole feature mapped",
+    ) -> MachineAssignment:
+        return MachineAssignment(
+            source_feature,
+            cast(tuple[MachineSlice, ...], slices),
+            cast(float, confidence),
+            cast(bool, ambiguous),
+            cast(str, reason),
+        )
+
+    @staticmethod
+    def _mapping(*assignments: MachineAssignment) -> DatasetMapping:
+        return DatasetMapping((), assignments)
+
+    @staticmethod
+    def _names(result: NormalizationResult, source_feature: str = "action") -> list[object]:
+        features = cast(dict[str, dict[str, object]], result.normalized_info["features"])
+        return cast(list[object], features[source_feature]["names"])
+
+    @staticmethod
+    def _codes(result: NormalizationResult) -> set[str]:
+        return {issue.code for issue in result.issues}
+
+    def test_replaces_names_only_for_complete_sourced_order_at_threshold(self) -> None:
+        evidence = self._evidence()
+        source_snapshot = deepcopy(evidence.source_info)
+        result = apply_standard(
+            evidence,
+            self._profile((self._component(),)),
+            self._mapping(self._assignment()),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(
+            self._names(result),
+            ["left_arm_joint_0_rad", "left_arm_joint_1_rad"],
+        )
+        self.assertEqual(evidence.source_info, source_snapshot)
+        self.assertEqual(result.normalized_info["statistics"], source_snapshot["statistics"])
+        output_feature = cast(dict[str, dict[str, object]], result.normalized_info["features"])["action"]
+        self.assertEqual(output_feature["values"], [0.25, 0.75])
+        self.assertEqual(output_feature["custom"], {"keep": True})
+        self.assertEqual(len(result.machine_mappings), 1)
+        record = result.machine_mappings[0]
+        self.assertEqual(record.source_address, "features.action.names")
+        self.assertEqual(record.source, ["raw_0", "raw_1"])
+        self.assertEqual(record.output, ["left_arm_joint_0_rad", "left_arm_joint_1_rad"])
+        self.assertEqual(record.candidate, ["left_arm_joint_0_rad", "left_arm_joint_1_rad"])
+        self.assertTrue(record.changed)
+        self.assertEqual(record.decision, "apply")
+        self.assertTrue(record.reason)
+        self.assertEqual(
+            [citation["source_id"] for citation in record.citations],
+            ["official-component"],
+        )
+        self.assertNotIn("unused-third-party", str(record.citations))
+
+    def test_keeps_already_standard_names_verbatim_over_alternate_candidate(self) -> None:
+        standard = ("right_arm_joint_0_rad", "right_arm_joint_1_rad")
+        evidence = self._evidence((self._machine(names=standard),))
+
+        result = apply_standard(
+            evidence,
+            self._profile((self._component(),)),
+            self._mapping(self._assignment()),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(self._names(result), list(standard))
+        self.assertEqual(result.machine_mappings[0].output, list(standard))
+        self.assertEqual(result.machine_mappings[0].decision, "keep")
+        self.assertNotIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_keeps_standard_non_gripper_names_without_valid_vlm_mapping(self) -> None:
+        standard = ("neck_joint_0_rad", "neck_joint_1_rad")
+        evidence = self._evidence((self._machine(names=standard),))
+        invalid = self._assignment(ambiguous=True)
+
+        result = apply_standard(
+            evidence,
+            self._profile((self._component(),)),
+            self._mapping(invalid),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(self._names(result), list(standard))
+        self.assertEqual(result.machine_mappings[0].decision, "keep")
+        self.assertNotIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_missing_or_empty_hardware_still_records_every_machine_in_order(self) -> None:
+        action = self._machine()
+        state = self._machine(
+            "observation.state",
+            names=("neck_joint_0_rad", "neck_joint_1_rad"),
+        )
+        evidence = self._evidence((action, state))
+        cases = (
+            (None, None),
+            (self._profile(()), self._mapping()),
+        )
+        for profile, mapping in cases:
+            with self.subTest(profile=profile, mapping=mapping):
+                result = apply_standard(
+                    evidence,
+                    profile,
+                    mapping,
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(
+                    [record.source_address for record in result.machine_mappings],
+                    ["features.action.names", "features.observation.state.names"],
+                )
+                self.assertEqual(
+                    [record.decision for record in result.machine_mappings],
+                    ["review", "keep"],
+                )
+                machine_issues = [
+                    issue
+                    for issue in result.issues
+                    if issue.scope.endswith(".names")
+                ]
+                self.assertEqual(
+                    [(issue.code, issue.scope) for issue in machine_issues],
+                    [("MACHINE_MAPPING_INVALID", "features.action.names")],
+                )
+
+    def test_standard_gripper_without_hardware_keeps_name_and_records_unconfirmed_range(self) -> None:
+        evidence = self._evidence(
+            (
+                self._machine(
+                    names=("left_gripper_open",),
+                    shape=(1,),
+                    episode_lengths=(1, 1),
+                ),
+            )
+        )
+
+        result = apply_standard(
+            evidence,
+            None,
+            None,
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(self._names(result), ["left_gripper_open"])
+        self.assertEqual(result.machine_mappings[0].decision, "review")
+        self.assertIn("GRIPPER_RANGE_UNCONFIRMED", self._codes(result))
+
+    def test_malformed_machine_schema_is_recorded_instead_of_silently_skipped(self) -> None:
+        malformed = replace(
+            self._machine(),
+            schema=cast(FeatureSchema, None),
+        )
+        evidence = replace(self._evidence(), machines=(malformed,))
+
+        result = apply_standard(
+            evidence,
+            self._profile((self._component(),)),
+            self._mapping(self._assignment()),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(len(result.machine_mappings), 1)
+        self.assertEqual(result.machine_mappings[0].decision, "review")
+        self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_invalid_length_shape_and_source_schema_fail_atomically(self) -> None:
+        base = self._machine()
+        wrong_source = self._evidence((base,))
+        cast(dict[str, dict[str, object]], wrong_source.source_info["features"])["action"]["shape"] = [3]
+        cases = (
+            self._evidence((replace(base, episode_lengths=()),)),
+            self._evidence((replace(base, episode_lengths=(2, 3)),)),
+            self._evidence((replace(base, episode_lengths=(2, True)),)),
+            self._evidence((replace(base, schema=replace(base.schema, shape=())),)),
+            self._evidence((replace(base, schema=replace(base.schema, shape=(True,))),)),
+            self._evidence((replace(base, schema=replace(base.schema, shape=(3,))),)),
+            wrong_source,
+        )
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                result = apply_standard(
+                    evidence,
+                    self._profile((self._component(),)),
+                    self._mapping(self._assignment()),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(self._names(result), ["raw_0", "raw_1"])
+                self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_gap_overlap_bounds_coverage_count_and_order_fail_atomically(self) -> None:
+        first = self._component(
+            "joint-a",
+            count=1,
+            element_order=("a",),
+            source_ids=("official-component",),
+        )
+        second = self._component(
+            "joint-b",
+            count=1,
+            element_order=("b",),
+            source_ids=("official-component",),
+        )
+        valid_slices = (
+            MachineSlice(0, 1, "joint-a", ("a",)),
+            MachineSlice(1, 2, "joint-b", ("b",)),
+        )
+        invalid_slices = (
+            (MachineSlice(1, 2, "joint-a", ("a",)),),
+            (MachineSlice(0, 1, "joint-a", ("a",)), MachineSlice(2, 3, "joint-b", ("b",))),
+            (MachineSlice(0, 2, "joint-a", ("a",)), MachineSlice(1, 2, "joint-b", ("b",))),
+            (MachineSlice(0, 1, "joint-a", ("a",)),),
+            (MachineSlice(0, 3, "joint-a", ("a",)),),
+            (MachineSlice(0, 1, "joint-a", ("wrong",)), MachineSlice(1, 2, "joint-b", ("b",))),
+            (MachineSlice(0, 1, "joint-a", cast(tuple[str, ...], ["a"])), MachineSlice(1, 2, "joint-b", ("b",))),
+            (MachineSlice(cast(int, True), 1, "joint-a", ("a",)), MachineSlice(1, 2, "joint-b", ("b",))),
+            (MachineSlice(0, cast(int, True), "joint-a", ("a",)), MachineSlice(1, 2, "joint-b", ("b",))),
+        )
+        for slices in invalid_slices:
+            with self.subTest(slices=slices):
+                result = apply_standard(
+                    self._evidence(),
+                    self._profile((first, second)),
+                    self._mapping(self._assignment(slices=slices)),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(self._names(result), ["raw_0", "raw_1"])
+                self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+        valid = apply_standard(
+            self._evidence(),
+            self._profile((first, second)),
+            self._mapping(self._assignment(slices=valid_slices)),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(self._names(valid), ["raw_0", "raw_1"])
+        self.assertIn("MACHINE_MAPPING_INVALID", self._codes(valid))
+
+    def test_duplicate_missing_unknown_and_unsourced_inputs_fail_closed(self) -> None:
+        action = self._machine()
+        action_assignment = self._assignment()
+        duplicate_evidence = self._evidence((action, replace(action, schema=replace(action.schema))))
+        missing_feature = self._evidence((action,))
+        cast(dict[str, object], missing_feature.source_info["features"]).pop("action")
+        third_party_profile = self._profile(
+            (replace(self._component(), source_ids=("community",)),),
+            component_sources=(
+                self._source("official-identity"),
+                self._source("community", kind="third_party"),
+            ),
+        )
+        cases = (
+            (duplicate_evidence, self._profile((self._component(),)), self._mapping(action_assignment, action_assignment)),
+            (self._evidence((action,)), self._profile((self._component(),)), self._mapping(action_assignment, action_assignment)),
+            (self._evidence((action,)), self._profile((self._component(), self._component())), self._mapping(action_assignment)),
+            (self._evidence((action,)), self._profile((self._component(),)), self._mapping(replace(action_assignment, source_feature="unknown"))),
+            (missing_feature, self._profile((self._component(),)), self._mapping(action_assignment)),
+            (self._evidence((action,)), third_party_profile, self._mapping(action_assignment)),
+            (
+                self._evidence((action,)),
+                self._profile((self._component(),)),
+                self._mapping(
+                    replace(
+                        action_assignment,
+                        slices=(
+                            MachineSlice(
+                                0,
+                                2,
+                                "missing",
+                                ("shoulder", "elbow"),
+                            ),
+                        ),
+                    )
+                ),
+            ),
+        )
+        for evidence, profile, mapping in cases:
+            with self.subTest(evidence=evidence, profile=profile, mapping=mapping):
+                result = apply_standard(evidence, profile, mapping, confidence_threshold=0.85)
+                self.assertTrue(result.machine_mappings)
+                self.assertTrue(all(record.decision == "review" for record in result.machine_mappings))
+                self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_assignment_and_component_trust_fields_are_strict(self) -> None:
+        bad_assignments = (
+            self._assignment(confidence=0.849),
+            self._assignment(confidence=True),
+            self._assignment(confidence=float("nan")),
+            self._assignment(confidence=float("inf")),
+            self._assignment(ambiguous=True),
+            self._assignment(ambiguous=1),
+            self._assignment(reason=""),
+            self._assignment(reason=" padded "),
+        )
+        for assignment in bad_assignments:
+            with self.subTest(assignment=assignment):
+                result = apply_standard(
+                    self._evidence(),
+                    self._profile((self._component(),)),
+                    self._mapping(assignment),
+                    confidence_threshold=0.85,
+                )
+                self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+        bad_components = (
+            self._component(confidence=0.849),
+            self._component(confidence=True),
+            self._component(confidence=float("nan")),
+            self._component(confidence=float("inf")),
+            self._component(ambiguous=True),
+            self._component(ambiguous=1),
+            self._component(reason=""),
+            self._component(source_ids=[]),
+        )
+        for component in bad_components:
+            with self.subTest(component=component):
+                result = apply_standard(
+                    self._evidence(),
+                    self._profile((component,)),
+                    self._mapping(self._assignment()),
+                    confidence_threshold=0.85,
+                )
+                self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_one_invalid_component_keeps_entire_feature_and_candidate_is_never_output(self) -> None:
+        arm = self._component(
+            count=1,
+            element_order=("shoulder",),
+        )
+        gripper = self._gripper_component(open_direction="decreasing")
+        mapping = self._mapping(
+            self._assignment(
+                slices=(
+                    MachineSlice(0, 1, "left-arm", ("shoulder",)),
+                    MachineSlice(1, 2, "left-gripper", ("opening",)),
+                )
+            )
+        )
+        evidence = self._evidence(
+            (
+                self._machine(
+                    gripper_ranges=(GripperRange(1, 0.0, 100.0, 8, 0),),
+                ),
+            )
+        )
+
+        result = apply_standard(
+            evidence,
+            self._profile((arm, gripper)),
+            mapping,
+            confidence_threshold=0.85,
+        )
+
+        record = result.machine_mappings[0]
+        self.assertEqual(self._names(result), ["raw_0", "raw_1"])
+        self.assertEqual(
+            record.candidate,
+            ["left_arm_joint_0_rad", "left_gripper_open"],
+        )
+        self.assertEqual(record.output, ["raw_0", "raw_1"])
+        self.assertEqual(record.decision, "review")
+        self.assertIn("GRIPPER_TRANSFORM_REQUIRED", self._codes(result))
+
+    def test_independent_feature_success_and_component_reuse_are_allowed(self) -> None:
+        action = self._machine()
+        state = self._machine("observation.state")
+        mappings = (
+            self._assignment(ambiguous=True),
+            self._assignment("observation.state"),
+        )
+        result = apply_standard(
+            self._evidence((action, state)),
+            self._profile((self._component(),)),
+            self._mapping(*mappings),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(self._names(result, "action"), ["raw_0", "raw_1"])
+        self.assertEqual(
+            self._names(result, "observation.state"),
+            ["left_arm_joint_0_rad", "left_arm_joint_1_rad"],
+        )
+        self.assertEqual(
+            [record.source_address for record in result.machine_mappings],
+            ["features.action.names", "features.observation.state.names"],
+        )
+        self.assertEqual(
+            [record.decision for record in result.machine_mappings],
+            ["review", "apply"],
+        )
+
+    def test_missing_or_duplicate_assignment_blocks_only_its_source_feature(self) -> None:
+        action = self._machine()
+        state = self._machine("observation.state")
+        state_assignment = self._assignment("observation.state")
+        cases = (
+            self._mapping(state_assignment),
+            self._mapping(self._assignment(), self._assignment(), state_assignment),
+        )
+        for mapping in cases:
+            with self.subTest(mapping=mapping):
+                result = apply_standard(
+                    self._evidence((action, state)),
+                    self._profile((self._component(),)),
+                    mapping,
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(self._names(result, "action"), ["raw_0", "raw_1"])
+                self.assertEqual(
+                    self._names(result, "observation.state"),
+                    ["left_arm_joint_0_rad", "left_arm_joint_1_rad"],
+                )
+                self.assertEqual(
+                    [record.decision for record in result.machine_mappings],
+                    ["review", "apply"],
+                )
+
+    def test_duplicate_component_id_blocks_only_features_that_reference_it(self) -> None:
+        action = self._machine()
+        state = self._machine("observation.state")
+        duplicate = self._component()
+        state_component = self._component(
+            "right-arm",
+            side="right",
+            source_ids=("official-component",),
+        )
+        result = apply_standard(
+            self._evidence((action, state)),
+            self._profile((duplicate, duplicate, state_component)),
+            self._mapping(
+                self._assignment(),
+                self._assignment(
+                    "observation.state",
+                    slices=(
+                        MachineSlice(
+                            0,
+                            2,
+                            "right-arm",
+                            ("shoulder", "elbow"),
+                        ),
+                    ),
+                ),
+            ),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(self._names(result, "action"), ["raw_0", "raw_1"])
+        self.assertEqual(
+            self._names(result, "observation.state"),
+            ["right_arm_joint_0_rad", "right_arm_joint_1_rad"],
+        )
+        self.assertEqual(
+            [record.decision for record in result.machine_mappings],
+            ["review", "apply"],
+        )
+
+    def test_schema_mismatch_record_uses_actual_info_names_for_source_and_output(self) -> None:
+        evidence = self._evidence()
+        source_info = deepcopy(evidence.source_info)
+        cast(dict[str, dict[str, object]], source_info["features"])["action"]["shape"] = [3]
+        evidence = replace(evidence, source_info=source_info)
+
+        result = apply_standard(
+            evidence,
+            self._profile((self._component(),)),
+            self._mapping(self._assignment()),
+            confidence_threshold=0.85,
+        )
+
+        record = result.machine_mappings[0]
+        self.assertEqual(record.source, ["raw_0", "raw_1"])
+        self.assertEqual(record.output, ["raw_0", "raw_1"])
+        self.assertEqual(self._names(result), ["raw_0", "raw_1"])
+
+    def test_gripper_ranges_are_checked_only_for_actual_or_standard_grippers(self) -> None:
+        malformed_ranges = cast(
+            tuple[GripperRange, ...],
+            [GripperRange(0, 0.0, 100.0, 8, 0)],
+        )
+        ordinary = self._evidence(
+            (
+                self._machine(
+                    names=("neck_joint_0_rad", "neck_joint_1_rad"),
+                    gripper_ranges=malformed_ranges,
+                ),
+            )
+        )
+        ordinary_result = apply_standard(
+            ordinary,
+            self._profile(()),
+            self._mapping(),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(
+            self._names(ordinary_result),
+            ["neck_joint_0_rad", "neck_joint_1_rad"],
+        )
+        self.assertEqual(ordinary_result.machine_mappings[0].decision, "keep")
+        self.assertNotIn("MACHINE_MAPPING_INVALID", self._codes(ordinary_result))
+
+        gripper = self._evidence(
+            (
+                self._machine(
+                    names=("left_gripper_open",),
+                    shape=(1,),
+                    episode_lengths=(1, 1),
+                    gripper_ranges=malformed_ranges,
+                ),
+            )
+        )
+        gripper_result = apply_standard(
+            gripper,
+            self._profile((self._gripper_component(),)),
+            self._mapping(
+                self._assignment(
+                    slices=(
+                        MachineSlice(0, 1, "left-gripper", ("opening",)),
+                    )
+                )
+            ),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(self._names(gripper_result), ["left_gripper_open"])
+        self.assertIn("GRIPPER_RANGE_UNCONFIRMED", self._codes(gripper_result))
+
+    def test_standard_gripper_ordinary_mapping_failures_are_machine_invalid(self) -> None:
+        evidence = self._evidence(
+            (
+                self._machine(
+                    names=("left_gripper_open",),
+                    shape=(1,),
+                    episode_lengths=(1, 1),
+                    gripper_ranges=(GripperRange(0, 0.0, 100.0, 8, 0),),
+                ),
+            )
+        )
+        valid_slice = (MachineSlice(0, 1, "left-gripper", ("opening",)),)
+        cases = (
+            (
+                self._profile((self._gripper_component(),)),
+                self._mapping(self._assignment(slices=valid_slice, ambiguous=True)),
+            ),
+            (
+                self._profile((self._gripper_component(),)),
+                self._mapping(
+                    self._assignment(
+                        slices=(MachineSlice(1, 2, "left-gripper", ("opening",)),)
+                    )
+                ),
+            ),
+            (
+                self._profile((self._gripper_component(),)),
+                self._mapping(
+                    self._assignment(
+                        slices=(MachineSlice(0, 1, "missing", ("opening",)),)
+                    )
+                ),
+            ),
+            (
+                self._profile(
+                    (self._gripper_component(), self._gripper_component())
+                ),
+                self._mapping(self._assignment(slices=valid_slice)),
+            ),
+            (
+                self._profile((self._gripper_component(confidence=0.84),)),
+                self._mapping(self._assignment(slices=valid_slice)),
+            ),
+        )
+        for profile, mapping in cases:
+            with self.subTest(profile=profile, mapping=mapping):
+                result = apply_standard(
+                    evidence,
+                    profile,
+                    mapping,
+                    confidence_threshold=0.85,
+                )
+                machine_codes = {
+                    issue.code
+                    for issue in result.issues
+                    if issue.scope == "features.action.names"
+                }
+                self.assertEqual(machine_codes, {"MACHINE_MAPPING_INVALID"})
+                self.assertEqual(self._names(result), ["left_gripper_open"])
+
+    def test_partial_render_failure_records_no_candidate(self) -> None:
+        first = self._component(
+            count=1,
+            element_order=("shoulder",),
+        )
+        result = apply_standard(
+            self._evidence(),
+            self._profile((first,)),
+            self._mapping(
+                self._assignment(
+                    slices=(
+                        MachineSlice(0, 1, "left-arm", ("shoulder",)),
+                        MachineSlice(1, 2, "missing", ("elbow",)),
+                    )
+                )
+            ),
+            confidence_threshold=0.85,
+        )
+
+        self.assertIsNone(result.machine_mappings[0].candidate)
+        self.assertEqual(result.machine_mappings[0].output, ["raw_0", "raw_1"])
+
+    def test_standard_names_require_trustworthy_episode_lengths(self) -> None:
+        standard = ("neck_joint_0_rad", "neck_joint_1_rad")
+        machines = (
+            self._machine(names=standard, episode_lengths=()),
+            self._machine(names=standard, episode_lengths=(2, True)),
+            self._machine(names=standard, episode_lengths=(2, 3)),
+            self._machine(names=standard, episode_lengths=(3, 3)),
+        )
+        for machine in machines:
+            with self.subTest(lengths=machine.episode_lengths):
+                result = apply_standard(
+                    self._evidence((machine,)),
+                    self._profile(()),
+                    self._mapping(),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(self._names(result), list(standard))
+                self.assertEqual(result.machine_mappings[0].decision, "review")
+                self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+    def test_accepts_all_four_gripper_ranges_and_observed_subranges(self) -> None:
+        for maximum in (1.0, 10.0, 100.0, 1000.0):
+            for observed in ((0.0, maximum), (maximum * 0.25, maximum * 0.75)):
+                with self.subTest(maximum=maximum, observed=observed):
+                    evidence = self._evidence(
+                        (
+                            self._machine(
+                                names=("raw_gripper",),
+                                shape=(1,),
+                                episode_lengths=(1, 1),
+                                gripper_ranges=(
+                                    GripperRange(0, observed[0], observed[1], 8, 0),
+                                ),
+                            ),
+                        )
+                    )
+                    result = apply_standard(
+                        evidence,
+                        self._profile((self._gripper_component(open_range=(0.0, maximum)),)),
+                        self._mapping(
+                            self._assignment(
+                                slices=(MachineSlice(0, 1, "left-gripper", ("opening",)),)
+                            )
+                        ),
+                        confidence_threshold=0.85,
+                    )
+                    self.assertEqual(self._names(result), ["left_gripper_open"])
+                    self.assertNotIn("GRIPPER_TRANSFORM_REQUIRED", self._codes(result))
+                    self.assertNotIn("GRIPPER_RANGE_UNCONFIRMED", self._codes(result))
+
+    def test_gripper_transform_cases_keep_whole_source_feature(self) -> None:
+        cases = (
+            ((0.0, 0.1), "increasing", (0.0, 0.1), 0),
+            ((0.0, 10000.0), "increasing", (0.0, 10000.0), 0),
+            ((0.0, 100.0), "decreasing", (0.0, 100.0), 0),
+            ((0.0, 100.0), "unknown", (0.0, 100.0), 0),
+            ((0.0, 100.0), "increasing", (-1.0, 100.0), 0),
+            ((0.0, 100.0), "increasing", (0.0, 101.0), 0),
+            ((0.0, 100.0), "increasing", (0.0, 100.0), 1),
+        )
+        for nominal, direction, observed, nonfinite in cases:
+            with self.subTest(case=(nominal, direction, observed, nonfinite)):
+                evidence = self._evidence(
+                    (
+                        self._machine(
+                            names=("raw_gripper",),
+                            shape=(1,),
+                            episode_lengths=(1, 1),
+                            gripper_ranges=(GripperRange(0, *observed, 8, nonfinite),),
+                        ),
+                    )
+                )
+                result = apply_standard(
+                    evidence,
+                    self._profile((self._gripper_component(open_range=nominal, open_direction=direction),)),
+                    self._mapping(
+                        self._assignment(
+                            slices=(MachineSlice(0, 1, "left-gripper", ("opening",)),)
+                        )
+                    ),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(self._names(result), ["raw_gripper"])
+                self.assertIn("GRIPPER_TRANSFORM_REQUIRED", self._codes(result))
+
+    def test_missing_duplicate_or_untrustworthy_gripper_range_is_unconfirmed(self) -> None:
+        malformed_ranges = (
+            (),
+            (GripperRange(0, 0.0, 100.0, 8, 0), GripperRange(0, 0.0, 100.0, 8, 0)),
+            (GripperRange(cast(int, True), 0.0, 100.0, 8, 0),),
+            (GripperRange(0, None, 100.0, 8, 0),),
+            (GripperRange(0, 100.0, 0.0, 8, 0),),
+            (GripperRange(0, 0.0, 100.0, cast(int, True), 0),),
+            (GripperRange(0, 0.0, 100.0, 0, 0),),
+            (GripperRange(0, 0.0, 100.0, 8, cast(int, True)),),
+        )
+        for ranges in malformed_ranges:
+            with self.subTest(ranges=ranges):
+                evidence = self._evidence(
+                    (
+                        self._machine(
+                            names=("left_gripper_open",),
+                            shape=(1,),
+                            episode_lengths=(1, 1),
+                            gripper_ranges=ranges,
+                        ),
+                    )
+                )
+                result = apply_standard(
+                    evidence,
+                    self._profile((self._gripper_component(),)),
+                    self._mapping(
+                        self._assignment(
+                            slices=(MachineSlice(0, 1, "left-gripper", ("opening",)),)
+                        )
+                    ),
+                    confidence_threshold=0.85,
+                )
+                self.assertEqual(self._names(result), ["left_gripper_open"])
+                self.assertIn("GRIPPER_RANGE_UNCONFIRMED", self._codes(result))
+
+    def test_issue_evidence_and_records_are_json_safe_and_minimal(self) -> None:
+        result = apply_standard(
+            self._evidence(),
+            self._profile((self._component(),)),
+            self._mapping(self._assignment(ambiguous=True)),
+            confidence_threshold=0.85,
+        )
+
+        encoded = json.dumps(
+            {
+                "issues": [issue.evidence for issue in result.issues],
+                "records": [
+                    {
+                        "source": record.source,
+                        "output": record.output,
+                        "candidate": record.candidate,
+                        "semantics": record.vlm_semantics,
+                        "citations": record.citations,
+                    }
+                    for record in result.machine_mappings
+                ],
+            },
+            allow_nan=False,
+        )
+        self.assertNotIn("Machine", encoded)
+        machine_issue = next(issue for issue in result.issues if issue.code == "MACHINE_MAPPING_INVALID")
+        self.assertLessEqual(set(machine_issue.evidence), {"candidate_names"})
+
+    def test_irrelevant_gripper_ranges_are_ignored_and_memory_error_propagates(self) -> None:
+        malformed = replace(
+            self._machine(),
+            gripper_ranges=cast(tuple[GripperRange, ...], [GripperRange(0, 0.0, 1.0, 1, 0)]),
+        )
+        result = apply_standard(
+            self._evidence((malformed,)),
+            self._profile((self._component(),)),
+            self._mapping(self._assignment()),
+            confidence_threshold=0.85,
+        )
+        self.assertEqual(
+            self._names(result),
+            ["left_arm_joint_0_rad", "left_arm_joint_1_rad"],
+        )
+        self.assertNotIn("MACHINE_MAPPING_INVALID", self._codes(result))
+
+        exploding = _ExplodingEquality()
+        evidence = self._evidence((self._machine(names=(exploding, "raw_1")),))
+        with self.assertRaises(MemoryError):
+            apply_standard(
+                evidence,
+                self._profile((self._component(),)),
+                self._mapping(self._assignment()),
+                confidence_threshold=0.85,
+            )
 
 
 if __name__ == "__main__":

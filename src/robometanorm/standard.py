@@ -16,10 +16,15 @@ from robometanorm.models import (
     CameraSlot,
     DatasetEvidence,
     DatasetMapping,
+    FeatureSchema,
+    GripperRange,
     HardwareProfile,
     IdentityAssessment,
     Issue,
     MachineComponent,
+    MachineAssignment,
+    MachineEvidence,
+    MachineSlice,
     MappingRecord,
     MediaSample,
     NormalizationResult,
@@ -106,6 +111,12 @@ JOINT_COMPONENTS = frozenset(
 INDEXED_COMPONENTS = frozenset({"head_position"})
 
 _GRIPPER_COMPONENTS = frozenset({"gripper_open", "gripper_open_scale"})
+_ACCEPTED_GRIPPER_RANGES = (
+    (0.0, 1.0),
+    (0.0, 10.0),
+    (0.0, 100.0),
+    (0.0, 1000.0),
+)
 _MACHINE_COMPONENTS = (
     frozenset(FIXED_COMPONENTS)
     | SIDED_COMPONENTS
@@ -1277,6 +1288,711 @@ def _apply_camera_plans(
     return tuple(records), tuple(issues)
 
 
+def _safe_machine_assignment_semantics(
+    assignment: MachineAssignment | None,
+) -> dict[str, object]:
+    if not isinstance(assignment, MachineAssignment):
+        return {}
+    slices: list[dict[str, object]] = []
+    if type(assignment.slices) is tuple:
+        for machine_slice in assignment.slices:
+            if not isinstance(machine_slice, MachineSlice):
+                continue
+            slices.append(
+                {
+                    "start": (
+                        machine_slice.start
+                        if type(machine_slice.start) is int
+                        else None
+                    ),
+                    "end": (
+                        machine_slice.end
+                        if type(machine_slice.end) is int
+                        else None
+                    ),
+                    "component_id": (
+                        machine_slice.component_id
+                        if _safe_text(machine_slice.component_id)
+                        else None
+                    ),
+                    "element_order": (
+                        list(machine_slice.element_order)
+                        if type(machine_slice.element_order) is tuple
+                        and all(_safe_text(item) for item in machine_slice.element_order)
+                        else None
+                    ),
+                }
+            )
+    return {
+        "source_feature": (
+            assignment.source_feature
+            if _safe_text(assignment.source_feature)
+            else None
+        ),
+        "slices": slices,
+        "confidence": (
+            assignment.confidence
+            if _is_finite_number(assignment.confidence)
+            else None
+        ),
+        "ambiguous": (
+            assignment.ambiguous
+            if type(assignment.ambiguous) is bool
+            else None
+        ),
+        "reason": assignment.reason if _safe_text(assignment.reason) else None,
+    }
+
+
+def _machine_source_names(
+    machine: MachineEvidence,
+    source_feature: dict[str, object] | None,
+    *,
+    require_episode_lengths: bool,
+) -> tuple[object | None, int | None, str | None]:
+    if source_feature is None:
+        return None, None, "源 info.json 中缺少对应机器 feature"
+    source_names = source_feature.get("names")
+    schema = machine.schema
+    if (
+        type(schema.shape) is not tuple
+        or not schema.shape
+        or type(schema.shape[0]) is not int
+        or schema.shape[0] <= 0
+        or type(schema.names) is not tuple
+        or len(schema.names) != schema.shape[0]
+        or not _schema_matches_source_feature(machine, source_feature)
+    ):
+        return source_names, None, "机器 feature schema 无效或与源信息不一致"
+    if type(source_names) is not list or len(source_names) != schema.shape[0]:
+        return source_names, schema.shape[0], "机器 feature names 与向量宽度不一致"
+    if require_episode_lengths:
+        lengths = machine.episode_lengths
+        if (
+            type(lengths) is not tuple
+            or not lengths
+            or any(type(length) is not int or length <= 0 for length in lengths)
+            or any(length != lengths[0] for length in lengths)
+            or lengths[0] != schema.shape[0]
+        ):
+            return source_names, schema.shape[0], "首末 Episode 的机器向量长度不完整或不一致"
+    return source_names, schema.shape[0], None
+
+
+def _machine_source_key(machine: object) -> str | None:
+    if (
+        not isinstance(machine, MachineEvidence)
+        or not isinstance(machine.schema, FeatureSchema)
+        or not _safe_text(machine.schema.source_key)
+    ):
+        return None
+    return machine.schema.source_key
+
+
+def _standard_machine_names(
+    source_names: object | None,
+    width: int | None,
+) -> tuple[str, ...] | None:
+    if type(source_names) is not list or width is None or len(source_names) != width:
+        return None
+    if not all(type(name) is str for name in source_names):
+        return None
+    names = tuple(source_names)
+    return names if are_standard_machine_names(names) else None
+
+
+def _standard_names_have_gripper(names: tuple[str, ...] | None) -> bool:
+    return names is not None and any(
+        name.endswith("_gripper_open")
+        or name.endswith("_gripper_open_scale")
+        for name in names
+    )
+
+
+def _component_is_structurally_safe(component: MachineComponent) -> bool:
+    return (
+        _safe_text(component.component_id)
+        and _safe_text(component.kind)
+        and (component.side is None or _safe_text(component.side))
+        and type(component.count) is int
+        and component.count > 0
+        and type(component.element_order) is tuple
+        and all(_safe_text(item) for item in component.element_order)
+        and _safe_text(component.representation)
+        and _safe_text(component.unit)
+        and _safe_text(component.reason)
+    )
+
+
+def _component_references(
+    component: MachineComponent,
+    sources: dict[str, SourceReference] | None,
+) -> tuple[SourceReference, ...] | None:
+    if not _component_is_structurally_safe(component):
+        return None
+    return _referenced_sources(component.source_ids, sources)
+
+
+def _append_unique_references(
+    references: list[SourceReference],
+    additions: tuple[SourceReference, ...] | None,
+) -> None:
+    if additions is None:
+        return
+    seen = {reference.source_id for reference in references}
+    for reference in additions:
+        if reference.source_id not in seen:
+            seen.add(reference.source_id)
+            references.append(reference)
+
+
+def _safe_range_pair(value: object) -> list[int | float] | None:
+    if (
+        type(value) is not tuple
+        or len(value) != 2
+        or not all(_is_builtin_finite(bound) for bound in value)
+    ):
+        return None
+    return [value[0], value[1]]
+
+
+def _gripper_issue_evidence(
+    candidate: list[str] | None,
+    component: MachineComponent,
+    observed: GripperRange | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "accepted_ranges": [list(bounds) for bounds in _ACCEPTED_GRIPPER_RANGES]
+    }
+    if candidate is not None:
+        payload["candidate_names"] = list(candidate)
+    nominal = _safe_range_pair(component.open_range)
+    if nominal is not None:
+        payload["nominal_range"] = nominal
+    if observed is not None:
+        observed_pair = _safe_range_pair((observed.minimum, observed.maximum))
+        if observed_pair is not None:
+            payload["observed_range"] = observed_pair
+    return payload
+
+
+def _validate_gripper_range(
+    machine: MachineEvidence,
+    machine_slice: MachineSlice,
+    component: MachineComponent,
+    candidate: list[str] | None,
+) -> tuple[str | None, str | None, dict[str, object]]:
+    nominal = component.open_range
+    if (
+        type(nominal) is not tuple
+        or len(nominal) != 2
+        or not all(_is_builtin_finite(bound) for bound in nominal)
+        or nominal not in _ACCEPTED_GRIPPER_RANGES
+        or type(component.open_direction) is not str
+        or component.open_direction != "increasing"
+    ):
+        return (
+            "GRIPPER_TRANSFORM_REQUIRED",
+            "夹爪名义范围或开合方向不符合 PDF，需缩放、反向或裁剪",
+            _gripper_issue_evidence(candidate, component, None),
+        )
+
+    if type(machine.gripper_ranges) is not tuple or not all(
+        isinstance(item, GripperRange) for item in machine.gripper_ranges
+    ):
+        return (
+            "GRIPPER_RANGE_UNCONFIRMED",
+            "夹爪实测范围容器缺失或结构无效",
+            _gripper_issue_evidence(candidate, component, None),
+        )
+
+    matching_ranges = [
+        item
+        for item in machine.gripper_ranges
+        if type(item.index) is int and item.index == machine_slice.start
+    ]
+    observed = matching_ranges[0] if len(matching_ranges) == 1 else None
+    if observed is None:
+        return (
+            "GRIPPER_RANGE_UNCONFIRMED",
+            "夹爪缺少唯一且可信的实测范围",
+            _gripper_issue_evidence(candidate, component, None),
+        )
+    if (
+        type(observed.index) is not int
+        or type(observed.finite_count) is not int
+        or observed.finite_count <= 0
+        or type(observed.nonfinite_count) is not int
+        or observed.nonfinite_count < 0
+        or type(observed.minimum) not in (int, float)
+        or type(observed.maximum) not in (int, float)
+        or observed.minimum > observed.maximum
+    ):
+        return (
+            "GRIPPER_RANGE_UNCONFIRMED",
+            "夹爪实测范围缺失、计数无效或上下界不可信",
+            _gripper_issue_evidence(candidate, component, observed),
+        )
+    if (
+        observed.nonfinite_count != 0
+        or not _is_builtin_finite(observed.minimum)
+        or not _is_builtin_finite(observed.maximum)
+        or observed.minimum < nominal[0]
+        or observed.maximum > nominal[1]
+    ):
+        return (
+            "GRIPPER_TRANSFORM_REQUIRED",
+            "夹爪实测值包含非有限数或超出已确认的 PDF 名义范围",
+            _gripper_issue_evidence(candidate, component, observed),
+        )
+    return None, None, {}
+
+
+@dataclass
+class _MachinePlan:
+    machine: object
+    source_key: str
+    source_names: object | None
+    assignment: MachineAssignment | None
+    candidate: list[str] | None
+    citations: tuple[dict[str, object], ...]
+    ready: bool
+    already_standard: bool
+    issue_code: str
+    reason: str
+    issue_evidence: dict[str, object]
+
+
+def _invalid_machine_plan(
+    machine: object,
+    source_key: str,
+    source_names: object | None,
+    assignment: MachineAssignment | None,
+    reason: str,
+    *,
+    issue_code: str = "MACHINE_MAPPING_INVALID",
+    candidate: list[str] | None = None,
+    citations: tuple[dict[str, object], ...] = (),
+    issue_evidence: dict[str, object] | None = None,
+) -> _MachinePlan:
+    evidence_payload = issue_evidence or (
+        {"candidate_names": list(candidate)} if candidate is not None else {}
+    )
+    return _MachinePlan(
+        machine,
+        source_key,
+        source_names,
+        assignment,
+        candidate,
+        citations,
+        False,
+        False,
+        issue_code,
+        reason,
+        evidence_payload,
+    )
+
+
+def _build_machine_plan(
+    machine: MachineEvidence,
+    source_feature: dict[str, object] | None,
+    assignment: MachineAssignment | None,
+    components: dict[str, MachineComponent],
+    sources: dict[str, SourceReference] | None,
+    confidence_threshold: float,
+    *,
+    structurally_unique: bool,
+) -> _MachinePlan:
+    source_key = machine.schema.source_key
+    source_names, width, source_error = _machine_source_names(
+        machine,
+        source_feature,
+        require_episode_lengths=True,
+    )
+    standard_names = _standard_machine_names(source_names, width)
+    has_standard_gripper = _standard_names_have_gripper(standard_names)
+    if (
+        source_error is None
+        and standard_names is not None
+        and not has_standard_gripper
+    ):
+        return _MachinePlan(
+            machine,
+            source_key,
+            source_names,
+            assignment,
+            None,
+            (),
+            True,
+            True,
+            "",
+            "源机器 names 已逐项符合 PDF 标准，保持原样",
+            {},
+        )
+
+    if source_error is not None:
+        return _invalid_machine_plan(
+            machine, source_key, source_names, assignment, source_error
+        )
+    if not structurally_unique:
+        return _invalid_machine_plan(
+            machine,
+            source_key,
+            source_names,
+            assignment,
+            "该机器 feature 的证据或整体映射包含缺失或重复标识",
+        )
+    if assignment is None:
+        return _invalid_machine_plan(
+            machine,
+            source_key,
+            source_names,
+            assignment,
+            "整体映射缺少该机器 feature",
+        )
+    if (
+        type(assignment.ambiguous) is not bool
+        or assignment.ambiguous
+        or not _is_finite_number(assignment.confidence)
+        or assignment.confidence < confidence_threshold
+        or not _safe_text(assignment.reason)
+        or type(assignment.slices) is not tuple
+        or not assignment.slices
+    ):
+        return _invalid_machine_plan(
+            machine,
+            source_key,
+            source_names,
+            assignment,
+            "机器整体映射仍有歧义、置信度不足或结构无效",
+        )
+    if width is None:
+        return _invalid_machine_plan(
+            machine, source_key, source_names, assignment, "机器向量宽度无法确认"
+        )
+
+    cursor = 0
+    candidate: list[str] = []
+    used_references: list[SourceReference] = []
+    grippers: list[tuple[MachineSlice, MachineComponent]] = []
+    failure_reason: str | None = None
+    for machine_slice in assignment.slices:
+        if (
+            not isinstance(machine_slice, MachineSlice)
+            or type(machine_slice.start) is not int
+            or type(machine_slice.end) is not int
+            or machine_slice.start != cursor
+            or machine_slice.end <= machine_slice.start
+            or machine_slice.end > width
+            or not _safe_text(machine_slice.component_id)
+            or type(machine_slice.element_order) is not tuple
+            or not all(_safe_text(item) for item in machine_slice.element_order)
+        ):
+            failure_reason = "机器切片必须按返回顺序连续、非空且不越界"
+            break
+        component = components.get(machine_slice.component_id)
+        if component is None:
+            failure_reason = "机器切片引用了不存在或不唯一的硬件组件"
+            break
+        references = _component_references(component, sources)
+        rendered = render_component_names(component)
+        if (
+            type(component.ambiguous) is not bool
+            or component.ambiguous
+            or not _is_finite_number(component.confidence)
+            or component.confidence < confidence_threshold
+            or not _has_official_reference(references)
+            or rendered is None
+            or machine_slice.end - machine_slice.start != component.count
+            or machine_slice.element_order != component.element_order
+        ):
+            failure_reason = "硬件组件语义、顺序、置信度或官方来源不足"
+            break
+        candidate.extend(rendered)
+        _append_unique_references(used_references, references)
+        if component.kind in _GRIPPER_COMPONENTS:
+            grippers.append((machine_slice, component))
+        cursor = machine_slice.end
+
+    citations = _citation_payloads(tuple(used_references))
+    if failure_reason is None and cursor != width:
+        failure_reason = "机器切片未完整覆盖整个向量"
+    if failure_reason is None and (
+        len(candidate) != width
+        or len(candidate) != len(set(candidate))
+        or not are_standard_machine_names(tuple(candidate))
+    ):
+        failure_reason = "渲染后的整组机器 names 长度、顺序或唯一性无效"
+    if failure_reason is not None:
+        return _invalid_machine_plan(
+            machine,
+            source_key,
+            source_names,
+            assignment,
+            failure_reason,
+            candidate=None,
+            citations=citations,
+        )
+
+    if has_standard_gripper:
+        source_gripper_indices = {
+            index
+            for index, name in enumerate(standard_names or ())
+            if name.endswith("_gripper_open")
+            or name.endswith("_gripper_open_scale")
+        }
+        mapped_gripper_indices = {machine_slice.start for machine_slice, _ in grippers}
+        if source_gripper_indices != mapped_gripper_indices:
+            return _invalid_machine_plan(
+                machine,
+                source_key,
+                source_names,
+                assignment,
+                "标准夹爪名称与已确认的夹爪切片位置不一致",
+                candidate=None,
+                citations=citations,
+            )
+
+    for machine_slice, component in grippers:
+        issue_code, reason, issue_evidence = _validate_gripper_range(
+            machine, machine_slice, component, candidate
+        )
+        if issue_code is not None and reason is not None:
+            return _invalid_machine_plan(
+                machine,
+                source_key,
+                source_names,
+                assignment,
+                reason,
+                issue_code=issue_code,
+                candidate=candidate,
+                citations=citations,
+                issue_evidence=issue_evidence,
+            )
+
+    return _MachinePlan(
+        machine,
+        source_key,
+        source_names,
+        assignment,
+        candidate,
+        citations,
+        True,
+        standard_names is not None,
+        "",
+        (
+            "源机器 names 已逐项符合 PDF 标准，保持原样"
+            if standard_names is not None
+            else "机器切片、组件顺序、官方来源和实测范围均满足自动应用条件"
+        ),
+        {},
+    )
+
+
+def _fallback_machine_plans(
+    evidence: DatasetEvidence,
+    reason: str,
+) -> tuple[tuple[MappingRecord, ...], tuple[Issue, ...]]:
+    if type(evidence.machines) is not tuple:
+        return (), (Issue("MACHINE_MAPPING_INVALID", reason, "features"),)
+    features = _feature_mapping(evidence.source_info)
+    records: list[MappingRecord] = []
+    issues: list[Issue] = []
+    for index, machine in enumerate(evidence.machines):
+        source_key = _machine_source_key(machine)
+        if source_key is None:
+            source_key = f"<invalid-machine-{index}>"
+            source_names = None
+            decision = "review"
+            issue_code = "MACHINE_MAPPING_INVALID"
+            record_reason = "机器证据条目或 schema 结构无效"
+        else:
+            source_value = features.get(source_key) if features is not None else None
+            source_feature = source_value if type(source_value) is dict else None
+            source_names, width, source_error = _machine_source_names(
+                machine,
+                source_feature,
+                require_episode_lengths=True,
+            )
+            standard_names = (
+                _standard_machine_names(source_names, width)
+                if source_error is None
+                else None
+            )
+            if standard_names is not None and not _standard_names_have_gripper(
+                standard_names
+            ):
+                decision = "keep"
+                issue_code = ""
+                record_reason = "源机器 names 已逐项符合 PDF 标准，保持原样"
+            elif standard_names is not None:
+                decision = "review"
+                issue_code = "GRIPPER_RANGE_UNCONFIRMED"
+                record_reason = "标准夹爪名称缺少可信硬件名义范围，保持原样待复核"
+            else:
+                decision = "review"
+                issue_code = "MACHINE_MAPPING_INVALID"
+                record_reason = source_error or reason
+        records.append(
+            MappingRecord(
+                f"features.{source_key}.names",
+                source_names,
+                deepcopy(source_names),
+                None,
+                False,
+                {},
+                (),
+                decision,
+                record_reason,
+            )
+        )
+        if issue_code:
+            issues.append(
+                Issue(
+                    issue_code,
+                    record_reason,
+                    f"features.{source_key}.names",
+                )
+            )
+    return tuple(records), tuple(issues)
+
+
+def _apply_machine_plans(
+    normalized_info: dict[str, object],
+    evidence: DatasetEvidence,
+    profile: HardwareProfile,
+    mapping: DatasetMapping,
+    confidence_threshold: float,
+) -> tuple[tuple[MappingRecord, ...], tuple[Issue, ...]]:
+    if type(evidence.machines) is not tuple:
+        return _fallback_machine_plans(
+            evidence, "机器证据容器必须是不可变 tuple"
+        )
+    assignment_groups: dict[str, list[MachineAssignment]] = {}
+    if type(mapping.machines) is tuple:
+        for assignment in mapping.machines:
+            if isinstance(assignment, MachineAssignment) and _safe_text(
+                assignment.source_feature
+            ):
+                assignment_groups.setdefault(
+                    assignment.source_feature, []
+                ).append(assignment)
+    component_groups: dict[str, list[MachineComponent]] = {}
+    if type(profile.components) is tuple:
+        for component in profile.components:
+            if isinstance(component, MachineComponent) and _safe_text(
+                component.component_id
+            ):
+                component_groups.setdefault(component.component_id, []).append(
+                    component
+                )
+    components = {
+        component_id: matches[0]
+        for component_id, matches in component_groups.items()
+        if len(matches) == 1
+    }
+    evidence_counts: dict[str, int] = {}
+    for machine in evidence.machines:
+        source_key = _machine_source_key(machine)
+        if source_key is not None:
+            evidence_counts[source_key] = evidence_counts.get(source_key, 0) + 1
+    sources = _source_index(profile)
+    source_features = _feature_mapping(evidence.source_info)
+    output_features = _feature_mapping(normalized_info)
+    plans: list[_MachinePlan] = []
+    for index, machine in enumerate(evidence.machines):
+        source_key = _machine_source_key(machine)
+        if source_key is None:
+            plans.append(
+                _invalid_machine_plan(
+                    machine,
+                    f"<invalid-machine-{index}>",
+                    None,
+                    None,
+                    "机器证据条目或 schema 结构无效",
+                )
+            )
+            continue
+        source_value = (
+            source_features.get(source_key) if source_features is not None else None
+        )
+        source_feature = source_value if type(source_value) is dict else None
+        matching_assignments = assignment_groups.get(source_key, [])
+        assignment = (
+            matching_assignments[0] if len(matching_assignments) == 1 else None
+        )
+        plans.append(
+            _build_machine_plan(
+                machine,
+                source_feature,
+                assignment,
+                components,
+                sources,
+                confidence_threshold,
+                structurally_unique=(
+                    evidence_counts.get(source_key) == 1
+                    and type(mapping.machines) is tuple
+                    and len(matching_assignments) == 1
+                ),
+            )
+        )
+
+    records: list[MappingRecord] = []
+    issues: list[Issue] = []
+    for plan in plans:
+        scope = f"features.{plan.source_key}.names"
+        source_names = deepcopy(plan.source_names)
+        if (
+            plan.ready
+            and not plan.already_standard
+            and plan.candidate is not None
+            and output_features is not None
+            and type(output_features.get(plan.source_key)) is dict
+        ):
+            output_feature = output_features[plan.source_key]
+            output_feature["names"] = list(plan.candidate)
+        final_feature = (
+            output_features.get(plan.source_key)
+            if output_features is not None
+            else None
+        )
+        output_names = (
+            deepcopy(final_feature.get("names"))
+            if type(final_feature) is dict and "names" in final_feature
+            else None
+        )
+        if plan.ready:
+            changed = source_names != output_names
+            decision = "apply" if changed else "keep"
+        else:
+            changed = False
+            decision = "review"
+            issues.append(
+                Issue(
+                    plan.issue_code,
+                    plan.reason,
+                    scope,
+                    plan.issue_evidence,
+                )
+            )
+        records.append(
+            MappingRecord(
+                source_address=scope,
+                source=source_names,
+                output=output_names,
+                candidate=(
+                    list(plan.candidate) if plan.candidate is not None else None
+                ),
+                changed=changed,
+                vlm_semantics=_safe_machine_assignment_semantics(plan.assignment),
+                citations=plan.citations,
+                decision=decision,
+                reason=plan.reason,
+            )
+        )
+    return tuple(records), tuple(issues)
+
+
 def apply_standard(
     evidence: DatasetEvidence,
     profile: HardwareProfile | None,
@@ -1285,7 +2001,7 @@ def apply_standard(
     confidence_threshold: float,
     extra_issues: Sequence[Issue] = (),
 ) -> NormalizationResult:
-    """Apply only fully sourced identity and camera changes to a source copy."""
+    """Apply only fully sourced identity, camera, and atomic machine changes."""
 
     if not _is_finite_number(confidence_threshold):
         raise ValueError("confidence_threshold 必须是 0 到 1 的有限内置数字")
@@ -1314,10 +2030,27 @@ def apply_standard(
             identity_reliable=identity_reliable,
         )
     issues.extend(camera_issues)
+    if allow_change and isinstance(profile, HardwareProfile) and isinstance(
+        mapping, DatasetMapping
+    ):
+        machine_records, machine_issues = _apply_machine_plans(
+            normalized_info,
+            evidence,
+            profile,
+            mapping,
+            confidence_threshold,
+        )
+        issues.extend(machine_issues)
+    else:
+        machine_records, machine_issues = _fallback_machine_plans(
+            evidence,
+            "缺少完整硬件画像或整体映射，机器 names 保持源值",
+        )
+        issues.extend(machine_issues)
     return NormalizationResult(
         normalized_info=normalized_info,
         robot_identity=identity_record,
         camera_mappings=camera_records,
-        machine_mappings=(),
+        machine_mappings=machine_records,
         issues=tuple(issues),
     )
