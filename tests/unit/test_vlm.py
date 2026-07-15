@@ -166,6 +166,45 @@ class VlmTransportTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.make_transport(base_url=base_url)
 
+    def test_constructor_rejects_unsafe_base_url_authority_and_characters(self) -> None:
+        invalid_urls = (
+            "https://user:secret@example.test/v1",
+            "https://@example.test/v1",
+            "https://:secret@example.test/v1",
+            "https://example.test:abc/v1",
+            "https://example.test:0/v1",
+            "https://example.test:70000/v1",
+            "https://example.test:/v1",
+            "https://[::1]:/v1",
+            "https://exa mple.test/v1",
+            "https://example.test/v1\tsegment",
+            "https://example.test/v1\nsegment",
+            "https://example.test/v1\rsegment",
+            "https://example.test/v1\x00segment",
+            "https://example.test/v1\x1fsegment",
+            "https://example.test/v1\u2003segment",
+            "https://[::1/v1",
+            "https://:443/v1",
+            "https://example.test/v1?",
+            "https://example.test/v1#",
+        )
+        for base_url in invalid_urls:
+            with self.subTest(base_url=repr(base_url)):
+                with self.assertRaises(ValueError) as caught:
+                    self.make_transport(base_url=base_url)
+                self.assertEqual(
+                    str(caught.exception), "base_url must be a valid HTTP(S) base URL"
+                )
+
+    def test_constructor_accepts_valid_port_boundaries(self) -> None:
+        for port in (1, 65535):
+            with self.subTest(port=port):
+                base_url = f"https://example.test:{port}/v1/"
+                transport = self.make_transport(base_url=base_url)
+                self.assertEqual(
+                    transport.base_url, f"https://example.test:{port}/v1"
+                )
+
     def test_constructor_rejects_invalid_numeric_configuration(self) -> None:
         invalid_values = (
             ("timeout_seconds", 0),

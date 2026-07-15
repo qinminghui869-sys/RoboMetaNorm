@@ -32,6 +32,8 @@ _ISSUE_MESSAGES = {
     "VLM_RESPONSE_INVALID": "The VLM service returned an invalid response.",
 }
 
+_BASE_URL_ERROR = "base_url must be a valid HTTP(S) base URL"
+
 
 class _InvalidResponse(ValueError):
     """Internal marker for a response that violates the transport contract."""
@@ -63,6 +65,50 @@ def _require_text(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ValueError(f"{name} must be a non-empty string without outer whitespace")
     return value
+
+
+def _normalize_base_url(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(_BASE_URL_ERROR)
+    if any(
+        character.isspace()
+        or ord(character) < 32
+        or 127 <= ord(character) <= 159
+        for character in value
+    ):
+        raise ValueError(_BASE_URL_ERROR)
+
+    normalized = value.rstrip("/")
+    if not normalized or "?" in normalized or "#" in normalized:
+        raise ValueError(_BASE_URL_ERROR)
+
+    split_url = None
+    hostname = None
+    username = None
+    password = None
+    port = None
+    parse_failed = False
+    try:
+        split_url = urlsplit(normalized)
+        hostname = split_url.hostname
+        username = split_url.username
+        password = split_url.password
+        port = split_url.port
+    except ValueError:
+        parse_failed = True
+
+    if parse_failed or split_url is None:
+        raise ValueError(_BASE_URL_ERROR)
+    if (
+        split_url.scheme not in {"http", "https"}
+        or not hostname
+        or username is not None
+        or password is not None
+        or split_url.netloc.endswith(":")
+        or (port is not None and (type(port) is not int or not 1 <= port <= 65535))
+    ):
+        raise ValueError(_BASE_URL_ERROR)
+    return normalized
 
 
 def _require_finite_number(
@@ -185,16 +231,7 @@ class OpenAICompatibleTransport:
         retry_backoff_seconds: float = 1.0,
         max_tokens: int = 1024,
     ) -> None:
-        base_url = _require_text("base_url", base_url).rstrip("/")
-        split_url = urlsplit(base_url)
-        if (
-            split_url.scheme not in {"http", "https"}
-            or not split_url.netloc
-            or split_url.query
-            or split_url.fragment
-        ):
-            raise ValueError("base_url must be an HTTP(S) URL without query or fragment")
-        self.base_url = base_url
+        self.base_url = _normalize_base_url(base_url)
         self.model = _require_text("model", model)
         self.api_key_env = _require_text("api_key_env", api_key_env)
         if api_key is not None and not isinstance(api_key, str):
