@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from decimal import Decimal
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pyarrow as pa
@@ -18,12 +21,17 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.evidence import (
+    collect_camera_evidence,
+    collect_dataset_evidence,
     collect_identity_evidence,
     collect_mapped_gripper_ranges,
     collect_machine_evidence,
+    extract_midpoint_frame,
+    probe_media,
     read_info,
 )
 from robometanorm.models import (
+    CameraEvidence,
     DatasetCandidate,
     DatasetEvidence,
     DatasetMapping,
@@ -36,6 +44,7 @@ from robometanorm.models import (
     MachineComponent,
     MachineEvidence,
     MachineSlice,
+    MediaSample,
     RobotIdentityFact,
 )
 
@@ -1550,6 +1559,1208 @@ class MappedGripperRangeTest(unittest.TestCase):
         serialized = json.dumps(issue.evidence, ensure_ascii=False)
         selected_candidate = candidate or self.candidate
         self.assertNotIn(str(selected_candidate.source_path), serialized)
+
+
+class CameraEvidenceTest(unittest.TestCase):
+    """Verify bounded, exact, read-only camera evidence collection."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.dataset_path = self.root / "acme_camera_dataset"
+        self.meta_path = self.dataset_path / "meta"
+        self.data_path = self.dataset_path / "data"
+        self.video_path = self.dataset_path / "videos"
+        self.depth_path = self.dataset_path / "depth"
+        for directory in (
+            self.meta_path,
+            self.data_path,
+            self.video_path,
+            self.depth_path,
+        ):
+            directory.mkdir(parents=True)
+        self.info_path = self.meta_path / "info.json"
+        self.info_path.write_text("{}", encoding="utf-8")
+        self.source_key = "observation.images.source_camera"
+        self.candidate = DatasetCandidate(
+            dataset_name=self.dataset_path.name,
+            task_name=None,
+            source_path=self.dataset_path,
+            layout_type=LayoutType.FLAT,
+            info_path=self.info_path,
+            data_path=self.data_path,
+            video_path=self.video_path,
+            depth_path=self.depth_path,
+        )
+        self.temp_frames = self.root / "temporary-frames"
+
+    def test_camera_schema_accepts_only_exact_image_feature_prefix(self) -> None:
+        raw_dtype = {"raw": "dtype"}
+        raw_fps = [30, "raw"]
+        raw_codec = {"name": "raw-codec"}
+        source_info: dict[str, object] = {
+            "features": {
+                self.source_key: {
+                    "dtype": raw_dtype,
+                    "shape": [480, "raw", None],
+                    "names": ("height", "width", "channel"),
+                    "fps": raw_fps,
+                    "codec": raw_codec,
+                },
+                "observation.tactile.palm": {"dtype": "image"},
+                "observation.audio.microphone": {"dtype": "audio"},
+                "images.source_camera": {"dtype": "video"},
+                7: {"dtype": "video"},
+                "observation.images.not_a_mapping": "video",
+            }
+        }
+
+        cameras, issues = collect_camera_evidence(
+            self.candidate, source_info, self.temp_frames
+        )
+
+        self.assertEqual(len(cameras), 1)
+        self.assertIsInstance(cameras[0], CameraEvidence)
+        self.assertEqual(cameras[0].schema.source_key, self.source_key)
+        self.assertIs(cameras[0].schema.dtype, raw_dtype)
+        self.assertEqual(cameras[0].schema.shape, (480, "raw", None))
+        self.assertEqual(
+            cameras[0].schema.names, ("height", "width", "channel")
+        )
+        self.assertIs(cameras[0].schema.fps, raw_fps)
+        self.assertIs(cameras[0].schema.codec, raw_codec)
+        self.assertEqual([issue.code for issue in issues], ["CAMERA_MEDIA_MISSING"])
+
+    def test_matches_only_full_source_key_relative_parent_part(self) -> None:
+        exact = self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.MP4",
+        )
+        self._write_media(
+            self.video_path,
+            "chunk-000/source_camera/episode_alias.mp4",
+        )
+        self._write_media(
+            self.video_path,
+            f"chunk-000/prefix-{self.source_key}-suffix/episode_substring.mp4",
+        )
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}.mp4",
+        )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ) as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(issues, ())
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [exact])
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(
+            cameras[0].samples[0].relative_path,
+            exact.relative_to(self.dataset_path).as_posix(),
+        )
+
+    def test_does_not_match_source_key_in_absolute_ancestor(self) -> None:
+        ancestor = self.root / self.source_key
+        dataset_path = ancestor / "dataset"
+        video_path = dataset_path / "videos"
+        meta_path = dataset_path / "meta"
+        video_path.mkdir(parents=True)
+        meta_path.mkdir()
+        info_path = meta_path / "info.json"
+        info_path.write_text("{}", encoding="utf-8")
+        self._write_media(video_path, "chunk-000/episode_000000.mp4")
+        candidate = replace(
+            self.candidate,
+            source_path=dataset_path,
+            info_path=info_path,
+            data_path=None,
+            video_path=video_path,
+            depth_path=None,
+        )
+
+        with patch("robometanorm.evidence.probe_media") as probe:
+            cameras, issues = collect_camera_evidence(
+                candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(cameras[0].samples, ())
+        self.assertEqual([issue.code for issue in issues], ["CAMERA_MEDIA_MISSING"])
+        probe.assert_not_called()
+
+    def test_three_media_files_sample_only_stable_first_and_last(self) -> None:
+        media_paths = [
+            self._write_media(
+                self.video_path,
+                f"chunk-000/{self.source_key}/episode_{index:06d}.mp4",
+            )
+            for index in range(3)
+        ]
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ) as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        selected = [media_paths[0], media_paths[-1]]
+        self.assertEqual([call.args[0] for call in probe.call_args_list], selected)
+        self.assertEqual([call.args[0] for call in extract.call_args_list], selected)
+        self.assertEqual(len(cameras[0].samples), 2)
+        self.assertEqual(issues, ())
+
+    def test_one_media_file_is_not_duplicated(self) -> None:
+        media_path = self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ) as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [media_path])
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(len(cameras[0].samples), 1)
+        self.assertEqual(issues, ())
+
+    def test_two_media_files_are_each_sampled_once(self) -> None:
+        media_paths = [
+            self._write_media(
+                self.video_path,
+                f"chunk-000/{self.source_key}/episode_{index:06d}.webm",
+            )
+            for index in range(2)
+        ]
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ) as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual([call.args[0] for call in probe.call_args_list], media_paths)
+        self.assertEqual(extract.call_count, 2)
+        self.assertEqual(len(cameras[0].samples), 2)
+        self.assertEqual(issues, ())
+
+    def test_overlapping_media_roots_deduplicate_same_path(self) -> None:
+        nested_root = self.video_path / "nested"
+        media_path = self._write_media(
+            nested_root,
+            f"chunk-000/{self.source_key}/episode_000000.mov",
+        )
+        candidate = replace(self.candidate, depth_path=nested_root)
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ) as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [media_path])
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(len(cameras[0].samples), 1)
+        self.assertEqual(issues, ())
+
+    def test_external_media_root_uses_safe_logical_relative_path(self) -> None:
+        external_root = self.root / "external-media"
+        media_path = self._write_media(
+            external_root,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+        candidate = replace(
+            self.candidate, video_path=external_root, depth_path=None
+        )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=replace(
+                    self._probed_sample(),
+                    relative_path=f"/secret/{self.dataset_path.name}.mp4",
+                ),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ),
+        ):
+            cameras, issues = collect_camera_evidence(
+                candidate, self._camera_info(), self.temp_frames
+            )
+
+        expected = "videos/" + media_path.relative_to(external_root).as_posix()
+        self.assertEqual(cameras[0].samples[0].relative_path, expected)
+        self.assertFalse(cameras[0].samples[0].relative_path.startswith("/"))
+        self.assertNotIn(str(external_root), cameras[0].samples[0].relative_path)
+        self.assertEqual(issues, ())
+
+    def test_static_image_is_used_directly_without_media_tools(self) -> None:
+        image_path = self._write_media(
+            self.depth_path,
+            f"chunk-000/{self.source_key}/episode_000000.JPG",
+            payload=b"immutable-image",
+        )
+        before_hash = self._sha256(image_path)
+
+        with (
+            patch("robometanorm.evidence.probe_media") as probe,
+            patch("robometanorm.evidence.extract_midpoint_frame") as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        sample = cameras[0].samples[0]
+        self.assertEqual(sample.media_type, "image")
+        self.assertEqual(sample.frame_path, image_path)
+        self.assertEqual(sample.relative_path, "depth/chunk-000/" + self.source_key + "/episode_000000.JPG")
+        self.assertIsNone(sample.codec)
+        self.assertIsNone(sample.duration_seconds)
+        self.assertEqual(self._sha256(image_path), before_hash)
+        self.assertEqual(issues, ())
+        probe.assert_not_called()
+        extract.assert_not_called()
+
+    def test_missing_exact_media_is_review_without_alias_guess(self) -> None:
+        self._write_media(
+            self.video_path,
+            "chunk-000/source_camera/episode_000000.mp4",
+        )
+
+        with (
+            patch("robometanorm.evidence.probe_media") as probe,
+            patch("robometanorm.evidence.extract_midpoint_frame") as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(cameras[0].samples, ())
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].code, "CAMERA_MEDIA_MISSING")
+        self.assertEqual(issues[0].evidence, {"source_key": self.source_key})
+        probe.assert_not_called()
+        extract.assert_not_called()
+
+    def test_probe_failure_is_isolated_and_issue_contains_only_safe_evidence(self) -> None:
+        media_paths = [
+            self._write_media(
+                self.video_path,
+                f"chunk-000/{self.source_key}/episode_{index:06d}.mp4",
+            )
+            for index in range(2)
+        ]
+
+        def probe(path: Path) -> MediaSample:
+            if path == media_paths[0]:
+                raise ValueError(f"secret stderr and path {path}")
+            return self._probed_sample()
+
+        with (
+            patch("robometanorm.evidence.probe_media", side_effect=probe) as mocked_probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ) as extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(mocked_probe.call_count, 2)
+        self.assertEqual(extract.call_count, 1)
+        self.assertEqual(len(cameras[0].samples), 1)
+        self.assertEqual(issues[0].code, "MEDIA_PROBE_FAILED")
+        self.assertEqual(
+            issues[0].evidence,
+            {
+                "source_key": self.source_key,
+                "relative_path": media_paths[0]
+                .relative_to(self.dataset_path)
+                .as_posix(),
+                "error_type": "ValueError",
+            },
+        )
+        serialized = json.dumps(issues[0].evidence, ensure_ascii=False)
+        self.assertNotIn(str(self.dataset_path), serialized)
+        self.assertNotIn("secret", serialized)
+
+    def test_frame_failure_keeps_probe_sample_and_continues(self) -> None:
+        media_paths = [
+            self._write_media(
+                self.video_path,
+                f"chunk-000/{self.source_key}/episode_{index:06d}.mkv",
+            )
+            for index in range(2)
+        ]
+
+        def extract(path: Path, output: Path) -> Path:
+            if path == media_paths[0]:
+                raise ValueError(f"secret command {path}")
+            return self._create_frame(path, output)
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ) as probe,
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=extract,
+            ) as mocked_extract,
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(mocked_extract.call_count, 2)
+        self.assertEqual(len(cameras[0].samples), 2)
+        self.assertIsNone(cameras[0].samples[0].frame_path)
+        self.assertTrue(cameras[0].samples[1].frame_path.is_file())
+        self.assertEqual(issues[0].code, "FRAME_EXTRACTION_FAILED")
+        self.assertEqual(
+            issues[0].evidence,
+            {
+                "source_key": self.source_key,
+                "relative_path": media_paths[0]
+                .relative_to(self.dataset_path)
+                .as_posix(),
+                "error_type": "ValueError",
+            },
+        )
+
+    def test_frame_failure_discards_partial_temporary_output(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+
+        def fail_after_write(media_path: Path, output_path: Path) -> Path:
+            del media_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"partial-frame")
+            raise ValueError("failed after partial output")
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=fail_after_write,
+            ),
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        self.assertIsNone(cameras[0].samples[0].frame_path)
+        self.assertEqual([issue.code for issue in issues], ["FRAME_EXTRACTION_FAILED"])
+        self.assertEqual(list(self.temp_frames.glob("*")), [])
+
+    def test_collection_propagates_probe_memory_error(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+
+        with patch(
+            "robometanorm.evidence.probe_media", side_effect=MemoryError("oom")
+        ):
+            with self.assertRaises(MemoryError):
+                collect_camera_evidence(
+                    self.candidate, self._camera_info(), self.temp_frames
+                )
+
+    def test_collection_propagates_frame_memory_error(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=MemoryError("oom"),
+            ),
+        ):
+            with self.assertRaises(MemoryError):
+                collect_camera_evidence(
+                    self.candidate, self._camera_info(), self.temp_frames
+                )
+
+    def test_collection_propagates_unexpected_runtime_errors(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+        with patch(
+            "robometanorm.evidence.probe_media",
+            side_effect=RuntimeError("unexpected programmer error"),
+        ):
+            with self.assertRaises(RuntimeError):
+                collect_camera_evidence(
+                    self.candidate, self._camera_info(), self.temp_frames
+                )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=RuntimeError("unexpected programmer error"),
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                collect_camera_evidence(
+                    self.candidate, self._camera_info(), self.temp_frames
+                )
+
+    def test_probe_media_parses_first_video_stream_and_uses_safe_command(self) -> None:
+        payload = {
+            "streams": [
+                {"codec_type": "audio", "codec_name": "aac"},
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "r_frame_rate": "30000/1001",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "9.5",
+                    "pix_fmt": "yuv420p",
+                },
+                {
+                    "codec_type": "video",
+                    "codec_name": "ignored",
+                    "r_frame_rate": "1/1",
+                    "width": 1,
+                    "height": 1,
+                    "duration": "1",
+                },
+            ],
+            "format": {"duration": "4.25"},
+        }
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr=f"secret {self.dataset_path}",
+        )
+
+        with patch("robometanorm.evidence.subprocess.run", return_value=completed) as run:
+            sample = probe_media(self.video_path / "fictional.mp4")
+
+        self.assertEqual(sample.media_type, "video")
+        self.assertEqual(sample.codec, "h264")
+        self.assertAlmostEqual(sample.fps, 30000 / 1001)
+        self.assertEqual((sample.width, sample.height), (1920, 1080))
+        self.assertEqual(sample.duration_seconds, 4.25)
+        self.assertEqual(sample.pixel_format, "yuv420p")
+        self.assertEqual(sample.relative_path, "")
+        self.assertIsNone(sample.frame_path)
+        command = run.call_args.args[0]
+        self.assertIs(type(command), list)
+        self.assertEqual(command[0], "ffprobe")
+        self.assertEqual(command[-1], str(self.video_path / "fictional.mp4"))
+        self.assertEqual(
+            run.call_args.kwargs,
+            {"capture_output": True, "text": True, "check": False},
+        )
+
+    def test_probe_media_falls_back_to_positive_stream_duration(self) -> None:
+        payload = self._valid_probe_payload()
+        payload["format"] = {"duration": "N/A"}
+        streams = payload["streams"]
+        assert isinstance(streams, list)
+        streams[0]["duration"] = "2.75"
+
+        with patch(
+            "robometanorm.evidence.subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout=json.dumps(payload), stderr=""
+            ),
+        ):
+            sample = probe_media(self.video_path / "fictional.mp4")
+
+        self.assertEqual(sample.duration_seconds, 2.75)
+
+    def test_probe_media_rejects_invalid_payload_shapes(self) -> None:
+        invalid_payloads: tuple[object, ...] = (
+            [],
+            {"streams": "not-a-sequence"},
+            {"streams": [7]},
+            {"streams": [{"codec_type": "audio"}]},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with patch(
+                    "robometanorm.evidence.subprocess.run",
+                    return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(payload), stderr=""
+                    ),
+                ):
+                    with self.assertRaises(ValueError):
+                        probe_media(self.video_path / "fictional.mp4")
+
+    def test_probe_media_rejects_nonpositive_nonfinite_and_overflow_values(self) -> None:
+        mutations = (
+            ("fps", "0/0"),
+            ("fps", "0/1"),
+            ("fps", "-1/2"),
+            ("fps", "N/A"),
+            ("fps", "1" + "0" * 3_999),
+            ("width", 0),
+            ("width", True),
+            ("height", -1),
+            ("duration", "0"),
+            ("duration", "-1"),
+            ("duration", "NaN"),
+            ("duration", "Infinity"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field, value=str(value)[:24]):
+                payload = self._valid_probe_payload()
+                stream = payload["streams"][0]
+                if field == "fps":
+                    stream["r_frame_rate"] = value
+                elif field in {"width", "height"}:
+                    stream[field] = value
+                else:
+                    payload["format"] = {"duration": value}
+                    stream.pop("duration", None)
+                with patch(
+                    "robometanorm.evidence.subprocess.run",
+                    return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(payload), stderr=""
+                    ),
+                ):
+                    with self.assertRaises(ValueError):
+                        probe_media(self.video_path / "fictional.mp4")
+
+    def test_probe_media_converts_tool_and_json_failures_to_safe_value_error(self) -> None:
+        failing_results = (
+            SimpleNamespace(
+                returncode=2,
+                stdout="{}",
+                stderr=f"secret stderr {self.dataset_path}",
+            ),
+            SimpleNamespace(returncode=0, stdout="{bad-json", stderr="secret"),
+        )
+        for result in failing_results:
+            with self.subTest(returncode=result.returncode, stdout=result.stdout):
+                with patch(
+                    "robometanorm.evidence.subprocess.run", return_value=result
+                ):
+                    with self.assertRaises(ValueError) as caught:
+                        probe_media(self.video_path / "fictional.mp4")
+                self.assertNotIn(str(self.dataset_path), str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+
+        with patch(
+            "robometanorm.evidence.subprocess.run",
+            side_effect=OSError(f"secret {self.dataset_path}"),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                probe_media(self.video_path / "fictional.mp4")
+        self.assertNotIn(str(self.dataset_path), str(caught.exception))
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_probe_media_converts_timeout_to_value_error(self) -> None:
+        with patch(
+            "robometanorm.evidence.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                ["ffprobe", str(self.video_path / "secret.mp4")], 1
+            ),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                probe_media(self.video_path / "fictional.mp4")
+
+        self.assertNotIn(str(self.video_path), str(caught.exception))
+
+    def test_probe_media_rejects_noninteger_float_dimensions(self) -> None:
+        for field in ("width", "height"):
+            payload = self._valid_probe_payload()
+            payload["streams"][0][field] = 640.0
+            with self.subTest(field=field):
+                with patch(
+                    "robometanorm.evidence.subprocess.run",
+                    return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(payload), stderr=""
+                    ),
+                ):
+                    with self.assertRaises(ValueError):
+                        probe_media(self.video_path / "fictional.mp4")
+
+        with (
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout="{}", stderr="secret"
+                ),
+            ),
+            patch(
+                "robometanorm.evidence.json.loads",
+                side_effect=RecursionError("secret recursion"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                probe_media(self.video_path / "fictional.mp4")
+        self.assertNotIn("secret", str(caught.exception))
+
+    def test_probe_media_propagates_memory_error(self) -> None:
+        with patch(
+            "robometanorm.evidence.subprocess.run", side_effect=MemoryError("oom")
+        ):
+            with self.assertRaises(MemoryError):
+                probe_media(self.video_path / "fictional.mp4")
+
+    def test_extract_midpoint_frame_uses_duration_scale_and_safe_command(self) -> None:
+        output_path = self.root / "new-parent" / "frame.jpg"
+
+        def run(command: list[str], **kwargs: object) -> object:
+            self.assertTrue(output_path.parent.is_dir())
+            Path(command[-1]).write_bytes(b"jpeg-frame")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(duration=10.0),
+            ) as probe,
+            patch("robometanorm.evidence.subprocess.run", side_effect=run) as mocked_run,
+        ):
+            result = extract_midpoint_frame(
+                self.video_path / "fictional.mp4", output_path
+            )
+
+        self.assertEqual(result, output_path)
+        self.assertEqual(output_path.read_bytes(), b"jpeg-frame")
+        probe.assert_called_once_with(self.video_path / "fictional.mp4")
+        command = mocked_run.call_args.args[0]
+        self.assertIs(type(command), list)
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertEqual(float(command[command.index("-ss") + 1]), 5.0)
+        self.assertEqual(
+            command[command.index("-vf") + 1],
+            "scale=1280:-2:force_original_aspect_ratio=decrease",
+        )
+        self.assertEqual(command[-1], str(output_path))
+        self.assertEqual(
+            mocked_run.call_args.kwargs,
+            {"capture_output": True, "text": True, "check": False},
+        )
+
+    def test_extract_midpoint_frame_rejects_unusable_duration(self) -> None:
+        for duration in (None, 0.0, -1.0, float("nan"), float("inf")):
+            with self.subTest(duration=duration):
+                with (
+                    patch(
+                        "robometanorm.evidence.probe_media",
+                        return_value=self._probed_sample(duration=duration),
+                    ),
+                    patch("robometanorm.evidence.subprocess.run") as run,
+                ):
+                    with self.assertRaises(ValueError):
+                        extract_midpoint_frame(
+                            self.video_path / "fictional.mp4",
+                            self.root / "frame.jpg",
+                        )
+                run.assert_not_called()
+
+    def test_extract_midpoint_frame_rejects_tool_failure_or_missing_output(self) -> None:
+        results = (
+            SimpleNamespace(returncode=1, stdout="", stderr="secret"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        for result in results:
+            with self.subTest(returncode=result.returncode):
+                output_path = self.root / f"frame-{result.returncode}.jpg"
+                with (
+                    patch(
+                        "robometanorm.evidence.probe_media",
+                        return_value=self._probed_sample(),
+                    ),
+                    patch(
+                        "robometanorm.evidence.subprocess.run", return_value=result
+                    ),
+                ):
+                    with self.assertRaises(ValueError) as caught:
+                        extract_midpoint_frame(
+                            self.video_path / "fictional.mp4", output_path
+                        )
+                self.assertNotIn("secret", str(caught.exception))
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                side_effect=OSError(f"secret {self.dataset_path}"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as caught:
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", self.root / "frame-os.jpg"
+                )
+        self.assertNotIn(str(self.dataset_path), str(caught.exception))
+
+    def test_extract_midpoint_frame_removes_stale_output_before_running(self) -> None:
+        output_path = self.root / "stale-frame.jpg"
+        output_path.write_bytes(b"stale-frame-must-not-count")
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", output_path
+                )
+
+        self.assertFalse(output_path.exists())
+
+    def test_extract_midpoint_frame_discards_partial_output_on_safe_errors(self) -> None:
+        tool_error_output = self.root / "partial-tool-error.jpg"
+
+        def write_then_fail(command: list[str], **kwargs: object) -> object:
+            del kwargs
+            Path(command[-1]).write_bytes(b"partial-tool-output")
+            raise OSError("tool failed after writing")
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                side_effect=write_then_fail,
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", tool_error_output
+                )
+        self.assertFalse(tool_error_output.exists())
+
+        stat_error_output = self.root / "partial-stat-error.jpg"
+
+        def write_frame(command: list[str], **kwargs: object) -> object:
+            del kwargs
+            Path(command[-1]).write_bytes(b"partial-stat-output")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                side_effect=write_frame,
+            ),
+            patch("pathlib.Path.is_file", return_value=True),
+            patch("pathlib.Path.stat", side_effect=OSError("stat failed")),
+        ):
+            with self.assertRaises(ValueError):
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", stat_error_output
+                )
+        self.assertFalse(stat_error_output.exists())
+
+    def test_extract_midpoint_frame_never_uses_source_media_as_output(self) -> None:
+        media_path = self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/immutable.mp4",
+            payload=b"immutable-video",
+        )
+        before_hash = self._sha256(media_path)
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch("robometanorm.evidence.subprocess.run") as run,
+        ):
+            with self.assertRaises(ValueError):
+                extract_midpoint_frame(media_path, media_path)
+
+        run.assert_not_called()
+        self.assertEqual(self._sha256(media_path), before_hash)
+
+    def test_extract_midpoint_frame_propagates_memory_error(self) -> None:
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.subprocess.run",
+                side_effect=MemoryError("oom"),
+            ),
+        ):
+            with self.assertRaises(MemoryError):
+                extract_midpoint_frame(
+                    self.video_path / "fictional.mp4", self.root / "frame.jpg"
+                )
+
+    def test_dataset_evidence_frames_exist_inside_context_and_are_removed_after(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ),
+        ):
+            with collect_dataset_evidence(
+                self.candidate, self._camera_info()
+            ) as evidence:
+                frame_paths = tuple(
+                    sample.frame_path
+                    for camera in evidence.cameras
+                    for sample in camera.samples
+                )
+                self.assertTrue(frame_paths)
+                self.assertTrue(
+                    all(path is not None and path.is_file() for path in frame_paths)
+                )
+                self.assertTrue(
+                    all(
+                        path is not None
+                        and path.name.startswith("frame-")
+                        and path.parent.name.startswith("robometanorm-mini-")
+                        for path in frame_paths
+                    )
+                )
+
+        self.assertTrue(
+            all(path is not None and not path.exists() for path in frame_paths)
+        )
+
+    def test_dataset_evidence_removes_frames_after_context_exception(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+        frame_path: Path | None = None
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "consumer failed"):
+                with collect_dataset_evidence(
+                    self.candidate, self._camera_info()
+                ) as evidence:
+                    frame_path = evidence.cameras[0].samples[0].frame_path
+                    self.assertIsNotNone(frame_path)
+                    assert frame_path is not None
+                    self.assertTrue(frame_path.is_file())
+                    raise RuntimeError("consumer failed")
+
+        self.assertIsNotNone(frame_path)
+        assert frame_path is not None
+        self.assertFalse(frame_path.exists())
+
+    def test_static_image_survives_dataset_context_unchanged(self) -> None:
+        image_path = self._write_media(
+            self.depth_path,
+            f"chunk-000/{self.source_key}/episode_000000.png",
+            payload=b"immutable-static-image",
+        )
+        before_hash = self._sha256(image_path)
+
+        with collect_dataset_evidence(
+            self.candidate, self._camera_info()
+        ) as evidence:
+            self.assertEqual(evidence.cameras[0].samples[0].frame_path, image_path)
+            self.assertTrue(image_path.is_file())
+
+        self.assertTrue(image_path.is_file())
+        self.assertEqual(self._sha256(image_path), before_hash)
+
+    def test_two_cameras_with_same_basename_get_distinct_safe_frame_paths(self) -> None:
+        source_keys = (
+            "observation.images.left_camera",
+            "observation.images.right_camera",
+        )
+        source_info = {
+            "features": {
+                source_key: {"dtype": "video", "shape": [1, 1, 3]}
+                for source_key in source_keys
+            }
+        }
+        for source_key in source_keys:
+            self._write_media(
+                self.video_path,
+                f"chunk-000/{source_key}/episode_000000.mp4",
+            )
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ),
+        ):
+            cameras, issues = collect_camera_evidence(
+                self.candidate, source_info, self.temp_frames
+            )
+
+        frame_paths = [camera.samples[0].frame_path for camera in cameras]
+        self.assertEqual(len(set(frame_paths)), 2)
+        self.assertTrue(
+            all(
+                path is not None and path.parent == self.temp_frames
+                for path in frame_paths
+            )
+        )
+        self.assertEqual(issues, ())
+
+    def test_media_issue_evidence_is_strict_json_safe(self) -> None:
+        self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.mp4",
+        )
+        with patch(
+            "robometanorm.evidence.probe_media", side_effect=ValueError("unsafe")
+        ):
+            _, issues = collect_camera_evidence(
+                self.candidate, self._camera_info(), self.temp_frames
+            )
+
+        json.dumps(issues[0].evidence, ensure_ascii=False, allow_nan=False)
+
+    def test_dataset_evidence_aggregates_issues_in_declared_order(self) -> None:
+        identity_issue = Issue("IDENTITY_REVIEW", "identity", "identity")
+        machine_issue = Issue("MACHINE_REVIEW", "machine", "machine")
+        camera_issue = Issue("CAMERA_REVIEW", "camera", "camera")
+        identity = IdentityEvidence(
+            "missing", None, "missing", None, "missing", (), (identity_issue,)
+        )
+        expected_source_info = self._camera_info()
+        observed_temp_paths: list[Path] = []
+
+        def collect_cameras(
+            candidate: DatasetCandidate,
+            source_info: object,
+            temp_frames: Path,
+        ) -> tuple[tuple[CameraEvidence, ...], tuple[Issue, ...]]:
+            observed_temp_paths.append(temp_frames)
+            self.assertEqual(candidate, self.candidate)
+            self.assertEqual(source_info, expected_source_info)
+            self.assertTrue(temp_frames.name.startswith("robometanorm-mini-"))
+            return (), (camera_issue,)
+
+        with (
+            patch(
+                "robometanorm.evidence.collect_identity_evidence",
+                return_value=identity,
+            ),
+            patch(
+                "robometanorm.evidence.collect_machine_evidence",
+                return_value=((), (machine_issue,)),
+            ),
+            patch(
+                "robometanorm.evidence.collect_camera_evidence",
+                side_effect=collect_cameras,
+            ),
+        ):
+            with collect_dataset_evidence(
+                self.candidate, expected_source_info
+            ) as evidence:
+                self.assertEqual(
+                    evidence.issues,
+                    (identity_issue, machine_issue, camera_issue),
+                )
+                self.assertEqual(evidence.source_info, expected_source_info)
+                self.assertIsNot(evidence.source_info, expected_source_info)
+                self.assertTrue(observed_temp_paths[0].is_dir())
+
+        self.assertFalse(observed_temp_paths[0].exists())
+
+    def test_collection_does_not_mutate_inputs_media_or_create_persistent_artifacts(self) -> None:
+        source_info = self._camera_info()
+        source_snapshot = deepcopy(source_info)
+        media_path = self._write_media(
+            self.video_path,
+            f"chunk-000/{self.source_key}/episode_000000.avi",
+            payload=b"immutable-video",
+        )
+        info_hash = self._sha256(self.info_path)
+        media_hash = self._sha256(media_path)
+        before_files = {
+            path.relative_to(self.dataset_path).as_posix()
+            for path in self.dataset_path.rglob("*")
+            if path.is_file()
+        }
+
+        with (
+            patch(
+                "robometanorm.evidence.probe_media",
+                return_value=self._probed_sample(),
+            ),
+            patch(
+                "robometanorm.evidence.extract_midpoint_frame",
+                side_effect=self._create_frame,
+            ),
+        ):
+            with collect_dataset_evidence(self.candidate, source_info):
+                pass
+
+        after_files = {
+            path.relative_to(self.dataset_path).as_posix()
+            for path in self.dataset_path.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(source_info, source_snapshot)
+        self.assertEqual(self._sha256(self.info_path), info_hash)
+        self.assertEqual(self._sha256(media_path), media_hash)
+        self.assertEqual(after_files, before_files)
+        self.assertEqual(list(self.dataset_path.rglob(".robometanorm_cache")), [])
+        self.assertEqual(list(self.dataset_path.rglob("preview*")), [])
+
+    def _camera_info(self) -> dict[str, object]:
+        return {
+            "robot_type": "acme_testbot",
+            "features": {
+                self.source_key: {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                    "names": ["height", "width", "channel"],
+                    "fps": 30,
+                    "codec": "h264",
+                }
+            },
+        }
+
+    @staticmethod
+    def _valid_probe_payload() -> dict[str, object]:
+        return {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "r_frame_rate": "20/1",
+                    "width": 640,
+                    "height": 480,
+                    "duration": "10.0",
+                    "pix_fmt": "yuv420p",
+                }
+            ],
+            "format": {"duration": "10.0"},
+        }
+
+    @staticmethod
+    def _probed_sample(duration: float | None = 10.0) -> MediaSample:
+        return MediaSample(
+            relative_path="ignored",
+            media_type="video",
+            codec="h264",
+            fps=20.0,
+            width=640,
+            height=480,
+            duration_seconds=duration,
+            pixel_format="yuv420p",
+            frame_path=None,
+        )
+
+    @staticmethod
+    def _create_frame(media_path: Path, output_path: Path) -> Path:
+        del media_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"jpeg-fixture")
+        return output_path
+
+    @staticmethod
+    def _write_media(root: Path, relative_path: str, payload: bytes = b"media") -> Path:
+        output_path = root / relative_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(payload)
+        return output_path
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 if __name__ == "__main__":

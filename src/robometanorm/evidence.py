@@ -1,20 +1,25 @@
-"""Collect raw robot identity evidence from dataset metadata."""
+"""Collect bounded, read-only evidence from local dataset inputs."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, time, timedelta
 from decimal import Decimal
+from fractions import Fraction
 import json
 import math
 from numbers import Number
 from pathlib import Path
+import subprocess
+import tempfile
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from robometanorm.models import (
+    CameraEvidence,
     DatasetCandidate,
     DatasetEvidence,
     DatasetMapping,
@@ -24,8 +29,14 @@ from robometanorm.models import (
     IdentityEvidence,
     Issue,
     MachineEvidence,
+    MediaSample,
     ParquetEpisodeEvidence,
 )
+
+
+_VIDEO_SUFFIXES = frozenset({".avi", ".mkv", ".mov", ".mp4", ".webm"})
+_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".webp"})
+_MEDIA_SUFFIXES = _VIDEO_SUFFIXES | _IMAGE_SUFFIXES
 
 
 def read_info(candidate: DatasetCandidate) -> dict[str, object]:
@@ -38,6 +49,399 @@ def read_info(candidate: DatasetCandidate) -> dict[str, object]:
     if not isinstance(source_info, dict):
         raise ValueError("info.json must contain a JSON object")
     return source_info
+
+
+def collect_camera_evidence(
+    candidate: DatasetCandidate,
+    source_info: Mapping[str, object],
+    temp_frames: Path,
+) -> tuple[tuple[CameraEvidence, ...], tuple[Issue, ...]]:
+    """Collect at most two exact-path media samples for each image feature."""
+    schemas = _camera_feature_schemas(source_info)
+    discovered_media = _discover_media(candidate)
+    issues: list[Issue] = []
+    cameras: list[CameraEvidence] = []
+    frame_sequence = 0
+
+    for schema in schemas:
+        matching_media = [
+            (path, relative_path, media_type)
+            for path, relative_path, media_type, parent_parts in discovered_media
+            if schema.source_key in parent_parts
+        ]
+        if len(matching_media) > 2:
+            matching_media = [matching_media[0], matching_media[-1]]
+        if not matching_media:
+            issues.append(
+                Issue(
+                    code="CAMERA_MEDIA_MISSING",
+                    message="No media matched the exact camera source path",
+                    scope=f"camera.{schema.source_key}",
+                    evidence={"source_key": schema.source_key},
+                )
+            )
+
+        samples: list[MediaSample] = []
+        for media_path, relative_path, media_type in matching_media:
+            if media_type == "image":
+                samples.append(
+                    MediaSample(
+                        relative_path=relative_path,
+                        media_type="image",
+                        codec=None,
+                        fps=None,
+                        width=None,
+                        height=None,
+                        duration_seconds=None,
+                        pixel_format=None,
+                        frame_path=media_path,
+                    )
+                )
+                continue
+
+            try:
+                probed_sample = probe_media(media_path)
+                sample = replace(
+                    probed_sample,
+                    relative_path=relative_path,
+                    media_type="video",
+                    frame_path=None,
+                )
+            except ValueError as error:
+                issues.append(
+                    _media_issue(
+                        code="MEDIA_PROBE_FAILED",
+                        message="Video metadata could not be probed",
+                        source_key=schema.source_key,
+                        relative_path=relative_path,
+                        error=error,
+                    )
+                )
+                continue
+
+            output_path = temp_frames / f"frame-{frame_sequence:06d}.jpg"
+            frame_sequence += 1
+            try:
+                extracted_path = extract_midpoint_frame(media_path, output_path)
+                if extracted_path != output_path or not output_path.is_file():
+                    raise ValueError("frame extraction returned no safe output")
+                sample = replace(sample, frame_path=output_path)
+            except ValueError as error:
+                _discard_frame_output(output_path)
+                issues.append(
+                    _media_issue(
+                        code="FRAME_EXTRACTION_FAILED",
+                        message="A representative video frame could not be extracted",
+                        source_key=schema.source_key,
+                        relative_path=relative_path,
+                        error=error,
+                    )
+                )
+            samples.append(sample)
+
+        cameras.append(CameraEvidence(schema=schema, samples=tuple(samples)))
+
+    return tuple(cameras), tuple(issues)
+
+
+def probe_media(media_path: Path) -> MediaSample:
+    """Probe one video with ffprobe without exposing tool diagnostics."""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        (
+            "stream=codec_type,codec_name,r_frame_rate,width,height,duration,pix_fmt:"
+            "format=duration"
+        ),
+        "-of",
+        "json",
+        str(media_path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("ffprobe could not be executed") from error
+    if completed.returncode != 0:
+        raise ValueError("ffprobe did not return usable metadata")
+
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise ValueError("ffprobe returned invalid JSON") from error
+    if not isinstance(payload, Mapping):
+        raise ValueError("ffprobe JSON must be an object")
+
+    streams = payload.get("streams")
+    if not isinstance(streams, Sequence) or isinstance(
+        streams, (str, bytes, bytearray)
+    ):
+        raise ValueError("ffprobe streams must be a sequence")
+
+    video_stream: Mapping[str, object] | None = None
+    for stream in streams:
+        if not isinstance(stream, Mapping):
+            raise ValueError("ffprobe stream must be an object")
+        if video_stream is None and stream.get("codec_type") == "video":
+            video_stream = stream
+    if video_stream is None:
+        raise ValueError("ffprobe returned no video stream")
+
+    fps = _positive_fraction(video_stream.get("r_frame_rate"))
+    width = _positive_dimension(video_stream.get("width"))
+    height = _positive_dimension(video_stream.get("height"))
+    if fps is None or width is None or height is None:
+        raise ValueError("ffprobe returned invalid video dimensions or frame rate")
+
+    raw_format = payload.get("format")
+    if raw_format is not None and not isinstance(raw_format, Mapping):
+        raise ValueError("ffprobe format must be an object")
+    format_duration = (
+        raw_format.get("duration") if isinstance(raw_format, Mapping) else None
+    )
+    duration = _positive_float(format_duration)
+    if duration is None:
+        duration = _positive_float(video_stream.get("duration"))
+    if duration is None:
+        raise ValueError("ffprobe returned no usable duration")
+
+    codec = video_stream.get("codec_name")
+    pixel_format = video_stream.get("pix_fmt")
+    return MediaSample(
+        relative_path="",
+        media_type="video",
+        codec=codec if isinstance(codec, str) else None,
+        fps=fps,
+        width=width,
+        height=height,
+        duration_seconds=duration,
+        pixel_format=pixel_format if isinstance(pixel_format, str) else None,
+        frame_path=None,
+    )
+
+
+def extract_midpoint_frame(media_path: Path, output_path: Path) -> Path:
+    """Extract one bounded JPEG at the temporal midpoint of a video."""
+    try:
+        if media_path.resolve(strict=False) == output_path.resolve(strict=False):
+            raise ValueError("frame output must differ from source media")
+    except (OSError, RuntimeError) as error:
+        raise ValueError("frame paths could not be validated") from error
+
+    media = probe_media(media_path)
+    duration = _positive_float(media.duration_seconds)
+    if duration is None:
+        raise ValueError("video duration is unusable")
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.unlink(missing_ok=True)
+    except OSError as error:
+        raise ValueError("frame output could not be prepared") from error
+
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-y",
+        "-ss",
+        str(duration * 0.5),
+        "-i",
+        str(media_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1280:-2:force_original_aspect_ratio=decrease",
+        str(output_path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        _discard_frame_output(output_path)
+        raise ValueError("ffmpeg could not be executed") from error
+    if completed.returncode != 0:
+        _discard_frame_output(output_path)
+        raise ValueError("ffmpeg did not extract a frame")
+    try:
+        output_is_usable = output_path.is_file() and output_path.stat().st_size > 0
+    except OSError as error:
+        _discard_frame_output(output_path)
+        raise ValueError("extracted frame could not be inspected") from error
+    if not output_is_usable:
+        _discard_frame_output(output_path)
+        raise ValueError("ffmpeg returned no frame")
+    return output_path
+
+
+@contextmanager
+def collect_dataset_evidence(
+    candidate: DatasetCandidate,
+    source_info: Mapping[str, object],
+) -> Iterator[DatasetEvidence]:
+    """Collect all local evidence while representative frames are available."""
+    with tempfile.TemporaryDirectory(prefix="robometanorm-mini-") as temp_name:
+        identity = collect_identity_evidence(candidate.info_path.parent, source_info)
+        machines, machine_issues = collect_machine_evidence(candidate, source_info)
+        cameras, camera_issues = collect_camera_evidence(
+            candidate, source_info, Path(temp_name)
+        )
+        yield DatasetEvidence(
+            candidate=candidate,
+            source_info=dict(source_info),
+            identity=identity,
+            cameras=cameras,
+            machines=machines,
+            issues=(*identity.issues, *machine_issues, *camera_issues),
+        )
+
+
+def _camera_feature_schemas(
+    source_info: Mapping[str, object],
+) -> tuple[FeatureSchema, ...]:
+    features = source_info.get("features")
+    if not isinstance(features, Mapping):
+        return ()
+    schemas: list[FeatureSchema] = []
+    for source_key, feature in features.items():
+        if (
+            not isinstance(source_key, str)
+            or not source_key.startswith("observation.images.")
+            or not isinstance(feature, Mapping)
+        ):
+            continue
+        shape = feature.get("shape")
+        names = feature.get("names")
+        schemas.append(
+            FeatureSchema(
+                source_key=source_key,
+                dtype=feature.get("dtype"),
+                shape=tuple(shape) if isinstance(shape, (list, tuple)) else (),
+                names=tuple(names) if isinstance(names, (list, tuple)) else (),
+                fps=feature.get("fps"),
+                codec=feature.get("codec"),
+            )
+        )
+    return tuple(schemas)
+
+
+def _discover_media(
+    candidate: DatasetCandidate,
+) -> tuple[tuple[Path, str, str, frozenset[str]], ...]:
+    roots = (
+        (candidate.video_path, "videos"),
+        (candidate.depth_path, "depth"),
+    )
+    discovered: dict[Path, tuple[str, str, set[str]]] = {}
+    for root, logical_name in roots:
+        if root is None or not root.is_dir():
+            continue
+        paths = sorted(
+            (
+                path
+                for path in root.rglob("*")
+                if path.is_file()
+                and path.suffix.lower() in _MEDIA_SUFFIXES
+            ),
+            key=lambda path: path.relative_to(root).as_posix(),
+        )
+        for path in paths:
+            relative_to_root = path.relative_to(root)
+            relative_path = _safe_media_relative_path(
+                candidate, path, relative_to_root, logical_name
+            )
+            media_type = (
+                "video" if path.suffix.lower() in _VIDEO_SUFFIXES else "image"
+            )
+            previous = discovered.get(path)
+            if previous is None:
+                discovered[path] = (
+                    relative_path,
+                    media_type,
+                    set(relative_to_root.parent.parts),
+                )
+            else:
+                previous[2].update(relative_to_root.parent.parts)
+
+    return tuple(
+        (path, relative_path, media_type, frozenset(parent_parts))
+        for path, (relative_path, media_type, parent_parts) in sorted(
+            discovered.items(), key=lambda item: item[1][0]
+        )
+    )
+
+
+def _safe_media_relative_path(
+    candidate: DatasetCandidate,
+    media_path: Path,
+    relative_to_root: Path,
+    logical_root: str,
+) -> str:
+    try:
+        return media_path.relative_to(candidate.source_path).as_posix()
+    except ValueError:
+        return (Path(logical_root) / relative_to_root).as_posix()
+
+
+def _media_issue(
+    *,
+    code: str,
+    message: str,
+    source_key: str,
+    relative_path: str,
+    error: BaseException,
+) -> Issue:
+    return Issue(
+        code=code,
+        message=message,
+        scope=f"camera.{source_key}",
+        evidence={
+            "source_key": source_key,
+            "relative_path": relative_path,
+            "error_type": type(error).__name__,
+        },
+    )
+
+
+def _positive_fraction(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = float(Fraction(value))
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _positive_dimension(value: object) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _positive_float(value: object) -> float | None:
+    if type(value) not in {str, int, float}:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _discard_frame_output(output_path: Path) -> None:
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def collect_identity_evidence(
