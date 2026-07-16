@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.models import (
     DatasetMapping,
+    DatasetResult,
     DatasetStatus,
     Issue,
     MachineAssignment,
@@ -234,6 +235,100 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertIsNone(results[0].source_info)
         self.assertEqual(results[0].changed_field_count, 0)
         self.assertEqual(results[1].source_info, second.info)
+
+    def test_scan_reports_each_completed_dataset_once_in_discovery_order(self) -> None:
+        self._create_dataset("dataset-b")
+        self.fixture.candidate.info_path.write_text("[", encoding="utf-8")
+        completed: list[tuple[int, int, str]] = []
+
+        def on_complete(index: int, total: int, result: DatasetResult) -> None:
+            completed.append((index, total, result.candidate.dataset_name))
+
+        from robometanorm.pipeline import scan_datasets
+
+        with self._media_stubs():
+            results = scan_datasets(self.root, progress=on_complete)
+
+        self.assertEqual(
+            [result.status for result in results],
+            [DatasetStatus.ERROR, DatasetStatus.PASS],
+        )
+        self.assertEqual(
+            [result.candidate.dataset_name for result in results],
+            ["dataset-a", "dataset-b"],
+        )
+        self.assertEqual(completed, [(1, 2, "dataset-a"), (2, 2, "dataset-b")])
+
+    def test_normalize_reports_each_completed_dataset_once_in_discovery_order(self) -> None:
+        self._create_dataset("dataset-b")
+        self.fixture.candidate.info_path.write_text("[", encoding="utf-8")
+        completed: list[tuple[int, int, str]] = []
+
+        def on_complete(index: int, total: int, result: DatasetResult) -> None:
+            completed.append((index, total, result.candidate.dataset_name))
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            results = normalize_datasets(
+                self.root,
+                vlm=self._success_vlm(),
+                confidence_threshold=0.85,
+                progress=on_complete,
+            )
+
+        self.assertEqual(
+            [result.status for result in results],
+            [DatasetStatus.ERROR, DatasetStatus.PASS],
+        )
+        self.assertEqual(
+            [result.candidate.dataset_name for result in results],
+            ["dataset-a", "dataset-b"],
+        )
+        self.assertEqual(completed, [(1, 2, "dataset-a"), (2, 2, "dataset-b")])
+
+    def test_scan_ignores_progress_callback_errors(self) -> None:
+        self._create_dataset("dataset-b")
+        attempted: list[tuple[int, int, str]] = []
+
+        def failing_progress(index: int, total: int, result: DatasetResult) -> None:
+            attempted.append((index, total, result.candidate.dataset_name))
+            raise OSError("terminal unavailable")
+
+        from robometanorm.pipeline import scan_datasets
+
+        with self._media_stubs():
+            results = scan_datasets(self.root, progress=failing_progress)
+
+        self.assertEqual(
+            [result.candidate.dataset_name for result in results],
+            ["dataset-a", "dataset-b"],
+        )
+        self.assertEqual(attempted, [(1, 2, "dataset-a"), (2, 2, "dataset-b")])
+
+    def test_normalize_ignores_progress_callback_errors(self) -> None:
+        self._create_dataset("dataset-b")
+        attempted: list[tuple[int, int, str]] = []
+
+        def failing_progress(index: int, total: int, result: DatasetResult) -> None:
+            attempted.append((index, total, result.candidate.dataset_name))
+            raise OSError("terminal unavailable")
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            results = normalize_datasets(
+                self.root,
+                vlm=self._success_vlm(),
+                confidence_threshold=0.85,
+                progress=failing_progress,
+            )
+
+        self.assertEqual(
+            [result.candidate.dataset_name for result in results],
+            ["dataset-a", "dataset-b"],
+        )
+        self.assertEqual(attempted, [(1, 2, "dataset-a"), (2, 2, "dataset-b")])
 
     def test_success_uses_one_research_map_and_range_then_writes_real_changes(self) -> None:
         vlm = self._success_vlm()

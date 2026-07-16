@@ -7,6 +7,8 @@ from collections.abc import Sequence
 import math
 import os
 from pathlib import Path
+import sys
+from typing import TextIO
 
 from robometanorm.models import DatasetResult, LayoutType
 from robometanorm.pipeline import normalize_datasets, scan_datasets
@@ -19,15 +21,40 @@ DEFAULT_VLM_API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 
 
+class _ProgressRenderer:
+    """Render completed datasets on one interactive terminal line."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self._wrote_update = False
+
+    def update(self, index: int, total: int, result: DatasetResult) -> None:
+        self._stream.write(
+            f"\r处理中 [{index}/{total}] {result.candidate.dataset_name}"
+        )
+        self._stream.flush()
+        self._wrote_update = True
+
+    def finish(self) -> None:
+        if self._wrote_update:
+            self._stream.write("\n")
+            self._stream.flush()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command and print the fixed four-column dataset summary."""
 
     parser = _build_parser()
     arguments = parser.parse_args(argv)
     layout = LayoutType(arguments.layout)
+    progress = _ProgressRenderer(sys.stderr) if sys.stderr.isatty() else None
     try:
         if arguments.command == "scan":
-            results = scan_datasets(arguments.root, layout)
+            results = scan_datasets(
+                arguments.root,
+                layout,
+                progress=progress.update if progress else None,
+            )
         else:
             vlm = _build_vlm(arguments, parser)
             results = normalize_datasets(
@@ -35,10 +62,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 layout,
                 vlm=vlm,
                 confidence_threshold=arguments.confidence_threshold,
+                progress=progress.update if progress else None,
             )
     except ValueError as error:
         parser.error(str(error))
         return 2
+    finally:
+        if progress is not None:
+            try:
+                progress.finish()
+            except MemoryError:
+                raise
+            except Exception:
+                pass
     print(_format_summary(results))
     return 0
 

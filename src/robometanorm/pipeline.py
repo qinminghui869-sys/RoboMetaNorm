@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 import importlib.metadata
 import math
@@ -54,6 +54,9 @@ _IDENTITY_UNRESOLVED = Issue(
 )
 
 
+ProgressCallback = Callable[[int, int, DatasetResult], None]
+
+
 def status_from_issues(issues: Sequence[Issue]) -> DatasetStatus:
     """Return the most severe status; unknown input fails closed to ERROR."""
 
@@ -87,11 +90,15 @@ def status_from_issues(issues: Sequence[Issue]) -> DatasetStatus:
 def scan_datasets(
     root: Path,
     layout: LayoutType = LayoutType.AUTO,
+    *,
+    progress: ProgressCallback | None = None,
 ) -> list[DatasetResult]:
     """Collect evidence and preconditions without VLM calls or persistent writes."""
 
+    candidates = list(discover_datasets(root, layout))
     results: list[DatasetResult] = []
-    for candidate in discover_datasets(root, layout):
+    total = len(candidates)
+    for index, candidate in enumerate(candidates, start=1):
         source_info: dict[str, object] | None = None
         camera_count = 0
         machine_count = 0
@@ -112,7 +119,8 @@ def scan_datasets(
         except MemoryError:
             raise
         except Exception:
-            results.append(
+            _append_result(
+                results,
                 _error_result(
                     candidate,
                     source_info,
@@ -120,10 +128,14 @@ def scan_datasets(
                     machine_count,
                     0,
                     known_issue_count,
-                )
+                ),
+                index=index,
+                total=total,
+                progress=progress,
             )
             continue
-        results.append(
+        _append_result(
+            results,
             DatasetResult(
                 candidate=candidate,
                 status=status,
@@ -132,7 +144,10 @@ def scan_datasets(
                 changed_field_count=0,
                 issue_count=known_issue_count,
                 source_info=source_info,
-            )
+            ),
+            index=index,
+            total=total,
+            progress=progress,
         )
     return results
 
@@ -143,15 +158,17 @@ def normalize_datasets(
     *,
     vlm: DatasetVlm,
     confidence_threshold: float,
+    progress: ProgressCallback | None = None,
 ) -> list[DatasetResult]:
     """Normalize every discovered dataset independently and conservatively."""
 
     _validate_confidence_threshold(confidence_threshold)
     generator = _generator_identity()
-    candidates = discover_datasets(root, layout)
+    candidates = list(discover_datasets(root, layout))
     results: list[DatasetResult] = []
+    total = len(candidates)
 
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates, start=1):
         source_info: dict[str, object] | None = None
         camera_count = 0
         machine_count = 0
@@ -244,7 +261,8 @@ def normalize_datasets(
         except MemoryError:
             raise
         except Exception:
-            results.append(
+            _append_result(
+                results,
                 _error_result(
                     candidate,
                     source_info,
@@ -252,11 +270,15 @@ def normalize_datasets(
                     machine_count,
                     known_changed_count,
                     known_issue_count,
-                )
+                ),
+                index=index,
+                total=total,
+                progress=progress,
             )
             continue
 
-        results.append(
+        _append_result(
+            results,
             DatasetResult(
                 candidate=candidate,
                 status=status,
@@ -265,7 +287,10 @@ def normalize_datasets(
                 changed_field_count=known_changed_count,
                 issue_count=known_issue_count,
                 source_info=source_info,
-            )
+            ),
+            index=index,
+            total=total,
+            progress=progress,
         )
     return results
 
@@ -348,6 +373,24 @@ def _changed_field_count(result: NormalizationResult) -> int:
         *result.machine_mappings,
     )
     return sum(1 for record in records if record.changed)
+
+
+def _append_result(
+    results: list[DatasetResult],
+    result: DatasetResult,
+    *,
+    index: int,
+    total: int,
+    progress: ProgressCallback | None,
+) -> None:
+    results.append(result)
+    if progress is not None:
+        try:
+            progress(index, total, result)
+        except MemoryError:
+            raise
+        except Exception:
+            pass
 
 
 def _error_result(

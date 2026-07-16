@@ -26,8 +26,26 @@ from robometanorm.cli.main import (
     _build_vlm,
     main,
 )
-from robometanorm.models import DatasetMapping, DatasetStatus, Issue, MediaSample
+from robometanorm.models import (
+    DatasetMapping,
+    DatasetResult,
+    DatasetStatus,
+    Issue,
+    MediaSample,
+)
 from tests.mini_fixtures import DatasetFixture, FakeVlm, PipelineFixture
+
+
+class _InteractiveStderr(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class _FinishFailingStderr(_InteractiveStderr):
+    def write(self, value: str) -> int:
+        if value == "\n":
+            raise OSError("terminal closed")
+        return super().write(value)
 
 
 class CliIntegrationTest(unittest.TestCase):
@@ -131,9 +149,10 @@ class CliIntegrationTest(unittest.TestCase):
         *arguments: str,
         vlm: object | None = None,
         use_real_builder: bool = False,
+        stderr: io.StringIO | None = None,
     ) -> tuple[str, str]:
         stdout = io.StringIO()
-        stderr = io.StringIO()
+        stderr = stderr if stderr is not None else io.StringIO()
         with ExitStack() as stack:
             stack.enter_context(
                 patch("robometanorm.evidence.probe_media", side_effect=self._probe_media)
@@ -175,6 +194,104 @@ class CliIntegrationTest(unittest.TestCase):
         meta = self.fixture.candidate.info_path.parent
         self.assertFalse((meta / "info_norm.json").exists())
         self.assertFalse((meta / "info_norm_review.json").exists())
+
+    def test_scan_renders_progress_only_to_interactive_stderr(self) -> None:
+        interactive_stderr = _InteractiveStderr()
+
+        output, progress = self._run(
+            "scan",
+            "--root",
+            str(self.root),
+            stderr=interactive_stderr,
+        )
+
+        self.assertEqual(progress, "\r处理中 [1/1] dataset-a\n")
+        self.assertIn("dataset-a | PASS", output)
+
+        _, noninteractive_stderr = self._run("scan", "--root", str(self.root))
+        self.assertEqual(noninteractive_stderr, "")
+
+    def test_normalize_renders_progress_only_to_interactive_stderr(self) -> None:
+        interactive_stderr = _InteractiveStderr()
+
+        output, progress = self._run(
+            "normalize",
+            "--root",
+            str(self.root),
+            vlm=self._success_vlm(),
+            stderr=interactive_stderr,
+        )
+
+        self.assertEqual(progress, "\r处理中 [1/1] dataset-a\n")
+        self.assertEqual(
+            output,
+            "Dataset | Status | Changed Fields | Issues\n"
+            "--- | --- | --- | ---\n"
+            "dataset-a | PASS | 4 | 0\n",
+        )
+
+        _, noninteractive_stderr = self._run(
+            "normalize",
+            "--root",
+            str(self.root),
+            vlm=self._success_vlm(),
+        )
+        self.assertEqual(noninteractive_stderr, "")
+
+    def test_interrupted_scan_finishes_rendered_progress_before_propagating(self) -> None:
+        interactive_stderr = _InteractiveStderr()
+
+        def interrupt_after_progress(
+            root: Path,
+            layout: object,
+            *,
+            progress: object = None,
+        ) -> list[DatasetResult]:
+            self.assertIsNotNone(progress)
+            progress(
+                1,
+                1,
+                DatasetResult(
+                    candidate=self.fixture.candidate,
+                    status=DatasetStatus.PASS,
+                    camera_count=0,
+                    machine_field_count=0,
+                    changed_field_count=0,
+                    issue_count=0,
+                    source_info=None,
+                ),
+            )
+            raise KeyboardInterrupt
+
+        with (
+            patch(
+                "robometanorm.cli.main.scan_datasets",
+                side_effect=interrupt_after_progress,
+            ),
+            redirect_stderr(interactive_stderr),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            main(["scan", "--root", str(self.root)])
+
+        self.assertEqual(interactive_stderr.getvalue(), "\r处理中 [1/1] dataset-a\n")
+
+    def test_finish_stream_error_does_not_prevent_successful_summary(self) -> None:
+        stderr = _FinishFailingStderr()
+
+        output, progress = self._run(
+            "scan",
+            "--root",
+            str(self.root),
+            stderr=stderr,
+        )
+
+        self.assertEqual(progress, "\r处理中 [1/1] dataset-a")
+        self.assertEqual(
+            output,
+            "Dataset | Status | Changed Fields | Issues\n"
+            "--- | --- | --- | ---\n"
+            "dataset-a | PASS | 0 | 0\n",
+        )
 
     def test_normalize_writes_annotation_and_preserves_all_sources(self) -> None:
         source_paths = tuple(
