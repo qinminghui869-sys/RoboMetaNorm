@@ -1,0 +1,407 @@
+"""Compile confirmed dataset mappings into the compact YAML descriptor."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+import math
+from pathlib import Path
+import re
+
+from robometanorm.models import (
+    CameraAssignment,
+    DatasetEvidence,
+    DatasetMapping,
+    HardwareProfile,
+    Issue,
+    MachineAssignment,
+    MachineComponent,
+    MachineSlice,
+)
+from robometanorm.standard import render_camera_key
+
+
+_GENERIC_JOINT = re.compile(r"(?:joint|j)[_-]?\d+", re.IGNORECASE)
+_GROUP_WEIGHTS = {"arm_motion": 0.3, "gripper": 0.45}
+
+
+@dataclass(frozen=True)
+class AnnotationResult:
+    """A descriptor or structured reasons why it cannot be compiled."""
+
+    document: dict[str, object] | None
+    issues: tuple[Issue, ...]
+
+
+def preflight_annotation(evidence: DatasetEvidence) -> tuple[Issue, ...]:
+    """Block raw joint labels that carry no side or component meaning."""
+
+    source_file = _relative_info_path(evidence)
+    issues: list[Issue] = []
+    for machine in evidence.machines:
+        names = machine.schema.names
+        indices = [
+            index
+            for index, name in enumerate(names)
+            if type(name) is str and _GENERIC_JOINT.fullmatch(name) is not None
+        ]
+        if indices:
+            observed = [names[index] for index in indices]
+            issues.append(
+                Issue(
+                    "ANNOTATION_JOINT_AMBIGUOUS",
+                    "无方位的泛化关节名无法安全映射到语义通道",
+                    "annotation",
+                    {
+                        "source_file": source_file,
+                        "source_feature": machine.schema.source_key,
+                        "source_indices": indices,
+                        "observed_names": observed,
+                        "hint": "请提供 left/right 方位和连续关节顺序，或更正 info.json。",
+                    },
+                    "block",
+                )
+            )
+    return tuple(issues)
+
+
+def compile_annotation(
+    evidence: DatasetEvidence,
+    profile: HardwareProfile | None,
+    mapping: DatasetMapping | None,
+    *,
+    normalized_info: Mapping[str, object],
+    confidence_threshold: float,
+) -> AnnotationResult:
+    """Compile only fully confirmed camera and machine assignments."""
+
+    issues = preflight_annotation(evidence)
+    if issues:
+        return AnnotationResult(None, issues)
+    if not isinstance(profile, HardwareProfile) or not isinstance(
+        mapping, DatasetMapping
+    ):
+        return _unconfirmed("缺少已确认的硬件画像或数据映射")
+    if not _valid_threshold(confidence_threshold):
+        return _unconfirmed("确认置信度门槛无效")
+    robot_type = normalized_info.get("robot_type")
+    if not _safe_text(robot_type):
+        return _unconfirmed("info.json 缺少可用的 robot_type")
+
+    components = _unique_by_id(profile.components, "component_id")
+    if components is None:
+        return _unconfirmed("硬件组件标识缺失或重复")
+    camera_document, camera_issue = _compile_cameras(
+        evidence, profile, mapping, confidence_threshold
+    )
+    if camera_issue is not None:
+        return AnnotationResult(None, (camera_issue,))
+    state_layout, action_layout, layout_issue = _compile_machine_layouts(
+        evidence, mapping, components, confidence_threshold
+    )
+    if layout_issue is not None:
+        return AnnotationResult(None, (layout_issue,))
+    if _layout_signature(state_layout) != _layout_signature(action_layout):
+        return _unconfirmed("action 与 observation.state 的已确认组件顺序不一致")
+
+    channels, channel_issue = _compile_channels(state_layout)
+    if channel_issue is not None:
+        return AnnotationResult(None, (channel_issue,))
+    groups = {channel["group"] for channel in channels.values()}
+    document: dict[str, object] = {
+        "version": "dataset_annotation_config_v1",
+        "robot_type": robot_type,
+        "adapter": {
+            "base_type": "LeRobot",
+            "base": {"qpos": "observation.state", "action": "action"},
+            "cameras": camera_document,
+        },
+        "robot_channel_schema": {
+            "version": "channel_schema_v1",
+            "robot_type": robot_type,
+            "channels": channels,
+            "group_weights": {
+                name: weight for name, weight in _GROUP_WEIGHTS.items() if name in groups
+            },
+        },
+    }
+    return AnnotationResult(document, ())
+
+
+def _relative_info_path(evidence: DatasetEvidence) -> str:
+    try:
+        return evidence.candidate.info_path.relative_to(
+            evidence.candidate.source_path
+        ).as_posix()
+    except ValueError:
+        return Path("meta").joinpath("info.json").as_posix()
+
+
+def _safe_text(value: object) -> bool:
+    return type(value) is str and bool(value) and value == value.strip()
+
+
+def _valid_threshold(value: object) -> bool:
+    return type(value) in {int, float} and math.isfinite(value) and 0 <= value <= 1
+
+
+def _confirmed(value: object, threshold: float) -> bool:
+    return (
+        type(getattr(value, "ambiguous", None)) is bool
+        and not value.ambiguous
+        and type(getattr(value, "confidence", None)) in {int, float}
+        and math.isfinite(value.confidence)
+        and 0 <= value.confidence <= 1
+        and value.confidence >= threshold
+        and _safe_text(getattr(value, "reason", None))
+    )
+
+
+def _unique_by_id(
+    values: tuple[object, ...], attribute: str
+) -> dict[str, object] | None:
+    indexed: dict[str, object] = {}
+    for value in values:
+        identifier = getattr(value, attribute, None)
+        if not _safe_text(identifier) or identifier in indexed:
+            return None
+        indexed[identifier] = value
+    return indexed
+
+
+def _unconfirmed(
+    message: str,
+    evidence: dict[str, object] | None = None,
+) -> AnnotationResult:
+    return AnnotationResult(
+        None,
+        (
+            Issue(
+                "ANNOTATION_MAPPING_UNCONFIRMED",
+                message,
+                "annotation",
+                evidence or {},
+            ),
+        ),
+    )
+
+
+def _compile_cameras(
+    evidence: DatasetEvidence,
+    profile: HardwareProfile,
+    mapping: DatasetMapping,
+    threshold: float,
+) -> tuple[dict[str, str], Issue | None]:
+    sources = {camera.schema.source_key for camera in evidence.cameras}
+    slots = _unique_by_id(profile.cameras, "camera_id")
+    if slots is None:
+        return {}, _unconfirmed("相机标识缺失或重复").issues[0]
+    output: dict[str, str] = {}
+    mapped_sources: set[str] = set()
+    for assignment in mapping.cameras:
+        if not isinstance(assignment, CameraAssignment) or not _confirmed(
+            assignment, threshold
+        ):
+            return {}, _unconfirmed("相机映射未确认").issues[0]
+        if (
+            assignment.source_key not in sources
+            or assignment.source_key in mapped_sources
+        ):
+            return {}, _unconfirmed(
+                "相机源字段缺失或重复", {"source_feature": assignment.source_key}
+            ).issues[0]
+        slot = slots.get(assignment.camera_id)
+        if slot is None or not _confirmed(slot, threshold):
+            return {}, _unconfirmed(
+                "相机组件未确认", {"source_feature": assignment.source_key}
+            ).issues[0]
+        target = render_camera_key(slot)
+        if target is None or target in output:
+            return {}, _unconfirmed(
+                "相机标准名称无效或重复",
+                {"source_feature": assignment.source_key},
+            ).issues[0]
+        output[target] = assignment.source_key
+        mapped_sources.add(assignment.source_key)
+    if mapped_sources != sources:
+        return {}, _unconfirmed("存在未确认的相机源字段").issues[0]
+    return output, None
+
+
+def _compile_machine_layouts(
+    evidence: DatasetEvidence,
+    mapping: DatasetMapping,
+    components: dict[str, object],
+    threshold: float,
+) -> tuple[
+    tuple[tuple[MachineSlice, MachineComponent], ...],
+    tuple[tuple[MachineSlice, MachineComponent], ...],
+    Issue | None,
+]:
+    schemas = {
+        machine.schema.source_key: machine.schema for machine in evidence.machines
+    }
+    assignments = _unique_by_id(mapping.machines, "source_feature")
+    if assignments is None:
+        return (), (), _unconfirmed("机器映射源字段缺失或重复").issues[0]
+    layouts: list[tuple[tuple[MachineSlice, MachineComponent], ...]] = []
+    for source_feature in ("observation.state", "action"):
+        schema = schemas.get(source_feature)
+        assignment = assignments.get(source_feature)
+        if schema is None or not isinstance(assignment, MachineAssignment):
+            return (), (), _unconfirmed("缺少 observation.state 或 action 的确认映射").issues[0]
+        layout, issue = _machine_layout(
+            schema.shape, assignment, components, threshold
+        )
+        if issue is not None:
+            return (), (), issue
+        layouts.append(layout)
+    return layouts[0], layouts[1], None
+
+
+def _machine_layout(
+    shape: tuple[object, ...],
+    assignment: MachineAssignment,
+    components: dict[str, object],
+    threshold: float,
+) -> tuple[tuple[tuple[MachineSlice, MachineComponent], ...], Issue | None]:
+    if (
+        not _confirmed(assignment, threshold)
+        or not shape
+        or type(shape[0]) is not int
+        or shape[0] <= 0
+        or not assignment.slices
+    ):
+        return (), _unconfirmed("机器向量或映射未确认").issues[0]
+    layout: list[tuple[MachineSlice, MachineComponent]] = []
+    cursor = 0
+    for machine_slice in assignment.slices:
+        component = (
+            components.get(machine_slice.component_id)
+            if isinstance(machine_slice, MachineSlice)
+            else None
+        )
+        if (
+            not isinstance(machine_slice, MachineSlice)
+            or not isinstance(component, MachineComponent)
+            or not _confirmed(component, threshold)
+            or machine_slice.start != cursor
+            or machine_slice.end <= machine_slice.start
+            or machine_slice.end > shape[0]
+            or machine_slice.end - machine_slice.start != component.count
+            or machine_slice.element_order != component.element_order
+        ):
+            return (), _unconfirmed("机器切片或组件未确认").issues[0]
+        layout.append((machine_slice, component))
+        cursor = machine_slice.end
+    if cursor != shape[0]:
+        return (), _unconfirmed("机器切片未完整覆盖向量").issues[0]
+    return tuple(layout), None
+
+
+def _layout_signature(
+    layout: tuple[tuple[MachineSlice, MachineComponent], ...]
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            machine_slice.start,
+            machine_slice.end,
+            component.kind,
+            component.side,
+            component.count,
+            component.representation,
+            component.unit,
+            component.element_order,
+        )
+        for machine_slice, component in layout
+    )
+
+
+def _compile_channels(
+    layout: tuple[tuple[MachineSlice, MachineComponent], ...]
+) -> tuple[dict[str, dict[str, object]], Issue | None]:
+    grouped: dict[str, dict[str, tuple[MachineSlice, MachineComponent]]] = {}
+    for machine_slice, component in layout:
+        if component.side not in {"left", "right"}:
+            return {}, _unconfirmed("机器组件缺少可确认的 left/right 方位").issues[0]
+        side = grouped.setdefault(component.side, {})
+        if component.kind in side:
+            return {}, _unconfirmed("同一语义组件重复映射").issues[0]
+        side[component.kind] = (machine_slice, component)
+
+    channels: dict[str, dict[str, object]] = {}
+    for side in sorted(grouped):
+        parts = grouped[side]
+        joint = parts.get("arm_joint")
+        if joint is not None:
+            machine_slice, component = joint
+            if component.representation != "joint_vector" or component.unit != "rad":
+                return {}, _unconfirmed("关节组件表示或单位未确认").issues[0]
+            channels[f"arm.{side}.joint"] = _channel(
+                machine_slice, "arm_motion", component.unit
+            )
+
+        position = parts.get("eef_position")
+        rotation = parts.get("eef_rotation")
+        if (position is None) != (rotation is None):
+            return {}, _unconfirmed("末端位姿必须同时确认位置与旋转").issues[0]
+        if position is not None and rotation is not None:
+            position_slice, position_component = position
+            rotation_slice, rotation_component = rotation
+            if (
+                position_component.representation != "position_xyz"
+                or position_component.unit != "m"
+                or rotation_component.representation != "euler_xyz"
+                or rotation_component.unit != "rad"
+                or position_slice.end != rotation_slice.start
+            ):
+                return {}, _unconfirmed("末端位姿组件表示、单位或顺序未确认").issues[0]
+            channels[f"arm.{side}.eef"] = _channel(
+                MachineSlice(
+                    position_slice.start,
+                    rotation_slice.end,
+                    "eef",
+                    position_slice.element_order + rotation_slice.element_order,
+                ),
+                "arm_motion",
+                "mixed_pose",
+            )
+
+        gripper = parts.get("gripper_open") or parts.get("gripper_open_scale")
+        if gripper is not None:
+            machine_slice, component = gripper
+            if component.representation != "scalar" or component.count != 1:
+                return {}, _unconfirmed("夹爪组件表示未确认").issues[0]
+            channels[f"gripper.{side}"] = _channel(
+                machine_slice, "gripper", component.unit
+            )
+
+        unsupported = set(parts) - {
+            "arm_joint",
+            "eef_position",
+            "eef_rotation",
+            "gripper_open",
+            "gripper_open_scale",
+        }
+        if unsupported:
+            return {}, _unconfirmed("存在不能安全写入标注的机器组件").issues[0]
+    if not channels:
+        return {}, _unconfirmed("没有可确认的机械通道").issues[0]
+    return channels, None
+
+
+def _channel(
+    machine_slice: MachineSlice,
+    group: str,
+    unit: str,
+) -> dict[str, object]:
+    return {
+        "source": "qpos",
+        "field": "qpos",
+        "slice": [machine_slice.start, machine_slice.end],
+        "group": group,
+        "unit": unit,
+        "norm": "robust_mad",
+        "weight": 1.0,
+        "optional": False,
+    }

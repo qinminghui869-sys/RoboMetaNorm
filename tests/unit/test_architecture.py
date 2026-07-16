@@ -17,6 +17,7 @@ EXPECTED_PRODUCTION_FILES = {
     "__main__.py",
     "adapters/__init__.py",
     "adapters/filesystem.py",
+    "annotation.py",
     "cli/__init__.py",
     "cli/main.py",
     "evidence.py",
@@ -32,6 +33,7 @@ EXPECTED_TEST_FILES = {
     "integration/__init__.py",
     "integration/test_cli.py",
     "unit/__init__.py",
+    "unit/test_annotation.py",
     "unit/test_architecture.py",
     "unit/test_discovery.py",
     "unit/test_evidence.py",
@@ -180,14 +182,14 @@ class MiniArchitectureTest(unittest.TestCase):
                             )
                         )
 
-    def test_pyproject_has_one_dependency_and_exact_console_script(self) -> None:
+    def test_pyproject_has_expected_dependencies_and_exact_console_script(self) -> None:
         pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         dependency_block = re.search(
             r"(?ms)^dependencies\s*=\s*\[(.*?)^\]", pyproject
         )
         self.assertIsNotNone(dependency_block)
         dependencies = re.findall(r'"([^"]+)"', dependency_block.group(1))
-        self.assertEqual(dependencies, ["pyarrow>=14.0"])
+        self.assertEqual(dependencies, ["pyarrow>=14.0", "PyYAML>=6.0"])
         lowered = pyproject.casefold()
         self.assertNotIn("numpy", lowered)
         self.assertNotIn("opencv", lowered)
