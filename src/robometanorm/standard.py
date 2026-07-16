@@ -8,7 +8,6 @@ import math
 from pathlib import Path
 import re
 from typing import Sequence
-from urllib.parse import urlsplit
 
 from robometanorm.models import (
     CameraAssignment,
@@ -19,7 +18,6 @@ from robometanorm.models import (
     FeatureSchema,
     GripperRange,
     HardwareProfile,
-    IdentityAssessment,
     Issue,
     MachineComponent,
     MachineAssignment,
@@ -28,8 +26,6 @@ from robometanorm.models import (
     MappingRecord,
     MediaSample,
     NormalizationResult,
-    RobotIdentityFact,
-    SourceReference,
 )
 
 
@@ -78,14 +74,6 @@ CONFLICT_GROUPS = (
 
 _MODALITIES = frozenset({"rgb", "depth"})
 _STANDALONE_EXTERNAL_DIRECTIONS = frozenset({"global", "env"})
-_OFFICIAL_SOURCE_KINDS = frozenset(
-    {"manufacturer_site", "official_product", "official_manual"}
-)
-_LOCAL_IDENTITY_SOURCES = (
-    "info_robot_type",
-    "common_record",
-    "tasks",
-)
 
 FIXED_COMPONENTS = {
     "eef_position": ("position_xyz", "m", 3),
@@ -425,313 +413,38 @@ def _safe_text(value: object) -> bool:
     )
 
 
-def _safe_url(value: object) -> bool:
-    if (
-        not _safe_text(value)
-        or "\\" in value
-        or any(character.isspace() for character in value)
-    ):
-        return False
-    try:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-        username = parsed.username
-        password = parsed.password
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme in {"http", "https"}
-        and bool(hostname)
-        and username is None
-        and password is None
-        and not parsed.netloc.endswith(":")
-        and (port is None or 1 <= port <= 65535)
-    )
-
-
-def _slugify_robot_type(manufacturer: object, model: object) -> str | None:
-    if not _safe_text(manufacturer) or not _safe_text(model):
-        return None
-    manufacturer_words = re.findall(r"[a-z0-9]+", manufacturer.casefold())
-    model_words = re.findall(r"[a-z0-9]+", model.casefold())
-    if not manufacturer_words or not model_words:
-        return None
-    return "_".join((*manufacturer_words, *model_words))
-
-
-def _source_index(
-    profile: HardwareProfile,
-) -> dict[str, SourceReference] | None:
-    if type(profile.sources) is not tuple:
-        return None
-    sources: dict[str, SourceReference] = {}
-    for source in profile.sources:
-        if (
-            not isinstance(source, SourceReference)
-            or not _safe_text(source.source_id)
-            or not _safe_text(source.title)
-            or not _safe_url(source.url)
-            or not _safe_text(source.kind)
-            or source.source_id in sources
-        ):
-            return None
-        sources[source.source_id] = source
-    return sources
-
-
-def _referenced_sources(
-    source_ids: object,
-    sources: dict[str, SourceReference] | None,
-) -> tuple[SourceReference, ...] | None:
-    if sources is None or type(source_ids) is not tuple:
-        return None
-    references: list[SourceReference] = []
-    seen: set[str] = set()
-    for source_id in source_ids:
-        if (
-            not _safe_text(source_id)
-            or source_id in seen
-            or source_id not in sources
-        ):
-            return None
-        seen.add(source_id)
-        references.append(sources[source_id])
-    return tuple(references)
-
-
-def _citation_payloads(
-    references: tuple[SourceReference, ...] | None,
-) -> tuple[dict[str, object], ...]:
-    if references is None:
-        return ()
-    return tuple(
-        {
-            "source_id": source.source_id,
-            "title": source.title,
-            "url": source.url,
-            "kind": source.kind,
-        }
-        for source in references
-    )
-
-
-def _has_official_reference(
-    references: tuple[SourceReference, ...] | None,
-) -> bool:
-    return references is not None and any(
-        source.kind in _OFFICIAL_SOURCE_KINDS for source in references
-    )
-
-
-def _expected_assessment_relation(
-    local_source: str,
-    evidence: DatasetEvidence,
-) -> frozenset[str] | None:
-    identity = evidence.identity
-    if local_source == "info_robot_type":
-        state = identity.info_robot_type_state
-        if any(issue.code == "INFO_ROBOT_TYPE_INVALID" for issue in identity.issues):
-            return frozenset({"invalid"})
-    elif local_source == "common_record":
-        state = identity.common_record_state
-    elif local_source == "tasks":
-        state = identity.tasks_state
-    else:
-        return None
-
-    if state == "missing":
-        return frozenset({"missing"})
-    if state in {"invalid", "unreadable"}:
-        return frozenset({"invalid"})
-    if state == "present":
-        return frozenset({"supports", "conflicts", "unknown"})
-    return None
-
-
-def _identity_evidence_states_match_source(evidence: DatasetEvidence) -> bool:
-    source_has_robot_type = "robot_type" in evidence.source_info
-    identity = evidence.identity
-    if (
-        type(identity.info_robot_type_state) is not str
-        or type(identity.common_record_state) is not str
-        or type(identity.tasks_state) is not str
-        or type(identity.tasks) is not tuple
-    ):
-        return False
-    if source_has_robot_type:
-        if identity.info_robot_type_state != "present":
-            return False
-        if identity.info_robot_type != evidence.source_info["robot_type"]:
-            return False
-    elif identity.info_robot_type_state != "missing" or identity.info_robot_type is not None:
-        return False
-    if identity.common_record_state in {"missing", "invalid", "unreadable"}:
-        if identity.common_record is not None:
-            return False
-    elif identity.common_record_state != "present":
-        return False
-    if identity.tasks_state in {"missing", "unreadable"}:
-        if identity.tasks:
-            return False
-    elif identity.tasks_state not in {"present", "invalid"}:
-        return False
-    return True
-
-
-def _assessments_match(
-    fact: RobotIdentityFact,
-    evidence: DatasetEvidence,
-) -> bool:
-    if type(fact.assessments) is not tuple or len(fact.assessments) != 3:
-        return False
-    assessments: dict[str, IdentityAssessment] = {}
-    for assessment in fact.assessments:
-        if (
-            not isinstance(assessment, IdentityAssessment)
-            or not _safe_text(assessment.local_source)
-            or assessment.local_source not in _LOCAL_IDENTITY_SOURCES
-            or assessment.local_source in assessments
-            or not _safe_text(assessment.relation)
-            or not _safe_text(assessment.explanation)
-        ):
-            return False
-        allowed_relations = _expected_assessment_relation(
-            assessment.local_source, evidence
-        )
-        if allowed_relations is None or assessment.relation not in allowed_relations:
-            return False
-        assessments[assessment.local_source] = assessment
-    if tuple(sorted(assessments)) != tuple(sorted(_LOCAL_IDENTITY_SOURCES)):
-        return False
-
-    relations = {assessment.relation for assessment in fact.assessments}
-    if not _safe_text(fact.local_evidence_status):
-        return False
-    if fact.local_evidence_status == "consistent":
-        return "supports" in relations and "conflicts" not in relations
-    if fact.local_evidence_status == "conflicts_explained":
-        return {"supports", "conflicts"} <= relations
-    return False
-
-
-def _identity_reliability(
-    evidence: DatasetEvidence,
-    profile: HardwareProfile,
-    confidence_threshold: float,
-) -> tuple[
-    bool,
-    str,
-    str | None,
-    tuple[dict[str, object], ...],
-]:
-    if not isinstance(profile, HardwareProfile) or not isinstance(
-        profile.identity, RobotIdentityFact
-    ):
-        return False, "硬件画像中的机器人身份结构无效", None, ()
-    fact = profile.identity
-    slug = _slugify_robot_type(fact.manufacturer, fact.model)
-    sources = _source_index(profile)
-    references = _referenced_sources(fact.source_ids, sources)
-    citations = _citation_payloads(references)
-    if slug is None:
-        return False, "联网研究未提供安全且唯一的厂商与型号", None, citations
-    if type(fact.ambiguous) is not bool or fact.ambiguous:
-        return False, "联网研究的机器人身份仍有歧义", slug, citations
-    if not _is_finite_number(fact.confidence) or fact.confidence < confidence_threshold:
-        return False, "机器人身份置信度无效或低于门槛", slug, citations
-    if not _safe_text(fact.reason):
-        return False, "机器人身份缺少有效判断理由", slug, citations
-    if not _identity_evidence_states_match_source(evidence):
-        return False, "本地机器人身份状态与源信息不一致", slug, citations
-    if not _assessments_match(fact, evidence):
-        return False, "联网身份评估未逐项匹配本地证据状态", slug, citations
-    if not _has_official_reference(references):
-        return False, "机器人身份未引用厂商官网、官方产品页或官方手册", slug, citations
-    return True, "机器人身份由一致的本地证据和官方来源确认", slug, citations
-
-
-def _safe_fact_semantics(fact: RobotIdentityFact | None) -> dict[str, object]:
-    if fact is None:
-        return {}
-    confidence = fact.confidence if _is_finite_number(fact.confidence) else None
-    return {
-        "manufacturer": fact.manufacturer if _safe_text(fact.manufacturer) else None,
-        "model": fact.model if _safe_text(fact.model) else None,
-        "confidence": confidence,
-        "ambiguous": fact.ambiguous if type(fact.ambiguous) is bool else None,
-        "local_evidence_status": (
-            fact.local_evidence_status
-            if _safe_text(fact.local_evidence_status)
-            else None
-        ),
-        "reason": fact.reason if _safe_text(fact.reason) else None,
-    }
-
-
 def _identity_record_and_issue(
-    normalized_info: dict[str, object],
     evidence: DatasetEvidence,
-    profile: HardwareProfile | None,
-    confidence_threshold: float,
-    *,
-    allow_change: bool,
-) -> tuple[MappingRecord, Issue | None, bool]:
+) -> tuple[MappingRecord, Issue | None]:
     source_exists = "robot_type" in evidence.source_info
     source_value = deepcopy(evidence.source_info.get("robot_type"))
-    fact = profile.identity if isinstance(profile, HardwareProfile) else None
-    if isinstance(profile, HardwareProfile):
-        reliable, reason, candidate, citations = _identity_reliability(
-            evidence, profile, confidence_threshold
-        )
-    else:
-        reliable = False
-        reason = "缺少联网硬件画像，机器人身份保持源值"
-        candidate = None
-        citations = ()
-    profile_reliable = reliable
-
-    if not allow_change:
-        reliable = False
-        reason = "缺少完整硬件画像或整体映射，机器人身份保持源值"
-    elif not source_exists:
-        reliable = False
-        reason = "源 info.json 缺少 robot_type，未创建候选字段"
-    elif not _safe_text(source_value):
-        reliable = False
-        reason = "源 robot_type 不是可安全替换的字符串"
-
-    if reliable and candidate is not None:
-        normalized_info["robot_type"] = candidate
-        output = deepcopy(normalized_info["robot_type"])
-        changed = source_value != output
-        decision = "apply" if changed else "keep"
+    output = deepcopy(source_value)
+    if source_exists and _safe_text(source_value):
+        reason = "robot_type came unchanged from meta/info.json"
+        decision = "keep"
         issue = None
     else:
-        output = deepcopy(source_value)
-        changed = False
-        decision = "review"
-        issue = Issue(
-            "ROBOT_IDENTITY_UNRESOLVED",
-            reason,
-            "robot_type",
-            {"candidate": candidate} if candidate is not None else {},
+        reason = (
+            "源 info.json 缺少 robot_type，未创建字段"
+            if not source_exists
+            else "源 robot_type 不是安全的非空字符串，保持源值"
         )
+        decision = "review"
+        issue = Issue("ROBOT_IDENTITY_UNRESOLVED", reason, "robot_type")
 
     return (
         MappingRecord(
             source_address="robot_type",
             source=source_value,
             output=output,
-            candidate=candidate,
-            changed=changed,
-            vlm_semantics=_safe_fact_semantics(fact),
-            citations=citations,
+            candidate=None,
+            changed=False,
+            vlm_semantics={},
+            citations=(),
             decision=decision,
             reason=reason,
         ),
         issue,
-        profile_reliable,
     )
 
 
@@ -998,10 +711,7 @@ def _build_camera_plans(
     profile: HardwareProfile,
     mapping: DatasetMapping,
     confidence_threshold: float,
-    *,
-    identity_reliable: bool,
 ) -> list[_CameraPlan]:
-    sources = _source_index(profile)
     features = _feature_mapping(evidence.source_info)
     structurally_unique = _mapping_inputs_are_unique(evidence, profile, mapping)
     assignments = (
@@ -1030,10 +740,7 @@ def _build_camera_plans(
             if slot is not None and _slot_is_safe_to_render(slot)
             else None
         )
-        references = (
-            _referenced_sources(slot.source_ids, sources) if slot is not None else None
-        )
-        citations = _citation_payloads(references)
+        citations = ()
         target_codec = (
             "av1"
             if slot is not None and slot.modality == "rgb"
@@ -1047,8 +754,6 @@ def _build_camera_plans(
         reason = "整体映射未提供该源相机的唯一有效槽位"
         if not structurally_unique:
             reason = "相机证据、硬件槽位或整体映射包含缺失或重复标识"
-        elif not identity_reliable:
-            reason = "机器人身份未达到自动应用相机映射的条件"
         elif assignment is None:
             reason = "整体映射缺少该源相机"
         elif type(assignment.ambiguous) is not bool or assignment.ambiguous:
@@ -1067,8 +772,6 @@ def _build_camera_plans(
             reason = "相机槽位缺少有效判断理由"
         elif target_key is None or target_codec is None:
             reason = "相机槽位不能按标准渲染目标名称"
-        elif not _has_official_reference(references):
-            reason = "相机槽位自身未引用官方来源"
         elif source_feature is None:
             reason = "源 info.json 中缺少对应相机 feature"
         else:
@@ -1188,8 +891,6 @@ def _apply_camera_plans(
     profile: HardwareProfile,
     mapping: DatasetMapping,
     confidence_threshold: float,
-    *,
-    identity_reliable: bool,
 ) -> tuple[tuple[MappingRecord, ...], tuple[Issue, ...]]:
     source_features = _feature_mapping(evidence.source_info)
     output_features = _feature_mapping(normalized_info)
@@ -1198,7 +899,6 @@ def _apply_camera_plans(
         profile,
         mapping,
         confidence_threshold,
-        identity_reliable=identity_reliable,
     )
     _mark_camera_collisions(plans, source_features)
 
@@ -1253,7 +953,7 @@ def _apply_camera_plans(
                 )
             else:
                 decision = "apply" if changed else "keep"
-                reason = "相机语义、媒体证据和官方来源均满足自动应用条件"
+                reason = "相机语义和本地媒体证据均满足自动应用条件"
         else:
             output_feature = deepcopy(plan.source_feature)
             changed = False
@@ -1409,43 +1109,6 @@ def _standard_names_have_gripper(names: tuple[str, ...] | None) -> bool:
     )
 
 
-def _component_is_structurally_safe(component: MachineComponent) -> bool:
-    return (
-        _safe_text(component.component_id)
-        and _safe_text(component.kind)
-        and (component.side is None or _safe_text(component.side))
-        and type(component.count) is int
-        and component.count > 0
-        and type(component.element_order) is tuple
-        and all(_safe_text(item) for item in component.element_order)
-        and _safe_text(component.representation)
-        and _safe_text(component.unit)
-        and _safe_text(component.reason)
-    )
-
-
-def _component_references(
-    component: MachineComponent,
-    sources: dict[str, SourceReference] | None,
-) -> tuple[SourceReference, ...] | None:
-    if not _component_is_structurally_safe(component):
-        return None
-    return _referenced_sources(component.source_ids, sources)
-
-
-def _append_unique_references(
-    references: list[SourceReference],
-    additions: tuple[SourceReference, ...] | None,
-) -> None:
-    if additions is None:
-        return
-    seen = {reference.source_id for reference in references}
-    for reference in additions:
-        if reference.source_id not in seen:
-            seen.add(reference.source_id)
-            references.append(reference)
-
-
 def _safe_range_pair(value: object) -> list[int | float] | None:
     if (
         type(value) is not tuple
@@ -1598,7 +1261,6 @@ def _build_machine_plan(
     source_feature: dict[str, object] | None,
     assignment: MachineAssignment | None,
     components: dict[str, MachineComponent],
-    sources: dict[str, SourceReference] | None,
     confidence_threshold: float,
     *,
     structurally_unique: bool,
@@ -1673,7 +1335,6 @@ def _build_machine_plan(
 
     cursor = 0
     candidate: list[str] = []
-    used_references: list[SourceReference] = []
     grippers: list[tuple[MachineSlice, MachineComponent]] = []
     failure_reason: str | None = None
     for machine_slice in assignment.slices:
@@ -1694,27 +1355,25 @@ def _build_machine_plan(
         if component is None:
             failure_reason = "机器切片引用了不存在或不唯一的硬件组件"
             break
-        references = _component_references(component, sources)
         rendered = render_component_names(component)
         if (
             type(component.ambiguous) is not bool
             or component.ambiguous
             or not _is_finite_number(component.confidence)
             or component.confidence < confidence_threshold
-            or not _has_official_reference(references)
+            or not _safe_text(component.reason)
             or rendered is None
             or machine_slice.end - machine_slice.start != component.count
             or machine_slice.element_order != component.element_order
         ):
-            failure_reason = "硬件组件语义、顺序、置信度或官方来源不足"
+            failure_reason = "硬件组件语义、顺序或置信度不足"
             break
         candidate.extend(rendered)
-        _append_unique_references(used_references, references)
         if component.kind in _GRIPPER_COMPONENTS:
             grippers.append((machine_slice, component))
         cursor = machine_slice.end
 
-    citations = _citation_payloads(tuple(used_references))
+    citations: tuple[dict[str, object], ...] = ()
     if failure_reason is None and cursor != width:
         failure_reason = "机器切片未完整覆盖整个向量"
     if failure_reason is None and (
@@ -1783,7 +1442,7 @@ def _build_machine_plan(
         (
             "源机器 names 已逐项符合 PDF 标准，保持原样"
             if standard_names is not None
-            else "机器切片、组件顺序、官方来源和实测范围均满足自动应用条件"
+            else "机器切片、组件顺序和本地实测范围均满足自动应用条件"
         ),
         {},
     )
@@ -1896,7 +1555,6 @@ def _apply_machine_plans(
         source_key = _machine_source_key(machine)
         if source_key is not None:
             evidence_counts[source_key] = evidence_counts.get(source_key, 0) + 1
-    sources = _source_index(profile)
     source_features = _feature_mapping(evidence.source_info)
     output_features = _feature_mapping(normalized_info)
     plans: list[_MachinePlan] = []
@@ -1927,7 +1585,6 @@ def _apply_machine_plans(
                 source_feature,
                 assignment,
                 components,
-                sources,
                 confidence_threshold,
                 structurally_unique=(
                     evidence_counts.get(source_key) == 1
@@ -2001,19 +1658,15 @@ def apply_standard(
     confidence_threshold: float,
     extra_issues: Sequence[Issue] = (),
 ) -> NormalizationResult:
-    """Apply only fully sourced identity, camera, and atomic machine changes."""
+    """Apply only locally validated camera and atomic machine changes."""
 
     if not _is_finite_number(confidence_threshold):
         raise ValueError("confidence_threshold 必须是 0 到 1 的有限内置数字")
     normalized_info = deepcopy(evidence.source_info)
     issues = [*evidence.issues, *extra_issues]
     allow_change = profile is not None and mapping is not None
-    identity_record, identity_issue, identity_reliable = _identity_record_and_issue(
-        normalized_info,
+    identity_record, identity_issue = _identity_record_and_issue(
         evidence,
-        profile,
-        confidence_threshold,
-        allow_change=allow_change,
     )
     if identity_issue is not None:
         issues.append(identity_issue)
@@ -2027,7 +1680,6 @@ def apply_standard(
             profile,
             mapping,
             confidence_threshold,
-            identity_reliable=identity_reliable,
         )
     issues.extend(camera_issues)
     if allow_change and isinstance(profile, HardwareProfile) and isinstance(

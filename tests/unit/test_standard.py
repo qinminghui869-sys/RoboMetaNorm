@@ -30,6 +30,7 @@ from robometanorm.models import (
     MachineComponent,
     MachineEvidence,
     MachineSlice,
+    MappingRecord,
     MediaSample,
     NormalizationResult,
     ParquetEpisodeEvidence,
@@ -1451,7 +1452,7 @@ class StandardApplicationTest(unittest.TestCase):
         )
         mapping = self._mapping(confidence=threshold)
         result = apply_standard(self._evidence(), profile, mapping, confidence_threshold=threshold)
-        self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+        self.assertEqual(result.normalized_info["robot_type"], "raw-model")
         self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
         invalid_values = (True, False, float("nan"), float("inf"), float("-inf"), -0.01, 1.01, _FloatSubclass(0.85))
@@ -1465,21 +1466,68 @@ class StandardApplicationTest(unittest.TestCase):
         with self.assertRaises(MemoryError):
             apply_standard(evidence, self._profile(), self._mapping(), confidence_threshold=0.85)
 
-    def test_applies_sourced_identity_with_scoped_citations_and_generic_slug(self) -> None:
+    def test_safe_source_identity_ignores_researched_identity_and_citations(self) -> None:
         third = self._source("community", kind="third_party")
         profile = self._profile(sources=(self._source(), third))
 
         result = apply_standard(self._evidence(), profile, self._mapping(), confidence_threshold=0.85)
 
-        self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+        self.assertEqual(result.normalized_info["robot_type"], "raw-model")
         record = result.robot_identity
-        self.assertEqual((record.source, record.output, record.candidate), ("raw-model", "acme_robotics_xr_7", "acme_robotics_xr_7"))
-        self.assertTrue(record.changed)
-        self.assertNotEqual(record.decision, "review")
-        self.assertEqual([citation["source_id"] for citation in record.citations], ["official-product"])
-        self.assertNotIn("community", {citation["source_id"] for citation in record.citations})
+        self.assertEqual((record.source, record.output, record.candidate), ("raw-model", "raw-model", None))
+        self.assertFalse(record.changed)
+        self.assertEqual(record.decision, "keep")
+        self.assertEqual(record.citations, ())
 
-    def test_identity_slug_requires_renderable_tokens_from_manufacturer_and_model(self) -> None:
+    def test_local_profile_applies_camera_and_preserves_source_robot_type(self) -> None:
+        profile = self._profile(
+            sources=(),
+            cameras=(self._slot(source_ids=()),),
+        )
+
+        result = apply_standard(
+            self._evidence(), profile, self._mapping(), confidence_threshold=0.85
+        )
+
+        self.assertEqual(result.normalized_info["robot_type"], "raw-model")
+        self.assertEqual(
+            result.robot_identity,
+            MappingRecord(
+                source_address="robot_type",
+                source="raw-model",
+                output="raw-model",
+                candidate=None,
+                changed=False,
+                vlm_semantics={},
+                citations=(),
+                decision="keep",
+                reason="robot_type came unchanged from meta/info.json",
+            ),
+        )
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
+        self.assertEqual(result.camera_mappings[0].citations, ())
+        self.assertNotIn("ROBOT_IDENTITY_UNRESOLVED", {issue.code for issue in result.issues})
+
+    def test_unsafe_source_robot_type_list_is_preserved_and_reviewed(self) -> None:
+        evidence = self._evidence()
+        evidence.source_info["robot_type"] = ["raw-model"]
+
+        result = apply_standard(
+            evidence, self._profile(), self._mapping(), confidence_threshold=0.85
+        )
+
+        self.assertEqual(result.normalized_info["robot_type"], ["raw-model"])
+        record = result.robot_identity
+        self.assertEqual(record.source, ["raw-model"])
+        self.assertEqual(record.output, ["raw-model"])
+        self.assertIsNone(record.candidate)
+        self.assertFalse(record.changed)
+        self.assertEqual(record.vlm_semantics, {})
+        self.assertEqual(record.citations, ())
+        self.assertEqual(record.decision, "review")
+        self.assertIn("ROBOT_IDENTITY_UNRESOLVED", {issue.code for issue in result.issues})
+
+    def test_researched_identity_does_not_change_safe_source_identity(self) -> None:
         evidence = self._evidence()
         unrenderable_manufacturer = self._identity_fact(
             manufacturer="宇树科技",
@@ -1494,9 +1542,9 @@ class StandardApplicationTest(unittest.TestCase):
         )
 
         self.assertEqual(result.normalized_info["robot_type"], "raw-model")
-        self.assertNotEqual(result.robot_identity.candidate, "g1")
-        self.assertEqual(result.robot_identity.decision, "review")
-        self.assert_camera_kept(result)
+        self.assertIsNone(result.robot_identity.candidate)
+        self.assertEqual(result.robot_identity.decision, "keep")
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
         normal = apply_standard(
             evidence,
@@ -1504,9 +1552,9 @@ class StandardApplicationTest(unittest.TestCase):
             self._mapping(),
             confidence_threshold=0.85,
         )
-        self.assertEqual(normal.normalized_info["robot_type"], "acme_robotics_xr_7")
+        self.assertEqual(normal.normalized_info["robot_type"], "raw-model")
 
-    def test_identity_rejects_third_party_or_unreferenced_official_sources(self) -> None:
+    def test_researched_identity_sources_do_not_affect_safe_source_identity(self) -> None:
         third = self._source("community", kind="third_party")
         cases = (
             self._profile(sources=(replace(self._source(), kind="third_party"),)),
@@ -1520,9 +1568,9 @@ class StandardApplicationTest(unittest.TestCase):
                 result = apply_standard(self._evidence(), profile, self._mapping(), confidence_threshold=0.85)
                 self.assertEqual(result.normalized_info["robot_type"], "raw-model")
                 self.assertEqual(result.robot_identity.output, "raw-model")
-                self.assertEqual(result.robot_identity.candidate, "acme_robotics_xr_7")
-                self.assertEqual(result.robot_identity.decision, "review")
-                self.assertIn("ROBOT_IDENTITY_UNRESOLVED", {item.code for item in result.issues})
+                self.assertIsNone(result.robot_identity.candidate)
+                self.assertEqual(result.robot_identity.decision, "keep")
+                self.assertNotIn("ROBOT_IDENTITY_UNRESOLVED", {item.code for item in result.issues})
 
     def test_missing_source_robot_type_is_never_created(self) -> None:
         evidence = self._evidence(include_robot_type=False)
@@ -1530,7 +1578,7 @@ class StandardApplicationTest(unittest.TestCase):
         self.assertNotIn("robot_type", result.normalized_info)
         self.assertIsNone(result.robot_identity.source)
         self.assertIsNone(result.robot_identity.output)
-        self.assertEqual(result.robot_identity.candidate, "acme_robotics_xr_7")
+        self.assertIsNone(result.robot_identity.candidate)
         self.assertEqual(result.robot_identity.decision, "review")
 
     def test_missing_robot_type_does_not_block_identity_confirmed_by_other_local_source(self) -> None:
@@ -1580,7 +1628,7 @@ class StandardApplicationTest(unittest.TestCase):
                     confidence_threshold=0.85,
                 )
                 self.assertEqual(result.normalized_info["robot_type"], "raw-model")
-                self.assert_camera_kept(result)
+                self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
     def test_present_null_common_and_invalid_tasks_with_valid_records_are_consistent(self) -> None:
         cases = (
@@ -1617,7 +1665,7 @@ class StandardApplicationTest(unittest.TestCase):
                     self._mapping(),
                     confidence_threshold=0.85,
                 )
-                self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
                 self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
     def test_identity_assessments_must_match_local_states_and_declared_status(self) -> None:
@@ -1680,7 +1728,7 @@ class StandardApplicationTest(unittest.TestCase):
                     confidence_threshold=0.85,
                 )
                 self.assertEqual(result.normalized_info.get("robot_type"), "raw-model")
-                self.assertEqual(result.robot_identity.decision, "review")
+                self.assertEqual(result.robot_identity.decision, "keep")
 
     def test_explained_identity_conflict_is_accepted_when_support_and_explanation_exist(self) -> None:
         evidence = self._evidence(
@@ -1709,7 +1757,7 @@ class StandardApplicationTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
 
-        self.assertEqual(result.normalized_info["robot_type"], "acme_robotics_xr_7")
+        self.assertEqual(result.normalized_info["robot_type"], "raw-model")
         self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
     def test_identity_rejects_unsafe_ambiguous_low_or_malformed_facts(self) -> None:
@@ -1731,9 +1779,9 @@ class StandardApplicationTest(unittest.TestCase):
                     confidence_threshold=0.85,
                 )
                 self.assertEqual(result.normalized_info["robot_type"], "raw-model")
-                self.assertEqual(result.robot_identity.decision, "review")
+                self.assertEqual(result.robot_identity.decision, "keep")
 
-    def test_surrogate_identity_and_source_text_fails_closed_without_reaching_review(self) -> None:
+    def test_researched_identity_and_source_text_do_not_block_local_camera_analysis(self) -> None:
         surrogate = "\ud800"
         base_fact = self._identity_fact()
         profiles = (
@@ -1750,25 +1798,17 @@ class StandardApplicationTest(unittest.TestCase):
                     confidence_threshold=0.85,
                 )
                 self.assertEqual(result.normalized_info["robot_type"], "raw-model")
-                self.assert_camera_kept(result)
+                self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
                 self.assert_no_surrogate_text(
                     (result.robot_identity, result.camera_mappings, result.issues)
                 )
 
-    def test_camera_requires_reliable_identity_assignment_slot_and_own_official_source(self) -> None:
-        third = self._source("community", kind="third_party")
-        low_identity = self._profile(identity=self._identity_fact(confidence=0.2))
-        slot_third_party = self._profile(
-            sources=(self._source(), third),
-            cameras=(self._slot(source_ids=("community",)),),
-        )
+    def test_camera_requires_assignment_and_slot_local_semantics(self) -> None:
         cases = (
-            (low_identity, self._mapping()),
             (self._profile(), self._mapping(ambiguous=True)),
             (self._profile(), self._mapping(confidence=0.2)),
             (self._profile(cameras=(self._slot(ambiguous=True),)), self._mapping()),
             (self._profile(cameras=(self._slot(confidence=0.2),)), self._mapping()),
-            (slot_third_party, self._mapping()),
             (self._profile(), self._mapping(camera_id=None, ambiguous=True)),
         )
         for profile, mapping in cases:
@@ -1825,7 +1865,7 @@ class StandardApplicationTest(unittest.TestCase):
                     confidence_threshold=0.85,
                 )
                 self.assertEqual(result.normalized_info["robot_type"], "raw-model")
-                self.assert_camera_kept(result)
+                self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
     def test_camera_rejects_missing_sources_and_handcrafted_duplicate_identifiers(self) -> None:
         duplicate_slot = replace(self._slot(direction_tokens=("left",), body_part="wrist"), camera_id="head-rgb")
@@ -2167,7 +2207,6 @@ class StandardApplicationTest(unittest.TestCase):
 
     def test_manual_nan_bool_and_duplicate_values_fail_closed_without_crashing(self) -> None:
         profiles_and_mappings = (
-            (self._profile(identity=self._identity_fact(confidence=float("nan"))), self._mapping()),
             (self._profile(cameras=(self._slot(confidence=float("nan")),)), self._mapping()),
             (self._profile(cameras=(self._slot(confidence=cast(float, True)),)), self._mapping()),
             (self._profile(), self._mapping(confidence=float("nan"))),
@@ -2176,11 +2215,11 @@ class StandardApplicationTest(unittest.TestCase):
         for profile, mapping in profiles_and_mappings:
             with self.subTest(profile=profile, mapping=mapping):
                 result = apply_standard(self._evidence(), profile, mapping, confidence_threshold=0.85)
-                self.assertEqual(result.normalized_info["robot_type"], "raw-model" if profile.identity.confidence != 0.95 else "acme_robotics_xr_7")
+                self.assertEqual(result.normalized_info["robot_type"], "raw-model")
                 self.assert_camera_kept(result)
                 self.assertEqual(result.camera_mappings[0].decision, "review")
 
-    def test_malformed_official_url_cannot_authorize_identity_or_camera_changes(self) -> None:
+    def test_malformed_remote_source_does_not_block_local_camera_analysis(self) -> None:
         malformed = replace(self._source(), url="https://?model=xr7")
         result = apply_standard(
             self._evidence(),
@@ -2189,30 +2228,14 @@ class StandardApplicationTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
         self.assertEqual(result.normalized_info["robot_type"], "raw-model")
-        self.assert_camera_kept(result)
-
-    def test_identity_comparison_memory_error_propagates(self) -> None:
-        exploding = _ExplodingEquality()
-        evidence = self._evidence(
-            identity=self._identity_evidence(info_value=exploding)
-        )
-        source_info = deepcopy(evidence.source_info)
-        source_info["robot_type"] = exploding
-        evidence = replace(evidence, source_info=source_info)
-
-        with self.assertRaises(MemoryError):
-            apply_standard(
-                evidence,
-                self._profile(),
-                self._mapping(),
-                confidence_threshold=0.85,
-            )
+        self.assertIn(self.TARGET_KEY, result.normalized_info["features"])
 
     def test_issue_order_is_evidence_then_extra_then_identity_then_camera(self) -> None:
         evidence = self._evidence(issues=(Issue("EVIDENCE", "evidence", "fixture"),))
+        evidence.source_info["robot_type"] = ["unsafe"]
         result = apply_standard(
             evidence,
-            self._profile(identity=self._identity_fact(ambiguous=True)),
+            self._profile(),
             self._mapping(ambiguous=True),
             confidence_threshold=0.85,
             extra_issues=(Issue("EXTRA", "extra", "fixture"),),
@@ -2398,7 +2421,7 @@ class MachineApplicationTest(unittest.TestCase):
         *,
         component_sources: tuple[SourceReference, ...] | None = None,
     ) -> HardwareProfile:
-        sources = component_sources or (
+        sources = component_sources if component_sources is not None else (
             cls._source("official-identity"),
             cls._source("official-component"),
             cls._source("official-gripper", kind="official_manual"),
@@ -2464,11 +2487,26 @@ class MachineApplicationTest(unittest.TestCase):
         self.assertTrue(record.changed)
         self.assertEqual(record.decision, "apply")
         self.assertTrue(record.reason)
-        self.assertEqual(
-            [citation["source_id"] for citation in record.citations],
-            ["official-component"],
+        self.assertEqual(record.citations, ())
+
+    def test_local_component_applies_vector_names_without_citations(self) -> None:
+        result = apply_standard(
+            self._evidence(),
+            self._profile(
+                (self._component(source_ids=()),), component_sources=()
+            ),
+            self._mapping(self._assignment()),
+            confidence_threshold=0.85,
         )
-        self.assertNotIn("unused-third-party", str(record.citations))
+
+        self.assertEqual(
+            self._names(result),
+            ["left_arm_joint_0_rad", "left_arm_joint_1_rad"],
+        )
+        record = result.machine_mappings[0]
+        self.assertEqual(record.citations, ())
+        self.assertEqual(record.decision, "apply")
+        self.assertFalse(any(issue.scope == "features.action.names" for issue in result.issues))
 
     def test_keeps_already_standard_names_verbatim_over_alternate_candidate(self) -> None:
         standard = ("right_arm_joint_0_rad", "right_arm_joint_1_rad")
@@ -2657,20 +2695,12 @@ class MachineApplicationTest(unittest.TestCase):
         duplicate_evidence = self._evidence((action, replace(action, schema=replace(action.schema))))
         missing_feature = self._evidence((action,))
         cast(dict[str, object], missing_feature.source_info["features"]).pop("action")
-        third_party_profile = self._profile(
-            (replace(self._component(), source_ids=("community",)),),
-            component_sources=(
-                self._source("official-identity"),
-                self._source("community", kind="third_party"),
-            ),
-        )
         cases = (
             (duplicate_evidence, self._profile((self._component(),)), self._mapping(action_assignment, action_assignment)),
             (self._evidence((action,)), self._profile((self._component(),)), self._mapping(action_assignment, action_assignment)),
             (self._evidence((action,)), self._profile((self._component(), self._component())), self._mapping(action_assignment)),
             (self._evidence((action,)), self._profile((self._component(),)), self._mapping(replace(action_assignment, source_feature="unknown"))),
             (missing_feature, self._profile((self._component(),)), self._mapping(action_assignment)),
-            (self._evidence((action,)), third_party_profile, self._mapping(action_assignment)),
             (
                 self._evidence((action,)),
                 self._profile((self._component(),)),
@@ -2725,7 +2755,6 @@ class MachineApplicationTest(unittest.TestCase):
             self._component(ambiguous=True),
             self._component(ambiguous=1),
             self._component(reason=""),
-            self._component(source_ids=[]),
         )
         for component in bad_components:
             with self.subTest(component=component):
