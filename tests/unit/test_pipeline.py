@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from robometanorm.models import (
     DatasetMapping,
     DatasetResult,
     DatasetStatus,
+    HardwareProfile,
     Issue,
     MachineAssignment,
     MediaSample,
@@ -792,6 +794,29 @@ class MiniPipelineTest(unittest.TestCase):
         review = self._read_output(self.fixture, "info_norm_review.json")
         self.assertIn("DATASET_ANALYSIS_INVALID", {item["code"] for item in review["issues"]})
         self.assertTrue((self.fixture.candidate.info_path.parent / "robo_annotation.yaml").is_file())
+
+    def test_analysis_with_invalid_nested_models_fails_closed_without_range_collection(self) -> None:
+        malformed = DatasetAnalysis(
+            profile=cast(HardwareProfile, object()),
+            mapping=cast(DatasetMapping, object()),
+        )
+        vlm = FakeVlm(analysis_result=(malformed, None))
+
+        with patch("robometanorm.pipeline.collect_mapped_gripper_ranges") as ranges:
+            result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.REVIEW)
+        ranges.assert_not_called()
+        annotation = yaml.safe_load(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(annotation["review"]["required"])
+        self.assertIn(
+            "DATASET_ANALYSIS_INVALID",
+            {item["code"] for item in annotation["review"]["issues"]},
+        )
 
     def test_invalid_info_is_error_without_vlm_range_or_fabricated_outputs(self) -> None:
         self.fixture.candidate.info_path.write_text("[", encoding="utf-8")

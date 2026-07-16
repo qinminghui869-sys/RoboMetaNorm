@@ -316,7 +316,11 @@ def _analyze_dataset(
     value, issue = raw_result
     if issue is not None:
         return None, issue if isinstance(issue, Issue) else _ANALYSIS_INVALID
-    if isinstance(value, DatasetAnalysis):
+    if (
+        isinstance(value, DatasetAnalysis)
+        and isinstance(value.profile, HardwareProfile)
+        and isinstance(value.mapping, DatasetMapping)
+    ):
         return value, None
     return None, _ANALYSIS_INVALID
 
