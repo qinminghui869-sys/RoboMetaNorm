@@ -834,6 +834,42 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertTrue(result.document["review"]["required"])
         self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
 
+    def test_confirmed_path_rejects_duplicate_machine_evidence_sources(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        state = next(
+            machine
+            for machine in evidence.machines
+            if machine.schema.source_key == "observation.state"
+        )
+        evidence = replace(evidence, machines=(*evidence.machines, state))
+
+        result = compile_annotation(
+            evidence,
+            AnnotationFixture.profile(sides=("left",)),
+            AnnotationFixture.mapping(sides=("left",)),
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAPPING_UNCONFIRMED")
+
+    def test_confirmed_path_rejects_duplicate_camera_evidence_sources(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        evidence = replace(evidence, cameras=(*evidence.cameras, evidence.cameras[0]))
+
+        result = compile_annotation(
+            evidence,
+            AnnotationFixture.profile(sides=("left",)),
+            AnnotationFixture.mapping(sides=("left",)),
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAPPING_UNCONFIRMED")
+
     def test_review_issues_are_ordered_and_deduplicated(self) -> None:
         first = Issue("FIRST", "same", "one", {"a": 1})
         duplicate = Issue("FIRST", "same", "two", {"b": 2})

@@ -434,11 +434,7 @@ def _best_effort_document(
 
 
 def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, object]]:
-    source_counts = {"action": 0, "observation.state": 0}
-    for machine in evidence.machines:
-        source_feature = machine.schema.source_key
-        if _safe_source_key(source_feature) and source_feature in source_counts:
-            source_counts[source_feature] += 1
+    source_counts = _required_machine_source_counts(evidence)
     if source_counts != {"action": 1, "observation.state": 1}:
         return {}
     sided_layouts = {
@@ -500,6 +496,9 @@ def _compile_confirmed_annotation(
 ) -> _ConfirmedAnnotationResult:
     """Compile only fully confirmed camera and machine assignments."""
 
+    source_issue = _confirmed_source_issue(evidence)
+    if source_issue is not None:
+        return _unconfirmed(source_issue.message, source_issue.evidence)
     issues = preflight_annotation(evidence)
     if issues:
         return _ConfirmedAnnotationResult(None, issues)
@@ -596,6 +595,38 @@ def _safe_text(value: object) -> bool:
 
 def _safe_source_key(value: object) -> bool:
     return _safe_text(value)
+
+
+def _required_machine_source_counts(evidence: DatasetEvidence) -> dict[str, int]:
+    counts = {"action": 0, "observation.state": 0}
+    for machine in evidence.machines:
+        source_feature = machine.schema.source_key
+        if _safe_source_key(source_feature) and source_feature in counts:
+            counts[source_feature] += 1
+    return counts
+
+
+def _confirmed_source_issue(evidence: DatasetEvidence) -> Issue | None:
+    machine_counts = _required_machine_source_counts(evidence)
+    if machine_counts != {"action": 1, "observation.state": 1}:
+        return Issue(
+            "ANNOTATION_MAPPING_UNCONFIRMED",
+            "机器源字段缺失或重复",
+            "annotation",
+            {"machine_source_counts": machine_counts},
+        )
+    camera_sources: set[str] = set()
+    for camera in evidence.cameras:
+        source_feature = camera.schema.source_key
+        if not _safe_source_key(source_feature) or source_feature in camera_sources:
+            return Issue(
+                "ANNOTATION_MAPPING_UNCONFIRMED",
+                "相机源字段无效或重复",
+                "annotation",
+                {},
+            )
+        camera_sources.add(source_feature)
+    return None
 
 
 def _valid_threshold(value: object) -> bool:
