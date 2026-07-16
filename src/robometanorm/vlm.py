@@ -1558,7 +1558,7 @@ def parse_dataset_mapping(
 
 def _local_analysis_identity(robot_type: str) -> dict[str, object]:
     return {
-        "manufacturer": "Local",
+        "manufacturer": robot_type,
         "model": robot_type,
         "confidence": 1.0,
         "ambiguous": False,
@@ -1622,21 +1622,6 @@ def parse_dataset_analysis(
 
 class DatasetVlm(Protocol):
     """Dataset-level VLM operations used by the normalization pipeline."""
-
-    def research_hardware(
-        self,
-        identity: IdentityEvidence,
-        *,
-        deadline_monotonic: float | None = None,
-    ) -> tuple[HardwareProfile | None, Issue | None]: ...
-
-    def map_dataset(
-        self,
-        evidence: DatasetEvidence,
-        profile: HardwareProfile,
-        *,
-        deadline_monotonic: float | None = None,
-    ) -> tuple[DatasetMapping | None, Issue | None]: ...
 
     def analyze_dataset(
         self,

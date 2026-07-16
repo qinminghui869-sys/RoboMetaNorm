@@ -2886,6 +2886,15 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
             "mapping": VlmFixture.valid_mapping_payload(),
         }
 
+    def test_dataset_vlm_protocol_exposes_only_combined_analysis(self) -> None:
+        protocol_methods = {
+            name
+            for name, value in vars(vlm_module.DatasetVlm).items()
+            if not name.startswith("_") and callable(value)
+        }
+
+        self.assertEqual(protocol_methods, {"analyze_dataset"})
+
     def test_builds_analysis_prompt_with_fixed_local_identity_and_no_profile(self) -> None:
         evidence = self.evidence(two_cameras=True)
 
@@ -2920,7 +2929,10 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         )
 
         self.assertIsInstance(analysis, DatasetAnalysis)
-        self.assertEqual(analysis.profile.identity.model, "Fixture Robot v2")
+        self.assertEqual(
+            (analysis.profile.identity.manufacturer, analysis.profile.identity.model),
+            ("Fixture Robot v2", "Fixture Robot v2"),
+        )
         self.assertEqual(analysis.profile.sources, ())
         self.assertEqual(analysis.profile.identity.source_ids, ())
         self.assertTrue(
@@ -2953,6 +2965,12 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
             payload = self.analysis_payload()
             payload["profile"][section][0]["source_ids"] = []
             invalid_payloads.append(payload)
+        payload = self.analysis_payload()
+        payload["profile"]["identity"] = {
+            "manufacturer": "VLM-provided manufacturer",
+            "model": "VLM-provided model",
+        }
+        invalid_payloads.append(payload)
 
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
