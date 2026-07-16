@@ -807,6 +807,33 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertEqual(result.document["adapter"]["cameras"], {})
         self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
 
+    def test_fallback_rejects_duplicate_machine_sources_without_choosing_one(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        action = next(
+            machine
+            for machine in evidence.machines
+            if machine.schema.source_key == "action"
+        )
+        conflicting_action = replace(
+            action,
+            schema=replace(
+                action.schema,
+                names=("right_joint_1", "right_joint_2", *action.schema.names[2:]),
+            ),
+        )
+        evidence = replace(
+            evidence,
+            machines=(evidence.machines[0], conflicting_action, action),
+        )
+
+        result = compile_annotation(
+            evidence, None, None,
+            normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
+
     def test_review_issues_are_ordered_and_deduplicated(self) -> None:
         first = Issue("FIRST", "same", "one", {"a": 1})
         duplicate = Issue("FIRST", "same", "two", {"b": 2})

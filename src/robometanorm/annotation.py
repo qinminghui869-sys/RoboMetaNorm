@@ -434,6 +434,13 @@ def _best_effort_document(
 
 
 def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, object]]:
+    source_counts = {"action": 0, "observation.state": 0}
+    for machine in evidence.machines:
+        source_feature = machine.schema.source_key
+        if _safe_source_key(source_feature) and source_feature in source_counts:
+            source_counts[source_feature] += 1
+    if source_counts != {"action": 1, "observation.state": 1}:
+        return {}
     sided_layouts = {
         machine.schema.source_key: _sided_joint_layout(machine.schema.names)
         for machine in evidence.machines
