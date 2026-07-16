@@ -48,6 +48,7 @@ _ISSUE_MESSAGES = {
     "VLM_IMAGE_READ_FAILED": "A VLM input image could not be read.",
     "VLM_HTTP_ERROR": "The VLM service rejected the request.",
     "VLM_NETWORK_ERROR": "The VLM service could not be reached.",
+    "VLM_DATASET_TIMEOUT": "The VLM dataset time budget was exhausted.",
     "VLM_RESPONSE_INVALID": "The VLM service returned an invalid response.",
     "WEB_SEARCH_UNAVAILABLE": "Web search is unavailable for this VLM service.",
     "HARDWARE_RESEARCH_INVALID": "The hardware research response was invalid.",
@@ -464,6 +465,8 @@ class OpenAICompatibleTransport:
         system_prompt: str,
         user_prompt: str,
         image_paths: Sequence[Path],
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[Mapping[str, object] | None, Issue | None]:
         """Send a Chat Completions request and return its strict JSON object."""
         credential = self._credential_provider()
@@ -527,10 +530,15 @@ class OpenAICompatibleTransport:
             payload,
             credential,
             _chat_content,
+            deadline_monotonic=deadline_monotonic,
         )
 
     def request_web_json(
-        self, system_prompt: str, user_prompt: str
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[Mapping[str, object] | None, Issue | None]:
         """Send a Responses web-search request and return its strict JSON object."""
         credential = self._credential_provider()
@@ -554,6 +562,7 @@ class OpenAICompatibleTransport:
             credential,
             _responses_content,
             inspect_unsupported_web_search=True,
+            deadline_monotonic=deadline_monotonic,
         )
 
     @staticmethod
@@ -575,6 +584,7 @@ class OpenAICompatibleTransport:
         content_parser: Callable[[Mapping[str, object]], str],
         *,
         inspect_unsupported_web_search: bool = False,
+        deadline_monotonic: float | None = None,
     ) -> tuple[Mapping[str, object] | None, Issue | None]:
         try:
             encoded_payload = json.dumps(
@@ -587,6 +597,11 @@ class OpenAICompatibleTransport:
             return None, self._response_issue(payload_error, stage="request")
 
         for attempt in range(self.max_retries + 1):
+            remaining_seconds = self._remaining_deadline_seconds(
+                deadline_monotonic
+            )
+            if remaining_seconds is not None and remaining_seconds <= 0:
+                return None, _issue("VLM_DATASET_TIMEOUT")
             http_request = request.Request(
                 url,
                 data=encoded_payload,
@@ -598,12 +613,23 @@ class OpenAICompatibleTransport:
             )
             try:
                 with request.urlopen(
-                    http_request, timeout=self.timeout_seconds
+                    http_request,
+                    timeout=(
+                        self.timeout_seconds
+                        if remaining_seconds is None
+                        else min(self.timeout_seconds, remaining_seconds)
+                    ),
                 ) as response:
                     response_bytes = bytearray()
                     remaining = _SUCCESS_RESPONSE_BYTES_LIMIT + 1
                     while True:
+                        if not self._refresh_response_read_timeout(
+                            response, deadline_monotonic
+                        ):
+                            return None, _issue("VLM_DATASET_TIMEOUT")
                         raw_response = response.read(remaining)
+                        if self._deadline_exhausted(deadline_monotonic):
+                            return None, _issue("VLM_DATASET_TIMEOUT")
                         if not isinstance(raw_response, bytes):
                             break
                         if len(raw_response) > remaining:
@@ -624,12 +650,19 @@ class OpenAICompatibleTransport:
                 return _strict_json_object(content), None
             except error.HTTPError as http_error:
                 try:
-                    unsupported_web_search = (
-                        inspect_unsupported_web_search
-                        and _responses_body_reports_unsupported_web_search(http_error)
-                    )
+                    unsupported_web_search = False
+                    if inspect_unsupported_web_search:
+                        if not self._refresh_response_read_timeout(
+                            http_error, deadline_monotonic
+                        ):
+                            return None, _issue("VLM_DATASET_TIMEOUT")
+                        unsupported_web_search = (
+                            _responses_body_reports_unsupported_web_search(http_error)
+                        )
                 finally:
                     self._close_http_error(http_error)
+                if self._deadline_exhausted(deadline_monotonic):
+                    return None, _issue("VLM_DATASET_TIMEOUT")
                 if unsupported_web_search:
                     return None, _issue(
                         "VLM_HTTP_ERROR",
@@ -639,12 +672,16 @@ class OpenAICompatibleTransport:
                         },
                     )
                 if self._should_retry_http(http_error.code, attempt):
-                    self._backoff(attempt)
+                    if not self._backoff(attempt, deadline_monotonic):
+                        return None, _issue("VLM_DATASET_TIMEOUT")
                     continue
                 return None, _issue("VLM_HTTP_ERROR", {"status": http_error.code})
             except (error.URLError, TimeoutError, OSError, IncompleteRead) as network_error:
+                if self._deadline_exhausted(deadline_monotonic):
+                    return None, _issue("VLM_DATASET_TIMEOUT")
                 if attempt < self.max_retries:
-                    self._backoff(attempt)
+                    if not self._backoff(attempt, deadline_monotonic):
+                        return None, _issue("VLM_DATASET_TIMEOUT")
                     continue
                 return None, _issue(
                     "VLM_NETWORK_ERROR",
@@ -661,14 +698,63 @@ class OpenAICompatibleTransport:
         raise AssertionError("retry loop exhausted without returning")
 
     def _should_retry_http(self, status: int, attempt: int) -> bool:
-        return attempt < self.max_retries and (
-            status == 429 or 500 <= status < 600
-        )
+        return attempt < self.max_retries and self._is_retryable_http_status(status)
 
-    def _backoff(self, attempt: int) -> None:
+    @staticmethod
+    def _is_retryable_http_status(status: int) -> bool:
+        return status == 429 or 500 <= status < 600
+
+    @staticmethod
+    def _remaining_deadline_seconds(
+        deadline_monotonic: float | None,
+    ) -> float | None:
+        if deadline_monotonic is None:
+            return None
+        return deadline_monotonic - time.monotonic()
+
+    def _deadline_exhausted(self, deadline_monotonic: float | None) -> bool:
+        remaining_seconds = self._remaining_deadline_seconds(deadline_monotonic)
+        return remaining_seconds is not None and remaining_seconds <= 0
+
+    def _refresh_response_read_timeout(
+        self, response: object, deadline_monotonic: float | None
+    ) -> bool:
+        remaining_seconds = self._remaining_deadline_seconds(deadline_monotonic)
+        if remaining_seconds is None:
+            return True
+        if remaining_seconds <= 0:
+            return False
+
+        missing = object()
+        try:
+            file_pointer = getattr(response, "fp", missing)
+            if file_pointer is missing:
+                return False
+            if file_pointer is None:
+                return True
+            raw_stream = getattr(file_pointer, "raw", missing)
+            if raw_stream is missing:
+                file_pointer = getattr(file_pointer, "fp", missing)
+                raw_stream = getattr(file_pointer, "raw", missing)
+            socket = getattr(raw_stream, "_sock", missing)
+            set_timeout = getattr(socket, "settimeout", missing)
+            if set_timeout is missing or not callable(set_timeout):
+                return False
+            set_timeout(min(self.timeout_seconds, remaining_seconds))
+        except (OSError, TypeError, ValueError):
+            return False
+        return True
+
+    def _backoff(
+        self, attempt: int, deadline_monotonic: float | None = None
+    ) -> bool:
         delay = self.retry_backoff_seconds * (2**attempt)
+        remaining_seconds = self._remaining_deadline_seconds(deadline_monotonic)
+        if remaining_seconds is not None and remaining_seconds <= delay:
+            return False
         if delay:
             time.sleep(delay)
+        return True
 
     @staticmethod
     def _close_http_error(http_error: error.HTTPError) -> None:
@@ -1425,11 +1511,18 @@ class DatasetVlm(Protocol):
     """Dataset-level VLM operations used by the normalization pipeline."""
 
     def research_hardware(
-        self, identity: IdentityEvidence
+        self,
+        identity: IdentityEvidence,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[HardwareProfile | None, Issue | None]: ...
 
     def map_dataset(
-        self, evidence: DatasetEvidence, profile: HardwareProfile
+        self,
+        evidence: DatasetEvidence,
+        profile: HardwareProfile,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[DatasetMapping | None, Issue | None]: ...
 
 
@@ -1440,13 +1533,23 @@ class OpenAICompatibleDatasetVlm:
         self.transport = transport
 
     def research_hardware(
-        self, identity: IdentityEvidence
+        self,
+        identity: IdentityEvidence,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[HardwareProfile | None, Issue | None]:
         try:
             system_prompt, user_prompt = build_research_prompt(identity)
         except (TypeError, ValueError, OverflowError, RecursionError):
             return None, _issue("HARDWARE_RESEARCH_INVALID")
-        payload, issue = self.transport.request_web_json(system_prompt, user_prompt)
+        if deadline_monotonic is None:
+            payload, issue = self.transport.request_web_json(system_prompt, user_prompt)
+        else:
+            payload, issue = self.transport.request_web_json(
+                system_prompt,
+                user_prompt,
+                deadline_monotonic=deadline_monotonic,
+            )
         if issue is not None:
             status = issue.evidence.get("status")
             if (
@@ -1468,7 +1571,11 @@ class OpenAICompatibleDatasetVlm:
             return None, _issue("HARDWARE_RESEARCH_INVALID")
 
     def map_dataset(
-        self, evidence: DatasetEvidence, profile: HardwareProfile
+        self,
+        evidence: DatasetEvidence,
+        profile: HardwareProfile,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[DatasetMapping | None, Issue | None]:
         try:
             system_prompt, user_prompt, image_paths = build_mapping_prompt(
@@ -1476,9 +1583,17 @@ class OpenAICompatibleDatasetVlm:
             )
         except (TypeError, ValueError, OverflowError, RecursionError):
             return None, _issue("DATASET_MAPPING_INVALID")
-        payload, issue = self.transport.request_json(
-            system_prompt, user_prompt, image_paths
-        )
+        if deadline_monotonic is None:
+            payload, issue = self.transport.request_json(
+                system_prompt, user_prompt, image_paths
+            )
+        else:
+            payload, issue = self.transport.request_json(
+                system_prompt,
+                user_prompt,
+                image_paths,
+                deadline_monotonic=deadline_monotonic,
+            )
         if issue is not None:
             return None, issue
         if payload is None:

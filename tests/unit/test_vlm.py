@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from urllib.error import HTTPError, URLError
 from unittest.mock import call, patch
@@ -31,7 +32,7 @@ from robometanorm.models import (
     MediaSample,
     ParquetEpisodeEvidence,
 )
-from tests.mini_fixtures import PipelineFixture, StubTransport, VlmFixture
+from tests.mini_fixtures import FakeVlm, PipelineFixture, StubTransport, VlmFixture
 import robometanorm.vlm as vlm_module
 from robometanorm.vlm import OpenAICompatibleTransport
 
@@ -99,6 +100,20 @@ class _SegmentedHttpResponse(_HttpResponse):
         return chunk
 
 
+class _ContentLengthHttpResponse(_HttpResponse):
+    """HTTPResponse-equivalent that drops fp after a full Content-Length read."""
+
+    def __init__(self, payload: object, socket: object) -> None:
+        super().__init__(payload)
+        self.fp = SimpleNamespace(raw=SimpleNamespace(_sock=socket))
+
+    def read(self, size: int = -1) -> bytes | object:
+        result = super().read(size)
+        if result:
+            self.fp = None
+        return result
+
+
 class _UnreadableHttpBody(BytesIO):
     """HTTPError body that makes accidental reads fail the test."""
 
@@ -163,6 +178,16 @@ class _SyntheticHttpBody:
         self.close_calls += 1
 
 
+class _TimeoutSocket:
+    """Records socket read deadlines set by the transport."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
 def _chat_response(content: object) -> _HttpResponse:
     return _HttpResponse({"choices": [{"message": {"content": content}}]})
 
@@ -188,6 +213,36 @@ def _http_error(status_code: int, reason: str = "fixture failure") -> HTTPError:
         {},
         _UnreadableHttpBody(b"private response body"),
     )
+
+
+class _LegacyTransport:
+    """Dataset VLM transport predating the optional deadline keyword."""
+
+    def __init__(
+        self,
+        *,
+        web_payload: dict[str, object] | None = None,
+        chat_payload: dict[str, object] | None = None,
+    ) -> None:
+        self.web_payload = web_payload
+        self.chat_payload = chat_payload
+        self.web_attempts = 0
+        self.chat_attempts = 0
+
+    def request_web_json(
+        self, system_prompt: str, user_prompt: str
+    ) -> tuple[dict[str, object] | None, Issue | None]:
+        self.web_attempts += 1
+        return self.web_payload, None
+
+    def request_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_paths: tuple[Path, ...],
+    ) -> tuple[dict[str, object] | None, Issue | None]:
+        self.chat_attempts += 1
+        return self.chat_payload, None
 
 
 class VlmTransportTest(unittest.TestCase):
@@ -1362,6 +1417,339 @@ class VlmTransportTest(unittest.TestCase):
             terminal.request_json("system", "user", ())
         terminal_sleep.assert_not_called()
 
+    def test_expired_deadline_returns_timeout_before_http(self) -> None:
+        transport = self.make_transport()
+        with (
+            patch("robometanorm.vlm.time.monotonic", return_value=10.0),
+            patch("robometanorm.vlm.request.urlopen") as urlopen,
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=10.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        urlopen.assert_not_called()
+
+    def test_deadline_exhausted_by_backoff_skips_retry(self) -> None:
+        transport = self.make_transport(
+            max_retries=2, retry_backoff_seconds=0.5
+        )
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 0.6, 0.6),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen",
+                side_effect=URLError("first attempt"),
+            ) as urlopen,
+            patch("robometanorm.vlm.time.sleep") as sleep,
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_final_retryable_failure_after_deadline_returns_timeout(self) -> None:
+        failures = (
+            TimeoutError("request timed out"),
+            _http_error(503),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                transport = self.make_transport(max_retries=0)
+                with (
+                    patch(
+                        "robometanorm.vlm.time.monotonic",
+                        side_effect=(0.0, 1.1),
+                    ),
+                    patch(
+                        "robometanorm.vlm.request.urlopen",
+                        side_effect=failure,
+                    ) as urlopen,
+                ):
+                    payload, issue = transport.request_json(
+                        "system", "user", (), deadline_monotonic=1.0
+                    )
+
+                self.assertIsNone(payload)
+                self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+                self.assertEqual(urlopen.call_count, 1)
+
+    def test_final_nonretryable_http_failure_after_deadline_returns_timeout(self) -> None:
+        transport = self.make_transport(max_retries=0)
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 1.1),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen",
+                side_effect=_http_error(400),
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+
+    def test_slow_web_error_body_past_deadline_returns_timeout(self) -> None:
+        socket = _TimeoutSocket()
+        body = _ReadableTrackedHttpBody(
+            json.dumps(
+                {
+                    "error": {
+                        "message": "web_search tool is not supported",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        body.fp = SimpleNamespace(raw=SimpleNamespace(_sock=socket))
+        http_error = HTTPError(
+            "https://example.test/v1/responses",
+            422,
+            "fixture failure",
+            {},
+            body,
+        )
+        transport = self.make_transport(max_retries=0)
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 0.1, 1.1),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", side_effect=http_error
+            ),
+        ):
+            payload, issue = transport.request_web_json(
+                "system", "user", deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        self.assertEqual(len(body.read_sizes), 1)
+        self.assertEqual(socket.timeouts, [0.9])
+
+    def test_web_error_body_socket_timeout_uses_remaining_deadline(self) -> None:
+        socket = _TimeoutSocket()
+        body = _ReadableTrackedHttpBody(
+            json.dumps(
+                {
+                    "error": {
+                        "message": "web_search tool is not supported",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        body.fp = SimpleNamespace(raw=SimpleNamespace(_sock=socket))
+        http_error = HTTPError(
+            "https://example.test/v1/responses",
+            422,
+            "fixture failure",
+            {},
+            body,
+        )
+        transport = self.make_transport(timeout_seconds=10.0, max_retries=0)
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 1.0, 2.0),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", side_effect=http_error
+            ),
+        ):
+            payload, issue = transport.request_web_json(
+                "system", "user", deadline_monotonic=10.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_HTTP_ERROR")
+        self.assertEqual(socket.timeouts, [9.0])
+        self.assertEqual(len(body.read_sizes), 1)
+
+    def test_unavailable_web_error_body_socket_timeout_fails_closed(self) -> None:
+        body = _ReadableTrackedHttpBody(
+            json.dumps(
+                {
+                    "error": {
+                        "message": "web_search tool is not supported",
+                    }
+                }
+            ).encode("utf-8")
+        )
+        http_error = HTTPError(
+            "https://example.test/v1/responses",
+            422,
+            "fixture failure",
+            {},
+            body,
+        )
+        transport = self.make_transport(max_retries=0)
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 0.1),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", side_effect=http_error
+            ),
+        ):
+            payload, issue = transport.request_web_json(
+                "system", "user", deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        self.assertEqual(body.read_sizes, [])
+        self.assertEqual(body.close_calls, 1)
+
+    def test_response_read_past_deadline_returns_timeout(self) -> None:
+        transport = self.make_transport(max_retries=0)
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 1.1),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen",
+                return_value=_chat_response('{"ok": true}'),
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+
+    def test_response_socket_timeout_is_refreshed_before_each_read(self) -> None:
+        transport = self.make_transport(timeout_seconds=10.0, max_retries=0)
+        socket = _TimeoutSocket()
+        response = _chat_response('{"ok": true}')
+        response.fp = SimpleNamespace(raw=SimpleNamespace(_sock=socket))
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=10.0
+            )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+        self.assertEqual(socket.timeouts, [9.0, 7.0])
+
+    def test_content_length_eof_after_socket_close_is_not_timed_out(self) -> None:
+        transport = self.make_transport(timeout_seconds=10.0, max_retries=0)
+        socket = _TimeoutSocket()
+        response = _ContentLengthHttpResponse(
+            {"choices": [{"message": {"content": '{"ok": true}'}}]}, socket
+        )
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 1.0, 2.0, 3.0, 4.0),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=10.0
+            )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+        self.assertEqual(socket.timeouts, [9.0])
+
+    def test_deadline_before_later_response_read_returns_timeout(self) -> None:
+        transport = self.make_transport(max_retries=0)
+        socket = _TimeoutSocket()
+        first_response = _chat_response('{"ok": true}')
+        response = _SegmentedHttpResponse((first_response.raw, b""))
+        response.fp = SimpleNamespace(raw=SimpleNamespace(_sock=socket))
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 0.1, 0.2, 1.1),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        self.assertEqual(len(response.read_sizes), 1)
+        self.assertEqual(socket.timeouts, [0.9])
+
+    def test_unavailable_response_socket_timeout_fails_closed(self) -> None:
+        transport = self.make_transport(max_retries=0)
+        response = _chat_response('{"ok": true}')
+        response.fp = object()
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 0.1, 0.2),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=response
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        self.assertEqual(response.read_sizes, [])
+
+    def test_response_without_fp_fails_closed_only_with_deadline(self) -> None:
+        timed = _chat_response('{"ok": true}')
+        transport = self.make_transport(max_retries=0)
+        with (
+            patch(
+                "robometanorm.vlm.time.monotonic",
+                side_effect=(0.0, 0.1, 0.2),
+            ),
+            patch(
+                "robometanorm.vlm.request.urlopen", return_value=timed
+            ),
+        ):
+            payload, issue = transport.request_json(
+                "system", "user", (), deadline_monotonic=1.0
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(issue.code, "VLM_DATASET_TIMEOUT")
+        self.assertEqual(timed.read_sizes, [])
+
+        unbounded = _chat_response('{"ok": true}')
+        with patch(
+            "robometanorm.vlm.request.urlopen", return_value=unbounded
+        ):
+            payload, issue = transport.request_json("system", "user", ())
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertIsNone(issue)
+
     def test_http_error_is_classified_before_url_error_without_reading_body(self) -> None:
         transport = self.make_transport(max_retries=0)
         error = _http_error(401, "authorization secret reason")
@@ -2387,6 +2775,48 @@ class HardwareResearchTest(unittest.TestCase, VlmFixture):
         self.assertEqual(transport.web_attempts, 1)
         self.assertEqual(transport.chat_attempts, 0)
 
+    def test_service_forwards_exact_deadline_to_transport(self) -> None:
+        deadline = 1234.5
+        transport = StubTransport(web_payload=self.valid_hardware_payload())
+        service = self.create_openai_service(transport)
+
+        profile, issue = service.research_hardware(
+            self.identity_with_injection_text(), deadline_monotonic=deadline
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertIsNone(issue)
+        self.assertEqual(transport.web_deadlines, [deadline])
+
+    def test_fake_vlm_records_exact_deadlines(self) -> None:
+        research_deadline = 1234.5
+        mapping_deadline = 5678.25
+        fake = FakeVlm()
+
+        fake.research_hardware(
+            self.identity_with_injection_text(),
+            deadline_monotonic=research_deadline,
+        )
+        fake.map_dataset(
+            object(),
+            PipelineFixture().hardware_profile(),
+            deadline_monotonic=mapping_deadline,
+        )
+
+        self.assertEqual(fake.research_deadlines, [research_deadline])
+        self.assertEqual(fake.mapping_deadlines, [mapping_deadline])
+
+    def test_research_without_deadline_supports_legacy_transport(self) -> None:
+        transport = _LegacyTransport(web_payload=self.valid_hardware_payload())
+
+        profile, issue = self.create_openai_service(transport).research_hardware(
+            self.identity_with_injection_text()
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertIsNone(issue)
+        self.assertEqual((transport.web_attempts, transport.chat_attempts), (1, 0))
+
 
 class DatasetMappingTest(unittest.TestCase, VlmFixture):
     @staticmethod
@@ -2717,6 +3147,29 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         self.assertIsNone(mapping)
         self.assertIs(issue, transport_issue)
         self.assertEqual((failed.chat_attempts, failed.web_attempts), (1, 0))
+
+    def test_map_dataset_forwards_exact_deadline_to_transport(self) -> None:
+        deadline = 5678.25
+        transport = StubTransport(chat_payload=self.payload())
+
+        mapping, issue = self.create_openai_service(transport).map_dataset(
+            self.evidence(), self.profile(), deadline_monotonic=deadline
+        )
+
+        self.assertIsNotNone(mapping)
+        self.assertIsNone(issue)
+        self.assertEqual(transport.chat_deadlines, [deadline])
+
+    def test_mapping_without_deadline_supports_legacy_transport(self) -> None:
+        transport = _LegacyTransport(chat_payload=self.payload())
+
+        mapping, issue = self.create_openai_service(transport).map_dataset(
+            self.evidence(), self.profile()
+        )
+
+        self.assertIsNotNone(mapping)
+        self.assertIsNone(issue)
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
 
     def test_map_dataset_rejects_unsafe_camera_and_machine_paths_before_request(self) -> None:
         base = self.evidence()

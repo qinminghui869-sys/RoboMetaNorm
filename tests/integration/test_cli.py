@@ -22,6 +22,8 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.cli.main import (
     DEFAULT_CONFIDENCE_THRESHOLD,
+    DEFAULT_DATASET_TIMEOUT_SECONDS,
+    _ProgressRenderer,
     _build_parser,
     _build_vlm,
     main,
@@ -222,7 +224,12 @@ class CliIntegrationTest(unittest.TestCase):
             stderr=interactive_stderr,
         )
 
-        self.assertEqual(progress, "\r处理中 [1/1] dataset-a\n")
+        self.assertIn("处理中 [1/1] dataset-a：查询硬件身份", progress)
+        self.assertLess(
+            progress.index("处理中 [1/1] dataset-a：查询硬件身份"),
+            progress.rindex("\r处理中 [1/1] dataset-a"),
+        )
+        self.assertTrue(progress.endswith("\n"))
         self.assertEqual(
             output,
             "Dataset | Status | Changed Fields | Issues\n"
@@ -237,6 +244,84 @@ class CliIntegrationTest(unittest.TestCase):
             vlm=self._success_vlm(),
         )
         self.assertEqual(noninteractive_stderr, "")
+
+    def test_progress_renderer_clears_wide_phase_suffix_before_completion(self) -> None:
+        stderr = _InteractiveStderr()
+        renderer = _ProgressRenderer(stderr)
+
+        renderer.stage(1, 1, self.fixture.candidate, "映射相机与关节")
+        renderer.update(
+            1,
+            1,
+            DatasetResult(
+                candidate=self.fixture.candidate,
+                status=DatasetStatus.PASS,
+                camera_count=0,
+                machine_field_count=0,
+                changed_field_count=0,
+                issue_count=0,
+                source_info=None,
+            ),
+        )
+        renderer.finish()
+
+        self.assertEqual(
+            stderr.getvalue(),
+            "\r处理中 [1/1] dataset-a：映射相机与关节"
+            "\r处理中 [1/1] dataset-a"
+            + " " * 16
+            + "\n",
+        )
+
+    def test_normalize_forwards_dataset_timeout_and_stage_callback(self) -> None:
+        cases = (((), 180.0), (("--dataset-timeout-seconds", "45"), 45.0))
+        for option, expected in cases:
+            with self.subTest(option=option):
+                stderr = _InteractiveStderr()
+                stdout = io.StringIO()
+                with (
+                    patch("robometanorm.cli.main._build_vlm", return_value=object()),
+                    patch(
+                        "robometanorm.cli.main.normalize_datasets",
+                        return_value=[],
+                    ) as normalize,
+                    redirect_stderr(stderr),
+                    redirect_stdout(stdout),
+                ):
+                    exit_code = main(
+                        ["normalize", "--root", str(self.root), *option]
+                    )
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(
+                    normalize.call_args.kwargs["dataset_timeout_seconds"], expected
+                )
+                self.assertIsNotNone(normalize.call_args.kwargs["stage"])
+                self.assertEqual(
+                    stdout.getvalue(),
+                    "Dataset | Status | Changed Fields | Issues\n"
+                    "--- | --- | --- | ---\n",
+                )
+
+        self.assertEqual(DEFAULT_DATASET_TIMEOUT_SECONDS, 180.0)
+
+    def test_normalize_rejects_invalid_dataset_timeout(self) -> None:
+        for value in ("nan", "inf", "-inf", "0", "-1"):
+            with self.subTest(value=value):
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    main(
+                        [
+                            "normalize",
+                            "--root",
+                            str(self.root),
+                            f"--dataset-timeout-seconds={value}",
+                        ]
+                    )
+                self.assertIn(
+                    "--dataset-timeout-seconds 必须是正的有限数字",
+                    stderr.getvalue(),
+                )
 
     def test_interrupted_scan_finishes_rendered_progress_before_propagating(self) -> None:
         interactive_stderr = _InteractiveStderr()

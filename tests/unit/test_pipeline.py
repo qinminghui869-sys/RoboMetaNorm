@@ -32,10 +32,21 @@ class _RaisingVlm:
     def __init__(self, error: BaseException) -> None:
         self.error = error
 
-    def research_hardware(self, identity: object) -> object:
+    def research_hardware(
+        self,
+        identity: object,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> object:
         raise self.error
 
-    def map_dataset(self, evidence: object, profile: object) -> object:
+    def map_dataset(
+        self,
+        evidence: object,
+        profile: object,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> object:
         raise AssertionError("mapping must not be called")
 
 
@@ -286,6 +297,181 @@ class MiniPipelineTest(unittest.TestCase):
             ["dataset-a", "dataset-b"],
         )
         self.assertEqual(completed, [(1, 2, "dataset-a"), (2, 2, "dataset-b")])
+
+    def test_normalize_reports_vlm_phases(self) -> None:
+        self._create_dataset("dataset-b")
+        stages: list[tuple[int, int, str, str]] = []
+
+        def stage(index: int, total: int, candidate: object, label: str) -> None:
+            stages.append((index, total, candidate.dataset_name, label))
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            results = normalize_datasets(
+                self.root,
+                vlm=self._success_vlm(),
+                confidence_threshold=0.85,
+                stage=stage,
+            )
+
+        self.assertEqual(
+            [result.status for result in results],
+            [DatasetStatus.PASS, DatasetStatus.PASS],
+        )
+        self.assertEqual(
+            stages,
+            [
+                (1, 2, "dataset-a", "读取本地证据"),
+                (1, 2, "dataset-a", "查询硬件身份"),
+                (1, 2, "dataset-a", "映射相机与关节"),
+                (2, 2, "dataset-b", "读取本地证据"),
+                (2, 2, "dataset-b", "查询硬件身份"),
+                (2, 2, "dataset-b", "映射相机与关节"),
+            ],
+        )
+
+    def test_normalize_ignores_stage_callback_errors(self) -> None:
+        attempted: list[str] = []
+
+        def failing_stage(
+            index: int, total: int, candidate: object, label: str
+        ) -> None:
+            attempted.append(label)
+            raise OSError("terminal unavailable")
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            results = normalize_datasets(
+                self.root,
+                vlm=self._success_vlm(),
+                confidence_threshold=0.85,
+                stage=failing_stage,
+            )
+
+        self.assertEqual([result.status for result in results], [DatasetStatus.PASS])
+        self.assertEqual(attempted, ["读取本地证据", "查询硬件身份", "映射相机与关节"])
+
+    def test_normalize_propagates_memory_error_from_stage_callback(self) -> None:
+        def failing_stage(
+            index: int, total: int, candidate: object, label: str
+        ) -> None:
+            raise MemoryError("memory")
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            with self.assertRaises(MemoryError):
+                normalize_datasets(
+                    self.root,
+                    vlm=self._success_vlm(),
+                    confidence_threshold=0.85,
+                    stage=failing_stage,
+                )
+
+    def test_normalize_dataset_timeout_is_optional_and_validated(self) -> None:
+        from robometanorm.pipeline import normalize_datasets
+
+        parameter = inspect.signature(normalize_datasets).parameters[
+            "dataset_timeout_seconds"
+        ]
+        self.assertIsNone(parameter.default)
+        for invalid in (True, False, float("nan"), float("inf"), 0, -1):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    normalize_datasets(
+                        self.root,
+                        vlm=self._success_vlm(),
+                        confidence_threshold=0.85,
+                        dataset_timeout_seconds=invalid,
+                    )
+
+    def test_normalize_forwards_one_deadline_to_both_vlm_calls(self) -> None:
+        vlm = self._success_vlm()
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with (
+            self._media_stubs(),
+            patch("robometanorm.pipeline.time.monotonic", return_value=100.0),
+        ):
+            results = normalize_datasets(
+                self.root,
+                vlm=vlm,
+                confidence_threshold=0.85,
+                dataset_timeout_seconds=180,
+            )
+
+        self.assertEqual([result.status for result in results], [DatasetStatus.PASS])
+        self.assertEqual(vlm.research_deadlines, [280.0])
+        self.assertEqual(vlm.mapping_deadlines, [280.0])
+
+    def test_normalize_default_budget_supports_legacy_vlm_signature(self) -> None:
+        class LegacyVlm:
+            def research_hardware(self, identity: object) -> object:
+                return self_profile, None
+
+            def map_dataset(self, evidence: object, profile: object) -> object:
+                return self_mapping, None
+
+        self_profile = self.profile
+        self_mapping = self.mapping
+
+        result = self._normalize(LegacyVlm())[0]
+
+        self.assertEqual(result.status, DatasetStatus.PASS)
+
+    def test_normalize_vlm_timeout_is_review_and_next_dataset_completes(self) -> None:
+        second = self._create_dataset("dataset-b")
+
+        class TimeoutThenSuccessVlm:
+            def __init__(self, profile: object, mapping: object) -> None:
+                self.profile = profile
+                self.mapping = mapping
+                self.research_calls = 0
+                self.mapping_calls = 0
+
+            def research_hardware(
+                self,
+                identity: object,
+                *,
+                deadline_monotonic: float | None = None,
+            ) -> object:
+                self.research_calls += 1
+                if self.research_calls == 1:
+                    return None, Issue("VLM_DATASET_TIMEOUT", "budget exhausted", "vlm")
+                return self.profile, None
+
+            def map_dataset(
+                self,
+                evidence: object,
+                profile: object,
+                *,
+                deadline_monotonic: float | None = None,
+            ) -> object:
+                self.mapping_calls += 1
+                return self.mapping, None
+
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            results = normalize_datasets(
+                self.root,
+                vlm=TimeoutThenSuccessVlm(self.profile, self.mapping),
+                confidence_threshold=0.85,
+                dataset_timeout_seconds=180,
+            )
+
+        self.assertEqual(
+            [result.status for result in results],
+            [DatasetStatus.REVIEW, DatasetStatus.PASS],
+        )
+        first_meta = self.fixture.candidate.info_path.parent
+        self.assertTrue((first_meta / "info_norm.json").is_file())
+        self.assertTrue((first_meta / "info_norm_review.json").is_file())
+        self.assertFalse((first_meta / "robo_annotation.yaml").exists())
+        self.assertTrue((second.candidate.info_path.parent / "robo_annotation.yaml").is_file())
 
     def test_scan_ignores_progress_callback_errors(self) -> None:
         self._create_dataset("dataset-b")

@@ -364,17 +364,28 @@ class FakeVlm:
     )
     research_calls: int = field(default=0, init=False)
     mapping_calls: int = field(default=0, init=False)
+    research_deadlines: list[float | None] = field(default_factory=list, init=False)
+    mapping_deadlines: list[float | None] = field(default_factory=list, init=False)
 
     def research_hardware(
-        self, identity: IdentityEvidence
+        self,
+        identity: IdentityEvidence,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[HardwareProfile | None, Issue | None]:
         self.research_calls += 1
+        self.research_deadlines.append(deadline_monotonic)
         return self.research_result
 
     def map_dataset(
-        self, evidence: DatasetEvidence, profile: HardwareProfile
+        self,
+        evidence: DatasetEvidence,
+        profile: HardwareProfile,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[DatasetMapping | None, Issue | None]:
         self.mapping_calls += 1
+        self.mapping_deadlines.append(deadline_monotonic)
         return self.mapping_result
 
 
@@ -388,11 +399,18 @@ class StubTransport:
     chat_issue: Issue | None = None
     web_attempts: int = field(default=0, init=False)
     chat_attempts: int = field(default=0, init=False)
+    web_deadlines: list[float | None] = field(default_factory=list, init=False)
+    chat_deadlines: list[float | None] = field(default_factory=list, init=False)
 
     def request_web_json(
-        self, system_prompt: str, user_prompt: str
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[dict[str, object] | None, Issue | None]:
         self.web_attempts += 1
+        self.web_deadlines.append(deadline_monotonic)
         return self.web_payload, self.web_issue
 
     def request_json(
@@ -400,6 +418,9 @@ class StubTransport:
         system_prompt: str,
         user_prompt: str,
         image_paths: tuple[Path, ...],
+        *,
+        deadline_monotonic: float | None = None,
     ) -> tuple[dict[str, object] | None, Issue | None]:
         self.chat_attempts += 1
+        self.chat_deadlines.append(deadline_monotonic)
         return self.chat_payload, self.chat_issue

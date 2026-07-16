@@ -7,6 +7,7 @@ from dataclasses import replace
 import importlib.metadata
 import math
 from pathlib import Path
+import time
 
 from robometanorm.adapters.filesystem import discover_datasets
 from robometanorm.annotation import (
@@ -55,6 +56,7 @@ _IDENTITY_UNRESOLVED = Issue(
 
 
 ProgressCallback = Callable[[int, int, DatasetResult], None]
+StageCallback = Callable[[int, int, DatasetCandidate, str], None]
 
 
 def status_from_issues(issues: Sequence[Issue]) -> DatasetStatus:
@@ -159,22 +161,31 @@ def normalize_datasets(
     vlm: DatasetVlm,
     confidence_threshold: float,
     progress: ProgressCallback | None = None,
+    stage: StageCallback | None = None,
+    dataset_timeout_seconds: float | None = None,
 ) -> list[DatasetResult]:
     """Normalize every discovered dataset independently and conservatively."""
 
     _validate_confidence_threshold(confidence_threshold)
+    _validate_dataset_timeout_seconds(dataset_timeout_seconds)
     generator = _generator_identity()
     candidates = list(discover_datasets(root, layout))
     results: list[DatasetResult] = []
     total = len(candidates)
 
     for index, candidate in enumerate(candidates, start=1):
+        deadline_monotonic = (
+            time.monotonic() + dataset_timeout_seconds
+            if dataset_timeout_seconds is not None
+            else None
+        )
         source_info: dict[str, object] | None = None
         camera_count = 0
         machine_count = 0
         known_changed_count = 0
         known_issue_count = 0
         try:
+            _report_stage(stage, index, total, candidate, "读取本地证据")
             source_info = read_info(candidate)
             with collect_dataset_evidence(candidate, source_info) as evidence:
                 camera_count = len(evidence.cameras)
@@ -192,7 +203,12 @@ def normalize_datasets(
 
                 if not any(issue.severity == "block" for issue in precondition_issues):
                     vlm_attempted = True
-                    profile, research_issue = _research_hardware(vlm, evidence.identity)
+                    _report_stage(stage, index, total, candidate, "查询硬件身份")
+                    profile, research_issue = _research_hardware(
+                        vlm,
+                        evidence.identity,
+                        deadline_monotonic=deadline_monotonic,
+                    )
                     if research_issue is not None:
                         extra_issues.append(research_issue)
                         known_issue_count = len(evidence.issues) + len(extra_issues)
@@ -200,7 +216,13 @@ def normalize_datasets(
                         extra_issues.append(_IDENTITY_UNRESOLVED)
                         known_issue_count = len(evidence.issues) + len(extra_issues)
                     elif profile is not None:
-                        mapping, mapping_issue = _map_dataset(vlm, evidence, profile)
+                        _report_stage(stage, index, total, candidate, "映射相机与关节")
+                        mapping, mapping_issue = _map_dataset(
+                            vlm,
+                            evidence,
+                            profile,
+                            deadline_monotonic=deadline_monotonic,
+                        )
                         if mapping_issue is not None:
                             extra_issues.append(mapping_issue)
                             known_issue_count = len(evidence.issues) + len(extra_issues)
@@ -298,8 +320,16 @@ def normalize_datasets(
 def _research_hardware(
     vlm: DatasetVlm,
     identity: IdentityEvidence,
+    *,
+    deadline_monotonic: float | None = None,
 ) -> tuple[HardwareProfile | None, Issue | None]:
-    raw_result = vlm.research_hardware(identity)
+    if deadline_monotonic is None:
+        raw_result = vlm.research_hardware(identity)
+    else:
+        raw_result = vlm.research_hardware(
+            identity,
+            deadline_monotonic=deadline_monotonic,
+        )
     if type(raw_result) is not tuple or len(raw_result) != 2:
         return None, _RESEARCH_INVALID
     value, issue = raw_result
@@ -314,8 +344,17 @@ def _map_dataset(
     vlm: DatasetVlm,
     evidence: DatasetEvidence,
     profile: HardwareProfile,
+    *,
+    deadline_monotonic: float | None = None,
 ) -> tuple[DatasetMapping | None, Issue | None]:
-    raw_result = vlm.map_dataset(evidence, profile)
+    if deadline_monotonic is None:
+        raw_result = vlm.map_dataset(evidence, profile)
+    else:
+        raw_result = vlm.map_dataset(
+            evidence,
+            profile,
+            deadline_monotonic=deadline_monotonic,
+        )
     if type(raw_result) is not tuple or len(raw_result) != 2:
         return None, _MAPPING_INVALID
     value, issue = raw_result
@@ -358,6 +397,17 @@ def _validate_confidence_threshold(confidence_threshold: object) -> None:
         raise ValueError("confidence_threshold must be a finite number from 0 to 1")
 
 
+def _validate_dataset_timeout_seconds(dataset_timeout_seconds: object) -> None:
+    if dataset_timeout_seconds is None:
+        return
+    if (
+        type(dataset_timeout_seconds) not in {int, float}
+        or not math.isfinite(dataset_timeout_seconds)
+        or dataset_timeout_seconds <= 0
+    ):
+        raise ValueError("dataset_timeout_seconds must be a finite positive number")
+
+
 def _generator_identity() -> dict[str, object]:
     try:
         version = importlib.metadata.version("robometanorm")
@@ -387,6 +437,22 @@ def _append_result(
     if progress is not None:
         try:
             progress(index, total, result)
+        except MemoryError:
+            raise
+        except Exception:
+            pass
+
+
+def _report_stage(
+    stage: StageCallback | None,
+    index: int,
+    total: int,
+    candidate: DatasetCandidate,
+    label: str,
+) -> None:
+    if stage is not None:
+        try:
+            stage(index, total, candidate, label)
         except MemoryError:
             raise
         except Exception:

@@ -9,8 +9,9 @@ import os
 from pathlib import Path
 import sys
 from typing import TextIO
+import unicodedata
 
-from robometanorm.models import DatasetResult, LayoutType
+from robometanorm.models import DatasetCandidate, DatasetResult, LayoutType
 from robometanorm.pipeline import normalize_datasets, scan_datasets
 from robometanorm.vlm import OpenAICompatibleDatasetVlm, OpenAICompatibleTransport
 
@@ -19,26 +20,54 @@ DEFAULT_VLM_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_VLM_MODEL = "qwen3.7-plus"
 DEFAULT_VLM_API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.85
+DEFAULT_DATASET_TIMEOUT_SECONDS = 180.0
 
 
 class _ProgressRenderer:
-    """Render completed datasets on one interactive terminal line."""
+    """Render dataset phases and completion on one interactive terminal line."""
 
     def __init__(self, stream: TextIO) -> None:
         self._stream = stream
+        self._rendered_width = 0
         self._wrote_update = False
 
     def update(self, index: int, total: int, result: DatasetResult) -> None:
-        self._stream.write(
-            f"\r处理中 [{index}/{total}] {result.candidate.dataset_name}"
-        )
+        self._write(f"处理中 [{index}/{total}] {result.candidate.dataset_name}")
+
+    def stage(
+        self,
+        index: int,
+        total: int,
+        candidate: DatasetCandidate,
+        label: str,
+    ) -> None:
+        self._write(f"处理中 [{index}/{total}] {candidate.dataset_name}：{label}")
+
+    def _write(self, message: str) -> None:
+        width = _display_width(message)
+        padding = " " * max(0, self._rendered_width - width)
+        self._stream.write(f"\r{message}{padding}")
         self._stream.flush()
+        self._rendered_width = max(self._rendered_width, width)
         self._wrote_update = True
 
     def finish(self) -> None:
         if self._wrote_update:
             self._stream.write("\n")
             self._stream.flush()
+
+
+def _display_width(text: str) -> int:
+    """Return terminal cells for the simple status text emitted by this CLI."""
+
+    return sum(
+        0
+        if unicodedata.combining(character)
+        else 2
+        if unicodedata.east_asian_width(character) in {"F", "W"}
+        else 1
+        for character in text
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,6 +85,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 progress=progress.update if progress else None,
             )
         else:
+            _validate_dataset_timeout_seconds(
+                arguments.dataset_timeout_seconds,
+                parser,
+            )
             vlm = _build_vlm(arguments, parser)
             results = normalize_datasets(
                 arguments.root,
@@ -63,6 +96,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vlm=vlm,
                 confidence_threshold=arguments.confidence_threshold,
                 progress=progress.update if progress else None,
+                stage=progress.stage if progress else None,
+                dataset_timeout_seconds=arguments.dataset_timeout_seconds,
             )
     except ValueError as error:
         parser.error(str(error))
@@ -121,6 +156,12 @@ def _build_parser() -> argparse.ArgumentParser:
                 ),
             )
             command_parser.add_argument(
+                "--dataset-timeout-seconds",
+                type=float,
+                default=DEFAULT_DATASET_TIMEOUT_SECONDS,
+                help="单个数据集的 VLM 总等待秒数，默认 180",
+            )
+            command_parser.add_argument(
                 "--vlm-timeout-seconds",
                 type=int,
                 default=120,
@@ -145,6 +186,18 @@ def _build_parser() -> argparse.ArgumentParser:
                 help="VLM 最大输出 token 数，默认 1024",
             )
     return parser
+
+
+def _validate_dataset_timeout_seconds(
+    timeout_seconds: object,
+    parser: argparse.ArgumentParser,
+) -> None:
+    if (
+        type(timeout_seconds) not in {int, float}
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        parser.error("--dataset-timeout-seconds 必须是正的有限数字")
 
 
 def _build_vlm(
