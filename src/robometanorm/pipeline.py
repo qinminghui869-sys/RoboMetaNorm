@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import replace
 import importlib.metadata
 import math
 from pathlib import Path
@@ -12,7 +11,6 @@ import time
 from robometanorm.adapters.filesystem import discover_datasets
 from robometanorm.annotation import (
     compile_annotation,
-    has_main_follower_candidate,
     preflight_annotation,
 )
 from robometanorm.evidence import (
@@ -22,36 +20,30 @@ from robometanorm.evidence import (
 )
 from robometanorm.models import (
     DatasetCandidate,
+    DatasetAnalysis,
     DatasetEvidence,
     DatasetMapping,
     DatasetResult,
     DatasetStatus,
     HardwareProfile,
-    IdentityEvidence,
     Issue,
     LayoutType,
     NormalizationResult,
-    RobotIdentityFact,
 )
 from robometanorm.standard import apply_standard, check_preconditions
 from robometanorm.vlm import DatasetVlm
 from robometanorm.writer import build_review_payload, write_outputs
 
 
-_RESEARCH_INVALID = Issue(
-    code="HARDWARE_RESEARCH_INVALID",
-    message="The hardware research result did not satisfy the pipeline contract.",
+_ANALYSIS_INVALID = Issue(
+    code="DATASET_ANALYSIS_INVALID",
+    message="The dataset analysis result did not satisfy the pipeline contract.",
     scope="vlm",
 )
-_MAPPING_INVALID = Issue(
-    code="DATASET_MAPPING_INVALID",
-    message="The dataset mapping result did not satisfy the pipeline contract.",
-    scope="vlm",
-)
-_IDENTITY_UNRESOLVED = Issue(
-    code="HARDWARE_IDENTITY_UNRESOLVED",
-    message="The researched manufacturer and model were not safe non-empty text.",
-    scope="vlm",
+_LOCAL_ROBOT_TYPE_UNAVAILABLE = Issue(
+    code="LOCAL_ROBOT_TYPE_UNAVAILABLE",
+    message="The local robot_type was not a safe non-empty string.",
+    scope="robot_type",
 )
 
 
@@ -199,42 +191,32 @@ def normalize_datasets(
                 mapping: DatasetMapping | None = None
                 extra_issues: list[Issue] = list(precondition_issues)
                 known_issue_count = len(evidence.issues) + len(extra_issues)
-                vlm_attempted = False
-
-                if not any(issue.severity == "block" for issue in precondition_issues):
-                    vlm_attempted = True
-                    _report_stage(stage, index, total, candidate, "查询硬件身份")
-                    profile, research_issue = _research_hardware(
+                robot_type = source_info.get("robot_type")
+                if not _safe_text(robot_type):
+                    extra_issues.append(_LOCAL_ROBOT_TYPE_UNAVAILABLE)
+                elif not any(
+                    issue.severity == "block" for issue in precondition_issues
+                ):
+                    _report_stage(stage, index, total, candidate, "分析相机与关节")
+                    analysis, analysis_issue = _analyze_dataset(
                         vlm,
-                        evidence.identity,
+                        evidence,
+                        robot_type,
                         deadline_monotonic=deadline_monotonic,
                     )
-                    if research_issue is not None:
-                        extra_issues.append(research_issue)
-                        known_issue_count = len(evidence.issues) + len(extra_issues)
-                    elif profile is not None and not _profile_has_safe_identity(profile):
-                        extra_issues.append(_IDENTITY_UNRESOLVED)
-                        known_issue_count = len(evidence.issues) + len(extra_issues)
-                    elif profile is not None:
-                        _report_stage(stage, index, total, candidate, "映射相机与关节")
-                        mapping, mapping_issue = _map_dataset(
-                            vlm,
+                    if analysis_issue is not None:
+                        extra_issues.append(analysis_issue)
+                    elif analysis is not None:
+                        profile = analysis.profile
+                        mapping = analysis.mapping
+                        evidence, range_issues = collect_mapped_gripper_ranges(
+                            candidate,
                             evidence,
                             profile,
-                            deadline_monotonic=deadline_monotonic,
+                            mapping,
                         )
-                        if mapping_issue is not None:
-                            extra_issues.append(mapping_issue)
-                            known_issue_count = len(evidence.issues) + len(extra_issues)
-                        elif mapping is not None:
-                            evidence, range_issues = collect_mapped_gripper_ranges(
-                                candidate,
-                                evidence,
-                                profile,
-                                mapping,
-                            )
-                            extra_issues.extend(range_issues)
-                            known_issue_count = len(evidence.issues) + len(extra_issues)
+                        extra_issues.extend(range_issues)
+                known_issue_count = len(evidence.issues) + len(extra_issues)
 
                 normalization = apply_standard(
                     evidence,
@@ -245,27 +227,24 @@ def normalize_datasets(
                 )
                 known_issue_count = len(normalization.issues)
                 known_changed_count = _changed_field_count(normalization)
-                status = status_from_issues(normalization.issues)
-                annotation: dict[str, object] | None = None
-                if status is DatasetStatus.PASS or (
-                    vlm_attempted and has_main_follower_candidate(evidence)
-                ):
-                    annotation_result = compile_annotation(
-                        evidence,
-                        profile,
-                        mapping,
+                annotation_result = compile_annotation(
+                    evidence,
+                    profile,
+                    mapping,
+                    normalized_info=normalization.normalized_info,
+                    confidence_threshold=confidence_threshold,
+                    existing_issues=normalization.issues,
+                )
+                if annotation_result.issues:
+                    normalization = NormalizationResult(
                         normalized_info=normalization.normalized_info,
-                        confidence_threshold=confidence_threshold,
+                        robot_identity=normalization.robot_identity,
+                        camera_mappings=normalization.camera_mappings,
+                        machine_mappings=normalization.machine_mappings,
+                        issues=(*normalization.issues, *annotation_result.issues),
                     )
-                    if annotation_result.issues:
-                        normalization = replace(
-                            normalization,
-                            issues=(*normalization.issues, *annotation_result.issues),
-                        )
-                        known_issue_count = len(normalization.issues)
-                        status = status_from_issues(normalization.issues)
-                    elif status is DatasetStatus.PASS:
-                        annotation = annotation_result.document
+                known_issue_count = len(normalization.issues)
+                status = status_from_issues(normalization.issues)
                 review = build_review_payload(
                     candidate,
                     status,
@@ -278,7 +257,7 @@ def normalize_datasets(
                     candidate,
                     normalization.normalized_info,
                     review,
-                    annotation=annotation,
+                    annotation=annotation_result.document,
                 )
         except MemoryError:
             raise
@@ -317,61 +296,29 @@ def normalize_datasets(
     return results
 
 
-def _research_hardware(
-    vlm: DatasetVlm,
-    identity: IdentityEvidence,
-    *,
-    deadline_monotonic: float | None = None,
-) -> tuple[HardwareProfile | None, Issue | None]:
-    if deadline_monotonic is None:
-        raw_result = vlm.research_hardware(identity)
-    else:
-        raw_result = vlm.research_hardware(
-            identity,
-            deadline_monotonic=deadline_monotonic,
-        )
-    if type(raw_result) is not tuple or len(raw_result) != 2:
-        return None, _RESEARCH_INVALID
-    value, issue = raw_result
-    if issue is not None:
-        return None, issue if isinstance(issue, Issue) else _RESEARCH_INVALID
-    if isinstance(value, HardwareProfile):
-        return value, None
-    return None, _RESEARCH_INVALID
-
-
-def _map_dataset(
+def _analyze_dataset(
     vlm: DatasetVlm,
     evidence: DatasetEvidence,
-    profile: HardwareProfile,
+    robot_type: str,
     *,
     deadline_monotonic: float | None = None,
-) -> tuple[DatasetMapping | None, Issue | None]:
+) -> tuple[DatasetAnalysis | None, Issue | None]:
     if deadline_monotonic is None:
-        raw_result = vlm.map_dataset(evidence, profile)
+        raw_result = vlm.analyze_dataset(evidence, robot_type)
     else:
-        raw_result = vlm.map_dataset(
+        raw_result = vlm.analyze_dataset(
             evidence,
-            profile,
+            robot_type,
             deadline_monotonic=deadline_monotonic,
         )
     if type(raw_result) is not tuple or len(raw_result) != 2:
-        return None, _MAPPING_INVALID
+        return None, _ANALYSIS_INVALID
     value, issue = raw_result
     if issue is not None:
-        return None, issue if isinstance(issue, Issue) else _MAPPING_INVALID
-    if isinstance(value, DatasetMapping):
+        return None, issue if isinstance(issue, Issue) else _ANALYSIS_INVALID
+    if isinstance(value, DatasetAnalysis):
         return value, None
-    return None, _MAPPING_INVALID
-
-
-def _profile_has_safe_identity(profile: HardwareProfile) -> bool:
-    fact = profile.identity
-    return (
-        isinstance(fact, RobotIdentityFact)
-        and _safe_text(fact.manufacturer)
-        and _safe_text(fact.model)
-    )
+    return None, _ANALYSIS_INVALID
 
 
 def _safe_text(value: object) -> bool:
@@ -418,7 +365,6 @@ def _generator_identity() -> dict[str, object]:
 
 def _changed_field_count(result: NormalizationResult) -> int:
     records = (
-        result.robot_identity,
         *result.camera_mappings,
         *result.machine_mappings,
     )

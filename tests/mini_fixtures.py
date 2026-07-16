@@ -14,6 +14,7 @@ from pathlib import Path
 from robometanorm.models import (
     CameraAssignment,
     CameraSlot,
+    DatasetAnalysis,
     DatasetCandidate,
     DatasetEvidence,
     DatasetMapping,
@@ -344,11 +345,7 @@ def _missing_vlm_issue() -> Issue:
     )
 
 
-def _missing_hardware_result() -> tuple[HardwareProfile | None, Issue | None]:
-    return None, _missing_vlm_issue()
-
-
-def _missing_mapping_result() -> tuple[DatasetMapping | None, Issue | None]:
+def _missing_analysis_result() -> tuple[DatasetAnalysis | None, Issue | None]:
     return None, _missing_vlm_issue()
 
 
@@ -356,37 +353,24 @@ def _missing_mapping_result() -> tuple[DatasetMapping | None, Issue | None]:
 class FakeVlm:
     """Fixed-result dataset VLM fake with inspectable calls."""
 
-    research_result: tuple[HardwareProfile | None, Issue | None] = field(
-        default_factory=_missing_hardware_result
+    analysis_result: tuple[DatasetAnalysis | None, Issue | None] = field(
+        default_factory=_missing_analysis_result
     )
-    mapping_result: tuple[DatasetMapping | None, Issue | None] = field(
-        default_factory=_missing_mapping_result
-    )
-    research_calls: int = field(default=0, init=False)
-    mapping_calls: int = field(default=0, init=False)
-    research_deadlines: list[float | None] = field(default_factory=list, init=False)
-    mapping_deadlines: list[float | None] = field(default_factory=list, init=False)
+    analysis_calls: int = field(default=0, init=False)
+    analysis_robot_types: list[str] = field(default_factory=list, init=False)
+    analysis_deadlines: list[float | None] = field(default_factory=list, init=False)
 
-    def research_hardware(
-        self,
-        identity: IdentityEvidence,
-        *,
-        deadline_monotonic: float | None = None,
-    ) -> tuple[HardwareProfile | None, Issue | None]:
-        self.research_calls += 1
-        self.research_deadlines.append(deadline_monotonic)
-        return self.research_result
-
-    def map_dataset(
+    def analyze_dataset(
         self,
         evidence: DatasetEvidence,
-        profile: HardwareProfile,
+        robot_type: str,
         *,
         deadline_monotonic: float | None = None,
-    ) -> tuple[DatasetMapping | None, Issue | None]:
-        self.mapping_calls += 1
-        self.mapping_deadlines.append(deadline_monotonic)
-        return self.mapping_result
+    ) -> tuple[DatasetAnalysis | None, Issue | None]:
+        self.analysis_calls += 1
+        self.analysis_robot_types.append(robot_type)
+        self.analysis_deadlines.append(deadline_monotonic)
+        return self.analysis_result
 
 
 @dataclass

@@ -217,28 +217,22 @@ class MiniFixtureTest(unittest.TestCase):
         json.dumps(mapping)
 
     def test_fake_vlm_uses_frozen_results_and_records_calls(self) -> None:
-        identity = object()
         evidence = object()
         profile = PipelineFixture().hardware_profile()
         mapping = PipelineFixture().dataset_mapping()
-        fake = FakeVlm(research_result=(profile, None), mapping_result=(mapping, None))
+        analysis = DatasetAnalysis(profile, mapping)
+        fake = FakeVlm(analysis_result=(analysis, None))
 
-        self.assertEqual(fake.research_calls, 0)
-        self.assertEqual(fake.mapping_calls, 0)
-        self.assertEqual(fake.research_hardware(identity), (profile, None))
-        self.assertEqual(fake.map_dataset(evidence, profile), (mapping, None))
-        self.assertEqual(fake.research_calls, 1)
-        self.assertEqual(fake.mapping_calls, 1)
+        self.assertEqual(fake.analysis_calls, 0)
+        self.assertEqual(fake.analyze_dataset(evidence, "acme_testbot"), (analysis, None))
+        self.assertEqual(fake.analysis_calls, 1)
+        self.assertEqual(fake.analysis_robot_types, ["acme_testbot"])
 
         missing = FakeVlm()
-        missing_profile, research_issue = missing.research_hardware(identity)
-        missing_mapping, mapping_issue = missing.map_dataset(evidence, profile)
-        self.assertIsNone(missing_profile)
-        self.assertIsNone(missing_mapping)
-        self.assertEqual(research_issue.code, "VLM_CONFIG_MISSING")
-        self.assertEqual(mapping_issue.code, "VLM_CONFIG_MISSING")
-        self.assertEqual(research_issue.severity, "review")
-        self.assertEqual(mapping_issue.severity, "review")
+        missing_analysis, issue = missing.analyze_dataset(evidence, "acme_testbot")
+        self.assertIsNone(missing_analysis)
+        self.assertEqual(issue.code, "VLM_CONFIG_MISSING")
+        self.assertEqual(issue.severity, "review")
 
     def test_stub_transport_returns_frozen_results_and_records_attempts(self) -> None:
         web_payload = {"sources": [{"title": "Acme Test Manual"}]}

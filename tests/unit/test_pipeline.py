@@ -18,6 +18,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.models import (
+    DatasetAnalysis,
     DatasetMapping,
     DatasetResult,
     DatasetStatus,
@@ -32,22 +33,14 @@ class _RaisingVlm:
     def __init__(self, error: BaseException) -> None:
         self.error = error
 
-    def research_hardware(
+    def analyze_dataset(
         self,
-        identity: object,
+        evidence: object,
+        robot_type: str,
         *,
         deadline_monotonic: float | None = None,
     ) -> object:
         raise self.error
-
-    def map_dataset(
-        self,
-        evidence: object,
-        profile: object,
-        *,
-        deadline_monotonic: float | None = None,
-    ) -> object:
-        raise AssertionError("mapping must not be called")
 
 
 class MiniPipelineTest(unittest.TestCase):
@@ -178,10 +171,86 @@ class MiniPipelineTest(unittest.TestCase):
         )
 
     def _success_vlm(self) -> FakeVlm:
-        return FakeVlm(
-            research_result=(self.profile, None),
-            mapping_result=(self.mapping, None),
+        return FakeVlm(analysis_result=(DatasetAnalysis(self.profile, self.mapping), None))
+
+    def test_success_uses_one_analysis_with_local_robot_type_and_writes_yaml(self) -> None:
+        class AnalysisOnlyVlm:
+            def __init__(self, analysis: DatasetAnalysis) -> None:
+                self.analysis = analysis
+                self.calls: list[tuple[object, str, float | None]] = []
+
+            def analyze_dataset(
+                self,
+                evidence: object,
+                robot_type: str,
+                *,
+                deadline_monotonic: float | None = None,
+            ) -> tuple[DatasetAnalysis, None]:
+                self.calls.append((evidence, robot_type, deadline_monotonic))
+                return self.analysis, None
+
+        vlm = AnalysisOnlyVlm(DatasetAnalysis(self.profile, self.mapping))
+
+        result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.PASS)
+        self.assertEqual(result.changed_field_count, 3)
+        self.assertEqual([robot_type for _, robot_type, _ in vlm.calls], ["acme_testbot"])
+        self.assertEqual(
+            self._read_output(self.fixture, "info_norm.json")["robot_type"],
+            "acme_testbot",
         )
+        annotation = yaml.safe_load(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(annotation["review"]["required"])
+
+    def test_missing_or_invalid_local_robot_type_skips_analysis_and_writes_review_yaml(self) -> None:
+        for robot_type in (None, " acme_testbot ", ""):
+            with self.subTest(robot_type=robot_type):
+                source = self._source_info()
+                if robot_type is None:
+                    del source["robot_type"]
+                else:
+                    source["robot_type"] = robot_type
+                self.fixture.candidate.info_path.write_text(
+                    json.dumps(source), encoding="utf-8"
+                )
+                vlm = self._success_vlm()
+
+                result = self._normalize(vlm)[0]
+
+                self.assertEqual(result.status, DatasetStatus.REVIEW)
+                self.assertEqual(vlm.analysis_calls, 0)
+                self.assertEqual(self._read_output(self.fixture, "info_norm.json"), source)
+                annotation = yaml.safe_load(
+                    (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertIsNone(annotation["robot_type"])
+                self.assertTrue(annotation["review"]["required"])
+                self.assertIn(
+                    "LOCAL_ROBOT_TYPE_UNAVAILABLE",
+                    {item["code"] for item in annotation["review"]["issues"]},
+                )
+
+    def test_rerun_replaces_confirmed_annotation_with_review_fallback(self) -> None:
+        self.assertEqual(self._normalize(self._success_vlm())[0].status, DatasetStatus.PASS)
+        annotation_path = self.fixture.candidate.info_path.parent / "robo_annotation.yaml"
+        self.assertFalse(yaml.safe_load(annotation_path.read_text(encoding="utf-8"))["review"]["required"])
+
+        source = self._source_info()
+        del source["features"]["action"]
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+        result = self._normalize(self._success_vlm())[0]
+
+        self.assertEqual(result.status, DatasetStatus.BLOCKED)
+        annotation = yaml.safe_load(annotation_path.read_text(encoding="utf-8"))
+        self.assertTrue(annotation["review"]["required"])
+        self.assertEqual(annotation["robot_channel_schema"]["channels"], {})
 
     def test_status_priority_is_error_block_review_pass_and_unknown_is_error(self) -> None:
         from robometanorm.pipeline import status_from_issues
@@ -323,11 +392,9 @@ class MiniPipelineTest(unittest.TestCase):
             stages,
             [
                 (1, 2, "dataset-a", "读取本地证据"),
-                (1, 2, "dataset-a", "查询硬件身份"),
-                (1, 2, "dataset-a", "映射相机与关节"),
+                (1, 2, "dataset-a", "分析相机与关节"),
                 (2, 2, "dataset-b", "读取本地证据"),
-                (2, 2, "dataset-b", "查询硬件身份"),
-                (2, 2, "dataset-b", "映射相机与关节"),
+                (2, 2, "dataset-b", "分析相机与关节"),
             ],
         )
 
@@ -351,7 +418,7 @@ class MiniPipelineTest(unittest.TestCase):
             )
 
         self.assertEqual([result.status for result in results], [DatasetStatus.PASS])
-        self.assertEqual(attempted, ["读取本地证据", "查询硬件身份", "映射相机与关节"])
+        self.assertEqual(attempted, ["读取本地证据", "分析相机与关节"])
 
     def test_normalize_propagates_memory_error_from_stage_callback(self) -> None:
         def failing_stage(
@@ -387,7 +454,7 @@ class MiniPipelineTest(unittest.TestCase):
                         dataset_timeout_seconds=invalid,
                     )
 
-    def test_normalize_forwards_one_deadline_to_both_vlm_calls(self) -> None:
+    def test_normalize_forwards_one_deadline_to_analysis_call(self) -> None:
         vlm = self._success_vlm()
 
         from robometanorm.pipeline import normalize_datasets
@@ -404,19 +471,14 @@ class MiniPipelineTest(unittest.TestCase):
             )
 
         self.assertEqual([result.status for result in results], [DatasetStatus.PASS])
-        self.assertEqual(vlm.research_deadlines, [280.0])
-        self.assertEqual(vlm.mapping_deadlines, [280.0])
+        self.assertEqual(vlm.analysis_deadlines, [280.0])
 
     def test_normalize_default_budget_supports_legacy_vlm_signature(self) -> None:
         class LegacyVlm:
-            def research_hardware(self, identity: object) -> object:
-                return self_profile, None
+            def analyze_dataset(self, evidence: object, robot_type: str) -> object:
+                return self_analysis, None
 
-            def map_dataset(self, evidence: object, profile: object) -> object:
-                return self_mapping, None
-
-        self_profile = self.profile
-        self_mapping = self.mapping
+        self_analysis = DatasetAnalysis(self.profile, self.mapping)
 
         result = self._normalize(LegacyVlm())[0]
 
@@ -427,31 +489,20 @@ class MiniPipelineTest(unittest.TestCase):
 
         class TimeoutThenSuccessVlm:
             def __init__(self, profile: object, mapping: object) -> None:
-                self.profile = profile
-                self.mapping = mapping
-                self.research_calls = 0
-                self.mapping_calls = 0
+                self.analysis = DatasetAnalysis(profile, mapping)
+                self.analysis_calls = 0
 
-            def research_hardware(
-                self,
-                identity: object,
-                *,
-                deadline_monotonic: float | None = None,
-            ) -> object:
-                self.research_calls += 1
-                if self.research_calls == 1:
-                    return None, Issue("VLM_DATASET_TIMEOUT", "budget exhausted", "vlm")
-                return self.profile, None
-
-            def map_dataset(
+            def analyze_dataset(
                 self,
                 evidence: object,
-                profile: object,
+                robot_type: str,
                 *,
                 deadline_monotonic: float | None = None,
             ) -> object:
-                self.mapping_calls += 1
-                return self.mapping, None
+                self.analysis_calls += 1
+                if self.analysis_calls == 1:
+                    return None, Issue("VLM_DATASET_TIMEOUT", "budget exhausted", "vlm")
+                return self.analysis, None
 
         from robometanorm.pipeline import normalize_datasets
 
@@ -470,7 +521,7 @@ class MiniPipelineTest(unittest.TestCase):
         first_meta = self.fixture.candidate.info_path.parent
         self.assertTrue((first_meta / "info_norm.json").is_file())
         self.assertTrue((first_meta / "info_norm_review.json").is_file())
-        self.assertFalse((first_meta / "robo_annotation.yaml").exists())
+        self.assertTrue((first_meta / "robo_annotation.yaml").is_file())
         self.assertTrue((second.candidate.info_path.parent / "robo_annotation.yaml").is_file())
 
     def test_scan_ignores_progress_callback_errors(self) -> None:
@@ -516,7 +567,7 @@ class MiniPipelineTest(unittest.TestCase):
         )
         self.assertEqual(attempted, [(1, 2, "dataset-a"), (2, 2, "dataset-b")])
 
-    def test_success_uses_one_research_map_and_range_then_writes_real_changes(self) -> None:
+    def test_success_uses_one_analysis_and_range_then_writes_real_changes(self) -> None:
         vlm = self._success_vlm()
         from robometanorm.evidence import collect_mapped_gripper_ranges as real_range
 
@@ -526,7 +577,8 @@ class MiniPipelineTest(unittest.TestCase):
         ) as ranges:
             results = self._normalize(vlm)
 
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 1))
+        self.assertEqual(vlm.analysis_calls, 1)
+        self.assertEqual(vlm.analysis_robot_types, ["acme_testbot"])
         ranges.assert_called_once()
         result = results[0]
         self.assertEqual(result.status, DatasetStatus.PASS)
@@ -555,7 +607,7 @@ class MiniPipelineTest(unittest.TestCase):
         result = self._normalize(vlm)[0]
 
         self.assertEqual(result.status, DatasetStatus.BLOCKED)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         review = self._read_output(self.fixture, "info_norm_review.json")
         issue = next(
             item
@@ -564,9 +616,13 @@ class MiniPipelineTest(unittest.TestCase):
         )
         self.assertEqual(issue["evidence"]["source_file"], "meta/info.json")
         self.assertEqual(issue["evidence"]["source_indices"], list(range(6)))
-        self.assertFalse(
-            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
+        annotation = yaml.safe_load(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                encoding="utf-8"
+            )
         )
+        self.assertTrue(annotation["review"]["required"])
+        self.assertEqual(annotation["robot_channel_schema"]["channels"], {})
 
     def test_main_follower_single_arm_emits_main_annotation(self) -> None:
         source = self._source_info()
@@ -592,8 +648,7 @@ class MiniPipelineTest(unittest.TestCase):
         source["features"]["observation.state"]["names"] = names
         self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
         vlm = FakeVlm(
-            research_result=(self.profile, None),
-            mapping_result=(None, Issue("DATASET_MAPPING_INVALID", "bad mapping", "vlm")),
+            analysis_result=(None, Issue("DATASET_ANALYSIS_INVALID", "bad analysis", "vlm")),
         )
 
         result = self._normalize(vlm)[0]
@@ -601,12 +656,10 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertEqual(result.status, DatasetStatus.REVIEW)
         review = self._read_output(self.fixture, "info_norm_review.json")
         self.assertTrue(
-            {"DATASET_MAPPING_INVALID", "ANNOTATION_MAIN_ARM_UNCONFIRMED"}
+            {"DATASET_ANALYSIS_INVALID", "ANNOTATION_MAIN_ARM_UNCONFIRMED"}
             <= {item["code"] for item in review["issues"]}
         )
-        self.assertFalse(
-            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
-        )
+        self.assertTrue((self.fixture.candidate.info_path.parent / "robo_annotation.yaml").is_file())
 
     def test_main_follower_vlm_confirmation_failures_are_reviewed(self) -> None:
         source = self._source_info()
@@ -614,10 +667,6 @@ class MiniPipelineTest(unittest.TestCase):
         source["features"]["action"]["names"] = names
         source["features"]["observation.state"]["names"] = names
         self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
-        unresolved_profile = replace(
-            self.profile,
-            identity=replace(self.profile.identity, manufacturer=" "),
-        )
         unconfirmed_camera_mapping = replace(
             self.mapping,
             cameras=(replace(self.mapping.cameras[0], ambiguous=True),),
@@ -625,18 +674,19 @@ class MiniPipelineTest(unittest.TestCase):
         cases = (
             (
                 FakeVlm(
-                    research_result=(
+                    analysis_result=(
                         None,
                         Issue("VLM_UNAVAILABLE", "offline", "vlm"),
                     )
                 ),
                 "VLM_UNAVAILABLE",
             ),
-            (FakeVlm(research_result=(unresolved_profile, None)), "HARDWARE_IDENTITY_UNRESOLVED"),
             (
                 FakeVlm(
-                    research_result=(self.profile, None),
-                    mapping_result=(unconfirmed_camera_mapping, None),
+                    analysis_result=(
+                        DatasetAnalysis(self.profile, unconfirmed_camera_mapping),
+                        None,
+                    ),
                 ),
                 "CAMERA_MAPPING_UNRESOLVED",
             ),
@@ -651,9 +701,7 @@ class MiniPipelineTest(unittest.TestCase):
                 codes = {item["code"] for item in review["issues"]}
                 self.assertIn(expected_code, codes)
                 self.assertIn("ANNOTATION_MAIN_ARM_UNCONFIRMED", codes)
-                self.assertFalse(
-                    (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
-                )
+                self.assertTrue((self.fixture.candidate.info_path.parent / "robo_annotation.yaml").is_file())
 
     def test_invalid_main_follower_layout_blocks_before_vlm(self) -> None:
         source = self._source_info()
@@ -673,15 +721,13 @@ class MiniPipelineTest(unittest.TestCase):
         result = self._normalize(vlm)[0]
 
         self.assertEqual(result.status, DatasetStatus.BLOCKED)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         review = self._read_output(self.fixture, "info_norm_review.json")
         self.assertIn(
             "ANNOTATION_MAIN_ARM_LAYOUT_INVALID",
             {item["code"] for item in review["issues"]},
         )
-        self.assertFalse(
-            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
-        )
+        self.assertTrue((self.fixture.candidate.info_path.parent / "robo_annotation.yaml").is_file())
 
     def test_blocked_writes_source_copy_and_skips_all_vlm_and_range_work(self) -> None:
         source = self._source_info()
@@ -692,22 +738,22 @@ class MiniPipelineTest(unittest.TestCase):
             result = self._normalize(vlm)[0]
 
         self.assertEqual(result.status, DatasetStatus.BLOCKED)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         ranges.assert_not_called()
         self.assertEqual(self._read_output(self.fixture, "info_norm.json"), source)
         self.assertTrue(
             (self.fixture.candidate.info_path.parent / "info_norm_review.json").is_file()
         )
 
-    def test_research_failure_or_conflicting_object_is_discarded_fail_closed(self) -> None:
-        issue = Issue("WEB_SEARCH_UNAVAILABLE", "offline", "vlm")
-        cases = ((None, issue), (self.profile, issue), (None, None))
-        for research_result in cases:
-            with self.subTest(research_result=research_result):
-                vlm = FakeVlm(research_result=research_result)
+    def test_analysis_failure_or_malformed_result_is_discarded_fail_closed(self) -> None:
+        issue = Issue("VLM_NETWORK_ERROR", "offline", "vlm")
+        cases = ((None, issue), (DatasetAnalysis(self.profile, self.mapping), issue), (None, None))
+        for analysis_result in cases:
+            with self.subTest(analysis_result=analysis_result):
+                vlm = FakeVlm(analysis_result=analysis_result)
                 with patch("robometanorm.pipeline.collect_mapped_gripper_ranges") as ranges:
                     result = self._normalize(vlm)[0]
-                self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 0))
+                self.assertEqual(vlm.analysis_calls, 1)
                 ranges.assert_not_called()
                 self.assertEqual(result.status, DatasetStatus.REVIEW)
                 self.assertEqual(
@@ -721,58 +767,31 @@ class MiniPipelineTest(unittest.TestCase):
                     )["issues"]
                 }
                 expected = (
-                    "HARDWARE_RESEARCH_INVALID"
-                    if research_result == (None, None)
-                    else "WEB_SEARCH_UNAVAILABLE"
+                    "DATASET_ANALYSIS_INVALID"
+                    if analysis_result == (None, None)
+                    else "VLM_NETWORK_ERROR"
                 )
                 self.assertIn(expected, codes)
+                annotation = yaml.safe_load(
+                    (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertTrue(annotation["review"]["required"])
+                self.assertIn("arm.left.joint", annotation["robot_channel_schema"]["channels"])
 
-    def test_unresolved_hardware_identity_skips_map_and_preserves_source(self) -> None:
-        unresolved = replace(
-            self.profile,
-            identity=replace(self.profile.identity, manufacturer=" "),
-        )
-        vlm = FakeVlm(research_result=(unresolved, None))
-        with patch("robometanorm.pipeline.collect_mapped_gripper_ranges") as ranges:
-            result = self._normalize(vlm)[0]
+    def test_malformed_analysis_tuple_fails_closed_and_writes_review_yaml(self) -> None:
+        class MalformedVlm:
+            def analyze_dataset(self, evidence: object, robot_type: str) -> object:
+                return self_profile, None, "unexpected"
 
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 0))
-        ranges.assert_not_called()
+        self_profile = self.profile
+        result = self._normalize(MalformedVlm())[0]
+
         self.assertEqual(result.status, DatasetStatus.REVIEW)
-        self.assertEqual(self._read_output(self.fixture, "info_norm.json"), self._source_info())
-        codes = {
-            issue["code"]
-            for issue in self._read_output(self.fixture, "info_norm_review.json")[
-                "issues"
-            ]
-        }
-        self.assertIn("HARDWARE_IDENTITY_UNRESOLVED", codes)
-
-    def test_mapping_failure_none_or_conflicting_object_never_applies_identity(self) -> None:
-        issue = Issue("DATASET_MAPPING_INVALID", "bad mapping", "vlm")
-        cases = ((None, issue), (self.mapping, issue), (None, None))
-        for mapping_result in cases:
-            with self.subTest(mapping_result=mapping_result):
-                vlm = FakeVlm(
-                    research_result=(self.profile, None),
-                    mapping_result=mapping_result,
-                )
-                with patch("robometanorm.pipeline.collect_mapped_gripper_ranges") as ranges:
-                    result = self._normalize(vlm)[0]
-                self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 1))
-                ranges.assert_not_called()
-                self.assertEqual(result.status, DatasetStatus.REVIEW)
-                self.assertEqual(
-                    self._read_output(self.fixture, "info_norm.json"),
-                    self._source_info(),
-                )
-                codes = {
-                    item["code"]
-                    for item in self._read_output(
-                        self.fixture, "info_norm_review.json"
-                    )["issues"]
-                }
-                self.assertIn("DATASET_MAPPING_INVALID", codes)
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertIn("DATASET_ANALYSIS_INVALID", {item["code"] for item in review["issues"]})
+        self.assertTrue((self.fixture.candidate.info_path.parent / "robo_annotation.yaml").is_file())
 
     def test_invalid_info_is_error_without_vlm_range_or_fabricated_outputs(self) -> None:
         self.fixture.candidate.info_path.write_text("[", encoding="utf-8")
@@ -782,7 +801,7 @@ class MiniPipelineTest(unittest.TestCase):
 
         self.assertEqual(result.status, DatasetStatus.ERROR)
         self.assertIsNone(result.source_info)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         ranges.assert_not_called()
         meta = self.fixture.candidate.info_path.parent
         self.assertFalse((meta / "info_norm.json").exists())
@@ -803,7 +822,7 @@ class MiniPipelineTest(unittest.TestCase):
 
         self.assertEqual(result.status, DatasetStatus.ERROR)
         self.assertIsNone(result.source_info)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         self.assertNotIn(sentinel, repr(result))
         meta = self.fixture.candidate.info_path.parent
         self.assertFalse((meta / "info_norm.json").exists())
@@ -826,7 +845,7 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertEqual(result.status, DatasetStatus.PASS)
         self.assertEqual(result.candidate.source_path, self.fixture.candidate.source_path)
         self.assertIsNotNone(result.source_info)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 1))
+        self.assertEqual(vlm.analysis_calls, 1)
         meta = self.fixture.candidate.info_path.parent
         self.assertTrue((meta / "info_norm.json").is_file())
         self.assertTrue((meta / "info_norm_review.json").is_file())
@@ -841,14 +860,14 @@ class MiniPipelineTest(unittest.TestCase):
 
         with patch.object(
             vlm,
-            "research_hardware",
-            wraps=vlm.research_hardware,
-        ) as research:
+            "analyze_dataset",
+            wraps=vlm.analyze_dataset,
+        ) as analysis:
             result = self._normalize(vlm)[0]
 
         self.assertEqual(result.status, DatasetStatus.REVIEW)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (1, 1))
-        self.assertNotIn(sentinel, repr(research.call_args.args[0]))
+        self.assertEqual(vlm.analysis_calls, 1)
+        self.assertNotIn(sentinel, repr(analysis.call_args.args[0]))
         normalized = self._read_output(self.fixture, "info_norm.json")
         review = self._read_output(self.fixture, "info_norm_review.json")
         self.assertIsInstance(normalized, dict)
@@ -895,9 +914,9 @@ class MiniPipelineTest(unittest.TestCase):
                     ),
                     patch.object(
                         vlm,
-                        "research_hardware",
-                        wraps=vlm.research_hardware,
-                    ) as research,
+                        "analyze_dataset",
+                        wraps=vlm.analyze_dataset,
+                    ) as analysis,
                 ):
                     result = self._normalize(vlm)[0]
 
@@ -906,7 +925,7 @@ class MiniPipelineTest(unittest.TestCase):
                 self.assertTrue((meta / "info_norm_review.json").is_file())
                 review = self._read_output(self.fixture, "info_norm_review.json")
                 self.assertIn(expected_code, {item["code"] for item in review["issues"]})
-                self.assertNotIn(sentinel, repr(research.call_args.args[0]))
+                self.assertNotIn(sentinel, repr(analysis.call_args.args[0]))
                 self.assertNotIn(sentinel, json.dumps(review, ensure_ascii=False))
 
     def test_strict_info_failures_are_error_with_zero_outputs(self) -> None:
@@ -929,7 +948,7 @@ class MiniPipelineTest(unittest.TestCase):
 
                 self.assertEqual(result.status, DatasetStatus.ERROR)
                 self.assertIsNone(result.source_info)
-                self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+                self.assertEqual(vlm.analysis_calls, 0)
                 self.assertFalse((meta / "info_norm.json").exists())
                 self.assertFalse((meta / "info_norm_review.json").exists())
 
@@ -949,7 +968,7 @@ class MiniPipelineTest(unittest.TestCase):
 
         parquet_file.assert_not_called()
         self.assertEqual(result.status, DatasetStatus.BLOCKED)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         self.assertEqual(
             self._read_output(self.fixture, "info_norm.json"),
             self._source_info(),
@@ -985,7 +1004,7 @@ class MiniPipelineTest(unittest.TestCase):
         probe.assert_not_called()
         extract.assert_not_called()
         self.assertEqual(result.status, DatasetStatus.BLOCKED)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         self.assertEqual(
             self._read_output(self.fixture, "info_norm.json"),
             self._source_info(),
@@ -1086,8 +1105,7 @@ class MiniPipelineTest(unittest.TestCase):
             machines=(replace(self.mapping.machines[0], ambiguous=True), *self.mapping.machines[1:]),
         )
         vlm = FakeVlm(
-            research_result=(self.profile, None),
-            mapping_result=(ambiguous_mapping, None),
+            analysis_result=(DatasetAnalysis(self.profile, ambiguous_mapping), None),
         )
 
         def range_result(candidate: object, evidence: object, profile: object, mapping: object):
@@ -1111,6 +1129,14 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertLess(codes.index("COMMON_RECORD_INVALID"), codes.index("PRECONDITION_REVIEW"))
         self.assertLess(codes.index("PRECONDITION_REVIEW"), codes.index("RANGE_REVIEW"))
         self.assertLess(codes.index("RANGE_REVIEW"), codes.index("MACHINE_MAPPING_INVALID"))
+        annotation = yaml.safe_load(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        annotation_codes = [item["code"] for item in annotation["review"]["issues"]]
+        self.assertEqual(annotation_codes, codes)
+        self.assertEqual(len(annotation_codes), len(set(annotation_codes)))
 
     def test_generator_is_fixed_and_only_package_not_found_is_suppressed(self) -> None:
         with patch("robometanorm.pipeline.importlib.metadata.version", return_value="9.9"):

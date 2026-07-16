@@ -29,6 +29,7 @@ from robometanorm.cli.main import (
     main,
 )
 from robometanorm.models import (
+    DatasetAnalysis,
     DatasetMapping,
     DatasetResult,
     DatasetStatus,
@@ -141,10 +142,7 @@ class CliIntegrationTest(unittest.TestCase):
         return output_path
 
     def _success_vlm(self) -> FakeVlm:
-        return FakeVlm(
-            research_result=(self.profile, None),
-            mapping_result=(self.mapping, None),
-        )
+        return FakeVlm(analysis_result=(DatasetAnalysis(self.profile, self.mapping), None))
 
     def _run(
         self,
@@ -224,9 +222,9 @@ class CliIntegrationTest(unittest.TestCase):
             stderr=interactive_stderr,
         )
 
-        self.assertIn("处理中 [1/1] dataset-a：查询硬件身份", progress)
+        self.assertIn("处理中 [1/1] dataset-a：分析相机与关节", progress)
         self.assertLess(
-            progress.index("处理中 [1/1] dataset-a：查询硬件身份"),
+            progress.index("处理中 [1/1] dataset-a：分析相机与关节"),
             progress.rindex("\r处理中 [1/1] dataset-a"),
         )
         self.assertTrue(progress.endswith("\n"))
@@ -444,10 +442,12 @@ class CliIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(normalized, self._source_info())
         self.assertIn("VLM_CONFIG_MISSING", {item["code"] for item in review["issues"]})
+        annotation = yaml.safe_load((meta / "robo_annotation.yaml").read_text(encoding="utf-8"))
+        self.assertTrue(annotation["review"]["required"])
 
     def test_network_failure_from_vlm_keeps_source_and_records_reason(self) -> None:
         failure = Issue("VLM_NETWORK_ERROR", "offline", "vlm")
-        vlm = FakeVlm(research_result=(None, failure))
+        vlm = FakeVlm(analysis_result=(None, failure))
         output, _ = self._run("normalize", "--root", str(self.root), vlm=vlm)
 
         self.assertIn("REVIEW", output)
@@ -460,8 +460,10 @@ class CliIntegrationTest(unittest.TestCase):
             (meta / "info_norm_review.json").read_text(encoding="utf-8")
         )
         self.assertIn("VLM_NETWORK_ERROR", {item["code"] for item in review["issues"]})
+        annotation = yaml.safe_load((meta / "robo_annotation.yaml").read_text(encoding="utf-8"))
+        self.assertTrue(annotation["review"]["required"])
 
-    def test_blocked_dataset_still_writes_exactly_two_source_preserving_outputs(self) -> None:
+    def test_blocked_dataset_still_writes_review_annotation_and_source_preserving_outputs(self) -> None:
         source = self._source_info()
         del source["features"]["action"]
         self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
@@ -470,12 +472,13 @@ class CliIntegrationTest(unittest.TestCase):
         output, _ = self._run("normalize", "--root", str(self.root), vlm=vlm)
 
         self.assertIn("BLOCKED", output)
-        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        self.assertEqual(vlm.analysis_calls, 0)
         meta = self.fixture.candidate.info_path.parent
         self.assertEqual(
             json.loads((meta / "info_norm.json").read_text(encoding="utf-8")), source
         )
         self.assertTrue((meta / "info_norm_review.json").is_file())
+        self.assertTrue((meta / "robo_annotation.yaml").is_file())
 
     def test_writer_failure_is_isolated_and_second_dataset_completes(self) -> None:
         second = self._create_dataset("dataset-b")

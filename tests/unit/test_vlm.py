@@ -2789,23 +2789,19 @@ class HardwareResearchTest(unittest.TestCase, VlmFixture):
         self.assertIsNone(issue)
         self.assertEqual(transport.web_deadlines, [deadline])
 
-    def test_fake_vlm_records_exact_deadlines(self) -> None:
-        research_deadline = 1234.5
-        mapping_deadline = 5678.25
+    def test_fake_vlm_records_exact_analysis_deadline(self) -> None:
+        deadline = 1234.5
         fake = FakeVlm()
 
-        fake.research_hardware(
-            self.identity_with_injection_text(),
-            deadline_monotonic=research_deadline,
-        )
-        fake.map_dataset(
+        fake.analyze_dataset(
             object(),
-            PipelineFixture().hardware_profile(),
-            deadline_monotonic=mapping_deadline,
+            "acme_testbot",
+            deadline_monotonic=deadline,
         )
 
-        self.assertEqual(fake.research_deadlines, [research_deadline])
-        self.assertEqual(fake.mapping_deadlines, [mapping_deadline])
+        self.assertEqual(fake.analysis_calls, 1)
+        self.assertEqual(fake.analysis_robot_types, ["acme_testbot"])
+        self.assertEqual(fake.analysis_deadlines, [deadline])
 
     def test_research_without_deadline_supports_legacy_transport(self) -> None:
         transport = _LegacyTransport(web_payload=self.valid_hardware_payload())
