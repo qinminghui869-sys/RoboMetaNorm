@@ -315,7 +315,10 @@ def compile_annotation(
         "required": bool(review_issues),
         "issues": review_issues,
     }
-    return AnnotationResult(document, confirmed.issues)
+    return AnnotationResult(
+        document,
+        _new_annotation_issues(existing_issues, confirmed.issues),
+    )
 
 
 def _deduplicated_review_issues(issues: Sequence[Issue]) -> list[dict[str, str]]:
@@ -327,6 +330,20 @@ def _deduplicated_review_issues(issues: Sequence[Issue]) -> list[dict[str, str]]
             seen.add(key)
             projected.append({"code": issue.code, "message": issue.message})
     return projected
+
+
+def _new_annotation_issues(
+    existing_issues: Sequence[Issue],
+    compiler_issues: Sequence[Issue],
+) -> tuple[Issue, ...]:
+    seen = {(issue.code, issue.message) for issue in existing_issues}
+    new_issues: list[Issue] = []
+    for issue in compiler_issues:
+        key = (issue.code, issue.message)
+        if key not in seen:
+            seen.add(key)
+            new_issues.append(issue)
+    return tuple(new_issues)
 
 
 def _best_effort_document(

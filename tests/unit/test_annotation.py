@@ -686,6 +686,29 @@ class AnnotationCompilerTest(unittest.TestCase):
             ],
         )
 
+    def test_fallback_does_not_return_annotation_issue_already_seen_by_pipeline(self) -> None:
+        existing = Issue(
+            "ANNOTATION_MAPPING_UNCONFIRMED",
+            "缺少已确认的硬件画像或数据映射",
+            "annotation",
+            {"already": "reported"},
+        )
+
+        result = compile_annotation(
+            AnnotationFixture.evidence(),
+            None,
+            None,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+            existing_issues=(existing,),
+        )
+
+        self.assertEqual(result.issues, ())
+        self.assertEqual(
+            result.document["review"]["issues"],
+            [{"code": "ANNOTATION_MAPPING_UNCONFIRMED", "message": "缺少已确认的硬件画像或数据映射"}],
+        )
+
     def test_fallback_ambiguous_or_invalid_identity_is_reviewed_without_channels(self) -> None:
         evidence = AnnotationFixture.evidence(sides=("left",))
         generic = tuple("joint_" + str(index) for index in range(1, 3))
