@@ -218,6 +218,14 @@ class DatasetMapping:
 
 
 @dataclass(frozen=True)
+class DatasetAnalysis:
+    """One locally scoped hardware structure and its dataset assignments."""
+
+    profile: HardwareProfile
+    mapping: DatasetMapping
+
+
+@dataclass(frozen=True)
 class MappingRecord:
     source_address: str
     source: object

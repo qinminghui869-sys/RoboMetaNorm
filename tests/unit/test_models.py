@@ -6,12 +6,18 @@ import json
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
-from robometanorm.models import DatasetCandidate, DatasetStatus, Issue, LayoutType
+from robometanorm.models import (
+    DatasetAnalysis,
+    DatasetCandidate,
+    DatasetStatus,
+    Issue,
+    LayoutType,
+)
 from tests.mini_fixtures import (
     DatasetFixture,
     FakeVlm,
@@ -92,6 +98,18 @@ class DatasetCandidateTest(unittest.TestCase):
 
 class MiniFixtureTest(unittest.TestCase):
     """Verify reusable mini fixtures stay deterministic and protocol-complete."""
+
+    def test_dataset_analysis_groups_profile_and_mapping(self) -> None:
+        fixture = PipelineFixture()
+        profile = fixture.hardware_profile()
+        mapping = fixture.dataset_mapping()
+
+        analysis = DatasetAnalysis(profile=profile, mapping=mapping)
+
+        self.assertIs(analysis.profile, profile)
+        self.assertIs(analysis.mapping, mapping)
+        with self.assertRaises(FrozenInstanceError):
+            analysis.mapping = mapping  # type: ignore[misc]
 
     def test_dataset_fixture_isolates_source_info_from_later_caller_changes(self) -> None:
         source_info = DatasetFixture.default_info()
