@@ -12,6 +12,8 @@ from pathlib import Path
 import secrets
 import stat
 
+import yaml
+
 from robometanorm.models import (
     DatasetCandidate,
     DatasetEvidence,
@@ -58,6 +60,7 @@ _STATUS_VALUES = frozenset(status.value for status in DatasetStatus)
 _LAYOUT_VALUES = frozenset(layout.value for layout in LayoutType)
 _INFO_OUTPUT_NAME = "info_norm.json"
 _REVIEW_OUTPUT_NAME = "info_norm_review.json"
+_ANNOTATION_OUTPUT_NAME = "robo_annotation.yaml"
 
 
 def _invalid_json() -> ValueError:
@@ -119,6 +122,27 @@ def _json_bytes(payload: object) -> bytes:
         )
         return (text + "\n").encode("utf-8")
     except (TypeError, ValueError, RecursionError, OverflowError):
+        raise _invalid_json() from None
+
+
+def _yaml_bytes(payload: Mapping[str, object]) -> bytes:
+    """Serialize a JSON-native annotation mapping and verify its YAML form."""
+
+    if type(payload) is not dict:
+        raise _invalid_json()
+    cloned = _safe_clone_json_native(payload)
+    if type(cloned) is not dict:
+        raise _invalid_json()
+    try:
+        rendered = yaml.safe_dump(
+            cloned,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+        if yaml.safe_load(rendered) != cloned:
+            raise _invalid_json()
+        return rendered.encode("utf-8")
+    except (TypeError, ValueError, yaml.YAMLError):
         raise _invalid_json() from None
 
 
@@ -418,7 +442,11 @@ def _validate_relative_file(meta_fd: int, name: str, *, required: bool) -> None:
         raise ValueError("输出路径不安全")
 
 
-def _open_output_directories(source_path: Path) -> tuple[int, int]:
+def _open_output_directories(
+    source_path: Path,
+    *,
+    with_annotation: bool,
+) -> tuple[int, int]:
     flags = _directory_open_flags()
     source_fd = os.open(source_path, flags)
     meta_fd: int | None = None
@@ -434,6 +462,8 @@ def _open_output_directories(source_path: Path) -> tuple[int, int]:
         _validate_relative_file(meta_fd, "info.json", required=True)
         _validate_relative_file(meta_fd, _INFO_OUTPUT_NAME, required=False)
         _validate_relative_file(meta_fd, _REVIEW_OUTPUT_NAME, required=False)
+        if with_annotation:
+            _validate_relative_file(meta_fd, _ANNOTATION_OUTPUT_NAME, required=False)
         completed = True
         return source_fd, meta_fd
     finally:
@@ -506,8 +536,10 @@ def write_outputs(
     candidate: DatasetCandidate,
     info_norm: Mapping[str, object],
     review_without_hash: Mapping[str, object],
-) -> tuple[Path, Path]:
-    """Atomically replace only the normalized info and its matching review."""
+    *,
+    annotation: Mapping[str, object] | None = None,
+) -> tuple[Path, ...]:
+    """Atomically replace the normalized bundle and optional annotation."""
 
     if type(info_norm) is not dict or type(review_without_hash) is not dict:
         raise _invalid_json()
@@ -516,17 +548,23 @@ def write_outputs(
     _validate_review_without_hash(review_copy)
 
     info_bytes = _json_bytes(info_norm)
+    annotation_bytes = _yaml_bytes(annotation) if annotation is not None else None
     info_digest = "sha256:" + hashlib.sha256(info_bytes).hexdigest()
     review_copy["info_norm_sha256"] = info_digest
     review_bytes = _json_bytes(review_copy)
     _, info_output, review_output = _validated_output_paths(candidate)
+    annotation_output = candidate.info_path.parent / _ANNOTATION_OUTPUT_NAME
 
     source_fd: int | None = None
     meta_fd: int | None = None
     info_temp: str | None = None
     review_temp: str | None = None
+    annotation_temp: str | None = None
     try:
-        source_fd, meta_fd = _open_output_directories(candidate.source_path)
+        source_fd, meta_fd = _open_output_directories(
+            candidate.source_path,
+            with_annotation=annotation_bytes is not None,
+        )
         info_temp = _write_temp(
             source_fd,
             meta_fd,
@@ -539,6 +577,13 @@ def write_outputs(
             prefix="info_norm_review",
             payload=review_bytes,
         )
+        if annotation_bytes is not None:
+            annotation_temp = _write_temp(
+                source_fd,
+                meta_fd,
+                prefix="robo_annotation",
+                payload=annotation_bytes,
+            )
         _assert_meta_attached(source_fd, meta_fd)
         os.replace(
             info_temp,
@@ -553,16 +598,27 @@ def write_outputs(
             src_dir_fd=meta_fd,
             dst_dir_fd=meta_fd,
         )
+        if annotation_temp is not None:
+            _assert_meta_attached(source_fd, meta_fd)
+            os.replace(
+                annotation_temp,
+                _ANNOTATION_OUTPUT_NAME,
+                src_dir_fd=meta_fd,
+                dst_dir_fd=meta_fd,
+            )
         _assert_meta_attached(source_fd, meta_fd)
     finally:
         if meta_fd is not None:
             try:
                 _remove_temp(meta_fd, info_temp)
                 _remove_temp(meta_fd, review_temp)
+                _remove_temp(meta_fd, annotation_temp)
             finally:
                 try:
                     os.close(meta_fd)
                 finally:
                     if source_fd is not None:
                         os.close(source_fd)
-    return info_output, review_output
+    if annotation_bytes is None:
+        return info_output, review_output
+    return info_output, review_output, annotation_output

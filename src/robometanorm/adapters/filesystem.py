@@ -45,7 +45,7 @@ def _build_candidate(root: Path, dataset_path: Path) -> DatasetCandidate | None:
         return None
 
     relative_path = dataset_path.relative_to(root)
-    if len(relative_path.parts) == 1:
+    if len(relative_path.parts) <= 1:
         layout_type = LayoutType.FLAT
         task_name = None
     else:

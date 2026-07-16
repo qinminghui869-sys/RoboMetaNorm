@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.models import (
@@ -328,6 +330,36 @@ class MiniWriterTest(unittest.TestCase):
         )
         self._assert_no_temps()
 
+    def test_writes_annotation_only_when_explicitly_supplied(self) -> None:
+        annotation = {
+            "version": "dataset_annotation_config_v1",
+            "robot_type": "acme_robotics_testbot_one",
+            "adapter": {"base_type": "LeRobot", "base": {}},
+            "robot_channel_schema": {"version": "channel_schema_v1", "channels": {}},
+        }
+
+        paths = write_outputs(
+            self.candidate,
+            self.result.normalized_info,
+            self.review,
+            annotation=annotation,
+        )
+
+        annotation_path = self.meta / "robo_annotation.yaml"
+        self.assertEqual(paths, (*self._output_paths(), annotation_path))
+        self.assertEqual(yaml.safe_load(annotation_path.read_text(encoding="utf-8")), annotation)
+
+    def test_none_annotation_keeps_exact_two_outputs(self) -> None:
+        paths = write_outputs(
+            self.candidate,
+            self.result.normalized_info,
+            self.review,
+            annotation=None,
+        )
+
+        self.assertEqual(paths, self._output_paths())
+        self.assertFalse((self.meta / "robo_annotation.yaml").exists())
+
     def test_emits_sorted_unicode_utf8_with_two_space_indent_and_one_newline(self) -> None:
         info = {"z_key": "中文", "a_key": {"z": 2, "a": 1}}
 
@@ -602,6 +634,31 @@ class MiniWriterTest(unittest.TestCase):
             {"info.json"},
         )
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_meta_swap_after_info_replace_cannot_write_review_to_moved_directory(self) -> None:
+        original_meta = self.meta
+        moved_meta = self.candidate.source_path / "meta-after-info-replace"
+        real_replace = os.replace
+        replacements = 0
+
+        def replace_then_swap(source: object, target: object, **kwargs: object) -> None:
+            nonlocal replacements
+            replacements += 1
+            real_replace(source, target, **kwargs)
+            if replacements == 1:
+                original_meta.rename(moved_meta)
+                original_meta.mkdir()
+
+        with patch("robometanorm.writer.os.replace", side_effect=replace_then_swap):
+            with self.assertRaises(ValueError):
+                write_outputs(self.candidate, self.result.normalized_info, self.review)
+
+        self.assertIn("info_norm.json", {path.name for path in moved_meta.iterdir()})
+        self.assertNotIn(
+            "info_norm_review.json", {path.name for path in moved_meta.iterdir()}
+        )
+        self.assertEqual(list(original_meta.iterdir()), [])
+        self._assert_no_temps()
 
     def test_first_temp_creation_failure_replaces_nothing(self) -> None:
         expected = self._seed_existing_outputs()

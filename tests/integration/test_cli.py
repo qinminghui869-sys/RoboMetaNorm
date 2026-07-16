@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.cli.main import (
@@ -49,7 +51,7 @@ class CliIntegrationTest(unittest.TestCase):
 
     @staticmethod
     def _source_info() -> dict[str, object]:
-        raw_names = [f"raw_joint_{index}" for index in range(6)]
+        raw_names = [f"left_joint_{index}" for index in range(1, 7)]
         return {
             "robot_type": "acme_testbot",
             "fps": 30,
@@ -174,7 +176,7 @@ class CliIntegrationTest(unittest.TestCase):
         self.assertFalse((meta / "info_norm.json").exists())
         self.assertFalse((meta / "info_norm_review.json").exists())
 
-    def test_normalize_changes_only_two_outputs_and_preserves_all_sources(self) -> None:
+    def test_normalize_writes_annotation_and_preserves_all_sources(self) -> None:
         source_paths = tuple(
             sorted(
                 (
@@ -198,7 +200,11 @@ class CliIntegrationTest(unittest.TestCase):
         meta = self.fixture.candidate.info_path.parent
         self.assertEqual(
             new_files,
-            {meta / "info_norm.json", meta / "info_norm_review.json"},
+            {
+                meta / "info_norm.json",
+                meta / "info_norm_review.json",
+                meta / "robo_annotation.yaml",
+            },
         )
         normalized = json.loads((meta / "info_norm.json").read_text(encoding="utf-8"))
         self.assertEqual(normalized["robot_type"], "acme_robotics_testbot_one")
@@ -207,6 +213,11 @@ class CliIntegrationTest(unittest.TestCase):
         expected = [f"left_arm_joint_{index}_rad" for index in range(6)]
         self.assertEqual(features["action"]["names"], expected)
         self.assertEqual(features["observation.state"]["names"], expected)
+        annotation = yaml.safe_load((meta / "robo_annotation.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(annotation["adapter"]["cameras"], {
+            "observation.images.cam_front_wrist_rgb": "observation.images.wrist"
+        })
+        self.assertIn("arm.left.joint", annotation["robot_channel_schema"]["channels"])
 
     def test_missing_api_key_never_opens_network_and_degrades_to_review(self) -> None:
         key_name = "ROBOMETANORM_TEST_MISSING_KEY"

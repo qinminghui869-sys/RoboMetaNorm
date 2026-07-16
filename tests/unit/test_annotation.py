@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
@@ -275,8 +276,8 @@ class AnnotationCompilerTest(unittest.TestCase):
             schema=FeatureSchema(
                 source_key="observation.state",
                 dtype="float32",
-                shape=(3,),
-                names=("joint1", "joint_2", "j3"),
+                shape=(4,),
+                names=("joint1", "joint_2", "j3", "raw_joint_4"),
                 fps=None,
                 codec=None,
             ),
@@ -294,8 +295,11 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertEqual(issues[0].severity, "block")
         self.assertEqual(issues[0].evidence["source_file"], "meta/info.json")
         self.assertEqual(issues[0].evidence["source_feature"], "observation.state")
-        self.assertEqual(issues[0].evidence["source_indices"], [0, 1, 2])
-        self.assertEqual(issues[0].evidence["observed_names"], ["joint1", "joint_2", "j3"])
+        self.assertEqual(issues[0].evidence["source_indices"], [0, 1, 2, 3])
+        self.assertEqual(
+            issues[0].evidence["observed_names"],
+            ["joint1", "joint_2", "j3", "raw_joint_4"],
+        )
         self.assertIn("hint", issues[0].evidence)
 
     def test_compiles_confirmed_dual_arm_channels_and_preserves_camera_source(self) -> None:
@@ -339,6 +343,50 @@ class AnnotationCompilerTest(unittest.TestCase):
             yaml.safe_load(yaml.safe_dump(result.document, sort_keys=False)),
             result.document,
         )
+
+    def test_preflight_blocks_inconsistent_sided_action_and_qpos_layouts(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        machines = tuple(
+            replace(
+                machine,
+                schema=replace(
+                    machine.schema,
+                    names=("right_joint_1", "right_joint_2", *machine.schema.names[2:]),
+                ),
+            )
+            if machine.schema.source_key == "action"
+            else machine
+            for machine in evidence.machines
+        )
+
+        issues = preflight_annotation(replace(evidence, machines=machines))
+
+        self.assertEqual(issues[0].code, "ANNOTATION_JOINT_LAYOUT_MISMATCH")
+        self.assertEqual(issues[0].severity, "block")
+        self.assertEqual(issues[0].evidence["source_file"], "meta/info.json")
+
+    def test_preflight_blocks_interleaved_sided_joint_vectors(self) -> None:
+        evidence = AnnotationFixture.evidence()
+        interleaved = (
+            "left_joint_1",
+            "right_joint_1",
+            "left_joint_2",
+            "right_joint_2",
+            *(
+                name
+                for name in evidence.machines[0].schema.names
+                if "_joint_" not in name
+            ),
+        )
+        machines = tuple(
+            replace(machine, schema=replace(machine.schema, names=interleaved))
+            for machine in evidence.machines
+        )
+
+        issues = preflight_annotation(replace(evidence, machines=machines))
+
+        self.assertEqual(issues[0].code, "ANNOTATION_JOINT_AMBIGUOUS")
+        self.assertEqual(issues[0].severity, "block")
 
     def test_compiles_only_confirmed_side_for_single_arm(self) -> None:
         result = compile_annotation(

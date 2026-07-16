@@ -57,7 +57,7 @@ class MiniPipelineTest(unittest.TestCase):
 
     @staticmethod
     def _source_info() -> dict[str, object]:
-        joint_names = [f"raw_joint_{index}" for index in range(6)]
+        joint_names = [f"left_joint_{index}" for index in range(1, 7)]
         return {
             "robot_type": "acme_testbot",
             "fps": 30,
@@ -257,6 +257,33 @@ class MiniPipelineTest(unittest.TestCase):
         expected_names = [f"left_arm_joint_{index}_rad" for index in range(6)]
         self.assertEqual(features["action"]["names"], expected_names)
         self.assertEqual(features["observation.state"]["names"], expected_names)
+        annotation = self.fixture.candidate.info_path.parent / "robo_annotation.yaml"
+        self.assertTrue(annotation.is_file())
+        self.assertIn("arm.left.joint", annotation.read_text(encoding="utf-8"))
+
+    def test_ambiguous_joint_preflight_skips_vlm_and_records_source_file(self) -> None:
+        source = self._source_info()
+        names = [f"joint_{index}" for index in range(1, 7)]
+        source["features"]["action"]["names"] = names
+        source["features"]["observation.state"]["names"] = names
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+        vlm = self._success_vlm()
+
+        result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.BLOCKED)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        issue = next(
+            item
+            for item in review["issues"]
+            if item["code"] == "ANNOTATION_JOINT_AMBIGUOUS"
+        )
+        self.assertEqual(issue["evidence"]["source_file"], "meta/info.json")
+        self.assertEqual(issue["evidence"]["source_indices"], list(range(6)))
+        self.assertFalse(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
+        )
 
     def test_blocked_writes_source_copy_and_skips_all_vlm_and_range_work(self) -> None:
         source = self._source_info()

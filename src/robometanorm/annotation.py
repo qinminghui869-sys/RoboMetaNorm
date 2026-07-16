@@ -21,7 +21,11 @@ from robometanorm.models import (
 from robometanorm.standard import render_camera_key
 
 
-_GENERIC_JOINT = re.compile(r"(?:joint|j)[_-]?\d+", re.IGNORECASE)
+_JOINT_LABEL = re.compile(r"(?:[a-z]+_)*(?:joint|j)[_-]?\d+", re.IGNORECASE)
+_SIDED_JOINT = re.compile(
+    r"(?P<side>left|right)(?:_[a-z]+)*_(?:joint|j)[_-]?(?P<index>\d+)(?:_[a-z]+)?$",
+    re.IGNORECASE,
+)
 _GROUP_WEIGHTS = {"arm_motion": 0.3, "gripper": 0.45}
 
 
@@ -43,7 +47,9 @@ def preflight_annotation(evidence: DatasetEvidence) -> tuple[Issue, ...]:
         indices = [
             index
             for index, name in enumerate(names)
-            if type(name) is str and _GENERIC_JOINT.fullmatch(name) is not None
+            if type(name) is str
+            and _JOINT_LABEL.fullmatch(name) is not None
+            and not _has_side(name)
         ]
         if indices:
             observed = [names[index] for index in indices]
@@ -62,7 +68,87 @@ def preflight_annotation(evidence: DatasetEvidence) -> tuple[Issue, ...]:
                     "block",
                 )
             )
+    issues.extend(_joint_layout_issues(evidence))
     return tuple(issues)
+
+
+def _has_side(name: str) -> bool:
+    return bool({"left", "right"} & set(re.split(r"[_-]", name.casefold())))
+
+
+def _joint_layout_issues(evidence: DatasetEvidence) -> tuple[Issue, ...]:
+    layouts: dict[str, tuple[tuple[str, int, int], ...]] = {}
+    for machine in evidence.machines:
+        source_feature = machine.schema.source_key
+        if source_feature not in {"action", "observation.state"}:
+            continue
+        layout = _sided_joint_layout(machine.schema.names)
+        if layout is not None:
+            layouts[source_feature] = layout
+            if not _is_contiguous(layout):
+                return (
+                    Issue(
+                        "ANNOTATION_JOINT_AMBIGUOUS",
+                        "带方位的关节编号不连续，无法安全推断通道切片",
+                        "annotation",
+                        {
+                            "source_file": _relative_info_path(evidence),
+                            "source_feature": source_feature,
+                            "observed_names": list(machine.schema.names),
+                            "hint": "请提供每侧连续且顺序一致的关节编号。",
+                        },
+                        "block",
+                    ),
+                )
+    action = layouts.get("action")
+    qpos = layouts.get("observation.state")
+    if action is not None and qpos is not None and action != qpos:
+        return (
+            Issue(
+                "ANNOTATION_JOINT_LAYOUT_MISMATCH",
+                "action 与 observation.state 的关节侧别或顺序不一致",
+                "annotation",
+                {
+                    "source_file": _relative_info_path(evidence),
+                    "source_features": ["action", "observation.state"],
+                    "action_layout": [list(item) for item in action],
+                    "observation_state_layout": [list(item) for item in qpos],
+                    "hint": "请使两个字段的 left/right 关节编号与顺序一致。",
+                },
+                "block",
+            ),
+        )
+    return ()
+
+
+def _sided_joint_layout(
+    names: tuple[object, ...],
+) -> tuple[tuple[str, int, int], ...] | None:
+    layout: list[tuple[str, int, int]] = []
+    for position, name in enumerate(names):
+        if type(name) is not str:
+            continue
+        matched = _SIDED_JOINT.fullmatch(name)
+        if matched is not None:
+            layout.append(
+                (matched["side"].casefold(), int(matched["index"]), position)
+            )
+    return tuple(layout) if layout else None
+
+
+def _is_contiguous(layout: tuple[tuple[str, int, int], ...]) -> bool:
+    by_side: dict[str, list[tuple[int, int]]] = {}
+    for side, index, position in layout:
+        by_side.setdefault(side, []).append((index, position))
+    return all(
+        indices == list(range(indices[0], indices[0] + len(indices)))
+        and positions == list(range(positions[0], positions[0] + len(positions)))
+        and indices[0] in {0, 1}
+        for indices, positions in (
+            ([index for index, _ in values], [position for _, position in values])
+            for values in by_side.values()
+        )
+    )
 
 
 def compile_annotation(

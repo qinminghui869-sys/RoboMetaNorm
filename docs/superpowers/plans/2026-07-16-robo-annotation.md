@@ -246,3 +246,36 @@ git add src/robometanorm/writer.py tests/unit/test_writer.py tests/integration/t
 git commit -m "feat: write pass-only robo annotations"
 git push origin HEAD:mini
 ```
+
+### Task 4: Architecture contract update
+
+**Files:**
+- Modify: `tests/unit/test_architecture.py`
+
+- [ ] **Step 1: Update the exact-tree and dependency expectations**
+
+```python
+EXPECTED_PRODUCTION_FILES.add("annotation.py")
+EXPECTED_TEST_FILES.add("unit/test_annotation.py")
+...
+self.assertEqual(dependencies, ["pyarrow>=14.0", "PyYAML>=6.0"])
+```
+
+Keep the no-robot-hardcoding and no-URDF/tactile/audio checks unchanged.
+
+- [ ] **Step 2: Run the architecture test and full suite**
+
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.unit.test_architecture -v`
+
+Expected: PASS.
+
+Run: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`
+
+Expected: all tests pass.
+
+- [ ] **Step 3: Commit any remaining architecture change**
+
+```bash
+git add tests/unit/test_architecture.py docs/superpowers/plans/2026-07-16-robo-annotation.md
+git commit -m "test: cover annotation architecture"
+```

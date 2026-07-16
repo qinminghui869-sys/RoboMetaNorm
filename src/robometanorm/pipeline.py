@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 import importlib.metadata
 import math
 from pathlib import Path
 
 from robometanorm.adapters.filesystem import discover_datasets
+from robometanorm.annotation import compile_annotation, preflight_annotation
 from robometanorm.evidence import (
     collect_dataset_evidence,
     collect_mapped_gripper_ranges,
@@ -96,7 +98,10 @@ def scan_datasets(
                 camera_count = len(evidence.cameras)
                 machine_count = len(evidence.machines)
                 known_issue_count = len(evidence.issues)
-                precondition_issues = check_preconditions(evidence)
+                precondition_issues = (
+                    *check_preconditions(evidence),
+                    *preflight_annotation(evidence),
+                )
                 issues = (*evidence.issues, *precondition_issues)
                 known_issue_count = len(issues)
                 status = status_from_issues(issues)
@@ -154,7 +159,10 @@ def normalize_datasets(
                 camera_count = len(evidence.cameras)
                 machine_count = len(evidence.machines)
                 known_issue_count = len(evidence.issues)
-                precondition_issues = check_preconditions(evidence)
+                precondition_issues = (
+                    *check_preconditions(evidence),
+                    *preflight_annotation(evidence),
+                )
                 profile: HardwareProfile | None = None
                 mapping: DatasetMapping | None = None
                 extra_issues: list[Issue] = list(precondition_issues)
@@ -193,6 +201,24 @@ def normalize_datasets(
                 known_issue_count = len(normalization.issues)
                 known_changed_count = _changed_field_count(normalization)
                 status = status_from_issues(normalization.issues)
+                annotation: dict[str, object] | None = None
+                if status is DatasetStatus.PASS:
+                    annotation_result = compile_annotation(
+                        evidence,
+                        profile,
+                        mapping,
+                        normalized_info=normalization.normalized_info,
+                        confidence_threshold=confidence_threshold,
+                    )
+                    if annotation_result.issues:
+                        normalization = replace(
+                            normalization,
+                            issues=(*normalization.issues, *annotation_result.issues),
+                        )
+                        known_issue_count = len(normalization.issues)
+                        status = status_from_issues(normalization.issues)
+                    else:
+                        annotation = annotation_result.document
                 review = build_review_payload(
                     candidate,
                     status,
@@ -201,7 +227,12 @@ def normalize_datasets(
                     normalization,
                     generator=generator,
                 )
-                write_outputs(candidate, normalization.normalized_info, review)
+                write_outputs(
+                    candidate,
+                    normalization.normalized_info,
+                    review,
+                    annotation=annotation,
+                )
         except MemoryError:
             raise
         except Exception:
