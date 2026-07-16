@@ -234,7 +234,7 @@ class CliIntegrationTest(unittest.TestCase):
             output,
             "Dataset | Status | Changed Fields | Issues\n"
             "--- | --- | --- | ---\n"
-            "dataset-a | PASS | 4 | 0\n",
+            "dataset-a | PASS | 3 | 0\n",
         )
 
         _, noninteractive_stderr = self._run(
@@ -395,7 +395,7 @@ class CliIntegrationTest(unittest.TestCase):
             "normalize", "--root", str(self.root), vlm=self._success_vlm()
         )
 
-        self.assertIn("dataset-a | PASS | 4 | 0", output)
+        self.assertIn("dataset-a | PASS | 3 | 0", output)
         self.assertEqual({path: self._hash(path) for path in source_paths}, before)
         after_files = set(self.fixture.candidate.source_path.rglob("*"))
         new_files = {path for path in after_files - before_files if path.is_file()}

@@ -2755,6 +2755,17 @@ class MachineApplicationTest(unittest.TestCase):
             self._component(ambiguous=True),
             self._component(ambiguous=1),
             self._component(reason=""),
+            self._component(kind=_StringSubclass("arm_joint")),
+            self._component(side=_StringSubclass("left")),
+            self._component(
+                element_order=(
+                    _StringSubclass("shoulder"),
+                    _StringSubclass("elbow"),
+                )
+            ),
+            self._component(representation=_StringSubclass("joint_vector")),
+            self._component(unit=_StringSubclass("rad")),
+            self._component(reason=_StringSubclass("component order")),
         )
         for component in bad_components:
             with self.subTest(component=component):
@@ -2764,6 +2775,8 @@ class MachineApplicationTest(unittest.TestCase):
                     self._mapping(self._assignment()),
                     confidence_threshold=0.85,
                 )
+                self.assertEqual(self._names(result), ["raw_0", "raw_1"])
+                self.assertEqual(result.machine_mappings[0].decision, "review")
                 self.assertIn("MACHINE_MAPPING_INVALID", self._codes(result))
 
     def test_one_invalid_component_keeps_entire_feature_and_candidate_is_never_output(self) -> None:

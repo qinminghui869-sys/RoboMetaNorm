@@ -1109,6 +1109,21 @@ def _standard_names_have_gripper(names: tuple[str, ...] | None) -> bool:
     )
 
 
+def _component_is_structurally_safe(component: MachineComponent) -> bool:
+    return (
+        _safe_text(component.component_id)
+        and _safe_text(component.kind)
+        and (component.side is None or _safe_text(component.side))
+        and type(component.count) is int
+        and component.count > 0
+        and type(component.element_order) is tuple
+        and all(_safe_text(item) for item in component.element_order)
+        and _safe_text(component.representation)
+        and _safe_text(component.unit)
+        and _safe_text(component.reason)
+    )
+
+
 def _safe_range_pair(value: object) -> list[int | float] | None:
     if (
         type(value) is not tuple
@@ -1357,7 +1372,8 @@ def _build_machine_plan(
             break
         rendered = render_component_names(component)
         if (
-            type(component.ambiguous) is not bool
+            not _component_is_structurally_safe(component)
+            or type(component.ambiguous) is not bool
             or component.ambiguous
             or not _is_finite_number(component.confidence)
             or component.confidence < confidence_threshold

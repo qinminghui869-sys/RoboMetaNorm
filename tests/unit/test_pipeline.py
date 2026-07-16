@@ -531,7 +531,7 @@ class MiniPipelineTest(unittest.TestCase):
         result = results[0]
         self.assertEqual(result.status, DatasetStatus.PASS)
         self.assertEqual((result.camera_count, result.machine_field_count), (1, 2))
-        self.assertEqual((result.changed_field_count, result.issue_count), (4, 0))
+        self.assertEqual((result.changed_field_count, result.issue_count), (3, 0))
         info_norm = self._read_output(self.fixture, "info_norm.json")
         self.assertEqual(info_norm["robot_type"], "acme_robotics_testbot_one")
         features = info_norm["features"]
@@ -1065,7 +1065,7 @@ class MiniPipelineTest(unittest.TestCase):
 
         self.assertEqual(replace_calls, 2)
         self.assertEqual(result.status, DatasetStatus.ERROR)
-        self.assertEqual((result.changed_field_count, result.issue_count), (4, 1))
+        self.assertEqual((result.changed_field_count, result.issue_count), (3, 1))
         normalized = self._read_output(self.fixture, "info_norm.json")
         self.assertEqual(normalized["robot_type"], "acme_robotics_testbot_one")
         features = normalized["features"]
