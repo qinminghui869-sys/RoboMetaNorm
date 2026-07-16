@@ -25,6 +25,7 @@ from robometanorm.models import (
     FeatureSchema,
     HardwareProfile,
     IdentityEvidence,
+    Issue,
     LayoutType,
     MachineAssignment,
     MachineComponent,
@@ -362,8 +363,9 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertEqual(result.issues, ())
         self.assertEqual(
             list(result.document),
-            ["version", "robot_type", "adapter", "robot_channel_schema"],
+            ["version", "robot_type", "adapter", "robot_channel_schema", "review"],
         )
+        self.assertEqual(result.document["review"], {"required": False, "issues": []})
         self.assertEqual(result.document["robot_type"], "fixture_final")
         self.assertEqual(
             result.document["robot_channel_schema"]["robot_type"],
@@ -420,7 +422,7 @@ class AnnotationCompilerTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
 
-        self.assertIsNone(result.document)
+        self.assertTrue(result.document["review"]["required"])
         self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
         self.assertEqual(result.issues[0].severity, "review")
 
@@ -433,7 +435,7 @@ class AnnotationCompilerTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
 
-        self.assertIsNone(result.document)
+        self.assertTrue(result.document["review"]["required"])
         self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
         self.assertEqual(result.issues[0].severity, "review")
 
@@ -452,7 +454,7 @@ class AnnotationCompilerTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
 
-        self.assertIsNone(result.document)
+        self.assertTrue(result.document["review"]["required"])
         self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
         self.assertEqual(result.issues[0].severity, "review")
 
@@ -471,7 +473,7 @@ class AnnotationCompilerTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
 
-        self.assertIsNone(result.document)
+        self.assertTrue(result.document["review"]["required"])
         self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
         self.assertEqual(result.issues[0].severity, "review")
 
@@ -626,9 +628,130 @@ class AnnotationCompilerTest(unittest.TestCase):
             confidence_threshold=0.85,
         )
 
-        self.assertIsNone(result.document)
+        self.assertTrue(result.document["review"]["required"])
         self.assertEqual(result.issues[0].code, "ANNOTATION_MAPPING_UNCONFIRMED")
         self.assertEqual(result.issues[0].severity, "review")
+
+    def test_projects_existing_issues_on_a_confirmed_document(self) -> None:
+        issue = Issue("VLM_UNCERTAIN", "请人工确认", "vlm", {"raw": "kept out"})
+
+        result = compile_annotation(
+            AnnotationFixture.evidence(),
+            AnnotationFixture.profile(),
+            AnnotationFixture.mapping(),
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+            existing_issues=(issue,),
+        )
+
+        self.assertEqual(result.issues, ())
+        self.assertEqual(
+            result.document["review"],
+            {"required": True, "issues": [{"code": "VLM_UNCERTAIN", "message": "请人工确认"}]},
+        )
+
+    def test_fallback_preserves_local_identity_and_safe_sided_joint_slices(self) -> None:
+        issue = Issue("VLM_UNCERTAIN", "请人工确认", "vlm", {"full": "evidence"})
+
+        result = compile_annotation(
+            AnnotationFixture.evidence(),
+            None,
+            None,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+            existing_issues=(issue,),
+        )
+
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAPPING_UNCONFIRMED")
+        self.assertEqual(result.document["robot_type"], "fixture_final")
+        self.assertEqual(result.document["adapter"]["base"], {"qpos": "observation.state", "action": "action"})
+        self.assertEqual(
+            result.document["robot_channel_schema"]["channels"],
+            {
+                "arm.left.joint": {
+                    "source": "qpos", "field": "qpos", "slice": [0, 2], "group": "arm_motion",
+                    "unit": "unknown", "norm": "robust_mad", "weight": 1.0, "optional": False,
+                },
+                "arm.right.joint": {
+                    "source": "qpos", "field": "qpos", "slice": [9, 11], "group": "arm_motion",
+                    "unit": "unknown", "norm": "robust_mad", "weight": 1.0, "optional": False,
+                },
+            },
+        )
+        self.assertEqual(
+            result.document["review"]["issues"],
+            [
+                {"code": "VLM_UNCERTAIN", "message": "请人工确认"},
+                {"code": "ANNOTATION_MAPPING_UNCONFIRMED", "message": "缺少已确认的硬件画像或数据映射"},
+            ],
+        )
+
+    def test_fallback_ambiguous_or_invalid_identity_is_reviewed_without_channels(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        generic = tuple("joint_" + str(index) for index in range(1, 3))
+        evidence = replace(
+            evidence,
+            machines=tuple(
+                replace(machine, schema=replace(machine.schema, names=generic))
+                for machine in evidence.machines
+            ),
+        )
+
+        result = compile_annotation(
+            evidence, None, None, normalized_info={"robot_type": " bad "}, confidence_threshold=0.85
+        )
+
+        self.assertIsNone(result.document["robot_type"])
+        self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
+        self.assertEqual(result.document["review"]["issues"][0]["code"], "ANNOTATION_JOINT_AMBIGUOUS")
+
+    def test_fallback_reuses_only_canonical_camera_keys_and_conditional_base_fields(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        canonical = replace(
+            evidence.cameras[0],
+            schema=replace(evidence.cameras[0].schema, source_key="observation.images.cam_left_wrist_rgb"),
+        )
+        evidence = replace(evidence, cameras=(canonical, evidence.cameras[0]))
+        evidence = replace(
+            evidence,
+            machines=tuple(machine for machine in evidence.machines if machine.schema.source_key == "action"),
+        )
+
+        result = compile_annotation(evidence, None, None, normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85)
+
+        self.assertEqual(result.document["adapter"]["base"], {"action": "action"})
+        self.assertEqual(result.document["adapter"]["cameras"], {"observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb"})
+
+    def test_fallback_main_follower_requires_matching_contiguous_layouts(self) -> None:
+        result = compile_annotation(
+            AnnotationFixture.main_follower_evidence(), None, None,
+            normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
+        )
+        self.assertEqual(list(result.document["robot_channel_schema"]["channels"]), ["arm.main.joint"])
+
+        gapped = list(AnnotationFixture.main_follower_evidence().machines[0].schema.names)
+        gapped[1] = "main_follower_joint_3"
+        invalid = compile_annotation(
+            AnnotationFixture.main_follower_evidence(state_names=tuple(gapped)), None, None,
+            normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
+        )
+        self.assertEqual(invalid.document["robot_channel_schema"]["channels"], {})
+
+    def test_review_issues_are_ordered_and_deduplicated(self) -> None:
+        first = Issue("FIRST", "same", "one", {"a": 1})
+        duplicate = Issue("FIRST", "same", "two", {"b": 2})
+        second = Issue("SECOND", "later", "one", {})
+
+        result = compile_annotation(
+            AnnotationFixture.evidence(), AnnotationFixture.profile(), AnnotationFixture.mapping(),
+            normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
+            existing_issues=(first, duplicate, second),
+        )
+
+        self.assertEqual(
+            result.document["review"]["issues"],
+            [{"code": "FIRST", "message": "same"}, {"code": "SECOND", "message": "later"}],
+        )
 
 
 if __name__ == "__main__":

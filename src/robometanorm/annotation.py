@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -18,7 +18,7 @@ from robometanorm.models import (
     MachineComponent,
     MachineSlice,
 )
-from robometanorm.standard import render_camera_key
+from robometanorm.standard import parse_standard_camera_key, render_camera_key
 
 
 _JOINT_LABEL = re.compile(r"(?:[a-z]+_)*(?:joint|j)[_-]?\d+", re.IGNORECASE)
@@ -37,7 +37,7 @@ _GROUP_WEIGHTS = {"arm_motion": 0.3, "gripper": 0.45}
 class AnnotationResult:
     """A descriptor or structured reasons why it cannot be compiled."""
 
-    document: dict[str, object] | None
+    document: dict[str, object]
     issues: tuple[Issue, ...]
 
 
@@ -285,6 +285,131 @@ def _main_layout_issue(
 
 
 def compile_annotation(
+    evidence: DatasetEvidence,
+    profile: HardwareProfile | None,
+    mapping: DatasetMapping | None,
+    *,
+    normalized_info: Mapping[str, object],
+    confidence_threshold: float,
+    existing_issues: Sequence[Issue] = (),
+) -> AnnotationResult:
+    """Compile a confirmed descriptor or a safe, review-aware fallback."""
+
+    confirmed = _compile_confirmed_annotation(
+        evidence,
+        profile,
+        mapping,
+        normalized_info=normalized_info,
+        confidence_threshold=confidence_threshold,
+    )
+    if confirmed.document is not None:
+        document = confirmed.document
+    else:
+        if not existing_issues and not confirmed.issues:
+            confirmed = _unconfirmed("缺少已确认的硬件画像或数据映射")
+        document = _best_effort_document(evidence, normalized_info)
+    review_issues = _deduplicated_review_issues(
+        (*existing_issues, *confirmed.issues)
+    )
+    document["review"] = {
+        "required": bool(review_issues),
+        "issues": review_issues,
+    }
+    return AnnotationResult(document, confirmed.issues)
+
+
+def _deduplicated_review_issues(issues: Sequence[Issue]) -> list[dict[str, str]]:
+    projected: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for issue in issues:
+        key = (issue.code, issue.message)
+        if key not in seen:
+            seen.add(key)
+            projected.append({"code": issue.code, "message": issue.message})
+    return projected
+
+
+def _best_effort_document(
+    evidence: DatasetEvidence,
+    normalized_info: Mapping[str, object],
+) -> dict[str, object]:
+    robot_type = normalized_info.get("robot_type")
+    safe_robot_type = robot_type if _safe_text(robot_type) else None
+    source_features = {machine.schema.source_key for machine in evidence.machines}
+    base: dict[str, str] = {}
+    if "observation.state" in source_features:
+        base["qpos"] = "observation.state"
+    if "action" in source_features:
+        base["action"] = "action"
+    cameras = {
+        camera.schema.source_key: camera.schema.source_key
+        for camera in evidence.cameras
+        if parse_standard_camera_key(camera.schema.source_key) is not None
+    }
+    channels = _best_effort_channels(evidence)
+    return {
+        "version": "dataset_annotation_config_v1",
+        "robot_type": safe_robot_type,
+        "adapter": {"base_type": "LeRobot", "base": base, "cameras": cameras},
+        "robot_channel_schema": {
+            "version": "channel_schema_v1",
+            "robot_type": safe_robot_type,
+            "channels": channels,
+            "group_weights": {"arm_motion": 0.3} if channels else {},
+        },
+    }
+
+
+def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, object]]:
+    sided_layouts = {
+        machine.schema.source_key: _sided_joint_layout(machine.schema.names)
+        for machine in evidence.machines
+        if machine.schema.source_key in {"action", "observation.state"}
+    }
+    action = sided_layouts.get("action")
+    qpos = sided_layouts.get("observation.state")
+    if action is not None and qpos is not None and action == qpos and _is_contiguous(action):
+        return {
+            f"arm.{side}.joint": _best_effort_channel(start, end)
+            for side, start, end in _sided_channel_ranges(qpos)
+        }
+
+    main_layouts = _main_joint_layouts(evidence)
+    if (
+        _main_joint_layout_issue(evidence) is None
+        and set(main_layouts) == {"action", "observation.state"}
+        and main_layouts["action"] == main_layouts["observation.state"]
+    ):
+        layout = main_layouts["observation.state"]
+        return {"arm.main.joint": _best_effort_channel(layout[0][1], layout[-1][1] + 1)}
+    return {}
+
+
+def _sided_channel_ranges(
+    layout: tuple[tuple[str, int, int], ...],
+) -> tuple[tuple[str, int, int], ...]:
+    ranges: list[tuple[str, int, int]] = []
+    for side in ("left", "right"):
+        positions = [position for item_side, _, position in layout if item_side == side]
+        if positions:
+            ranges.append((side, positions[0], positions[-1] + 1))
+    return tuple(ranges)
+
+
+def _best_effort_channel(start: int, end: int) -> dict[str, object]:
+    return {
+        "source": "qpos",
+        "field": "qpos",
+        "slice": [start, end],
+        "group": "arm_motion",
+        "unit": "unknown",
+        "norm": "robust_mad",
+        "weight": 1.0,
+        "optional": False,
+    }
+
+
+def _compile_confirmed_annotation(
     evidence: DatasetEvidence,
     profile: HardwareProfile | None,
     mapping: DatasetMapping | None,
