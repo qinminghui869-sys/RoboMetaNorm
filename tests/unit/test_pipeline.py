@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.models import (
@@ -281,6 +283,121 @@ class MiniPipelineTest(unittest.TestCase):
         )
         self.assertEqual(issue["evidence"]["source_file"], "meta/info.json")
         self.assertEqual(issue["evidence"]["source_indices"], list(range(6)))
+        self.assertFalse(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
+        )
+
+    def test_main_follower_single_arm_emits_main_annotation(self) -> None:
+        source = self._source_info()
+        names = [f"main_follower_joint_{index}" for index in range(1, 7)]
+        source["features"]["action"]["names"] = names
+        source["features"]["observation.state"]["names"] = names
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+
+        result = self._normalize(self._success_vlm())[0]
+
+        self.assertEqual(result.status, DatasetStatus.PASS)
+        annotation = yaml.safe_load(
+            (
+                self.fixture.candidate.info_path.parent / "robo_annotation.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertIn("arm.main.joint", annotation["robot_channel_schema"]["channels"])
+
+    def test_main_follower_mapping_failure_records_main_confirmation_issue(self) -> None:
+        source = self._source_info()
+        names = [f"main_follower_joint_{index}" for index in range(1, 7)]
+        source["features"]["action"]["names"] = names
+        source["features"]["observation.state"]["names"] = names
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+        vlm = FakeVlm(
+            research_result=(self.profile, None),
+            mapping_result=(None, Issue("DATASET_MAPPING_INVALID", "bad mapping", "vlm")),
+        )
+
+        result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.REVIEW)
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertTrue(
+            {"DATASET_MAPPING_INVALID", "ANNOTATION_MAIN_ARM_UNCONFIRMED"}
+            <= {item["code"] for item in review["issues"]}
+        )
+        self.assertFalse(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
+        )
+
+    def test_main_follower_vlm_confirmation_failures_are_reviewed(self) -> None:
+        source = self._source_info()
+        names = [f"main_follower_joint_{index}" for index in range(1, 7)]
+        source["features"]["action"]["names"] = names
+        source["features"]["observation.state"]["names"] = names
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+        unresolved_profile = replace(
+            self.profile,
+            identity=replace(self.profile.identity, manufacturer=" "),
+        )
+        unconfirmed_camera_mapping = replace(
+            self.mapping,
+            cameras=(replace(self.mapping.cameras[0], ambiguous=True),),
+        )
+        cases = (
+            (
+                FakeVlm(
+                    research_result=(
+                        None,
+                        Issue("VLM_UNAVAILABLE", "offline", "vlm"),
+                    )
+                ),
+                "VLM_UNAVAILABLE",
+            ),
+            (FakeVlm(research_result=(unresolved_profile, None)), "HARDWARE_IDENTITY_UNRESOLVED"),
+            (
+                FakeVlm(
+                    research_result=(self.profile, None),
+                    mapping_result=(unconfirmed_camera_mapping, None),
+                ),
+                "CAMERA_MAPPING_UNRESOLVED",
+            ),
+        )
+
+        for vlm, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                result = self._normalize(vlm)[0]
+
+                self.assertEqual(result.status, DatasetStatus.REVIEW)
+                review = self._read_output(self.fixture, "info_norm_review.json")
+                codes = {item["code"] for item in review["issues"]}
+                self.assertIn(expected_code, codes)
+                self.assertIn("ANNOTATION_MAIN_ARM_UNCONFIRMED", codes)
+                self.assertFalse(
+                    (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
+                )
+
+    def test_invalid_main_follower_layout_blocks_before_vlm(self) -> None:
+        source = self._source_info()
+        names = [
+            "main_follower_joint_1",
+            "main_follower_joint_3",
+            "main_follower_joint_4",
+            "main_follower_joint_5",
+            "main_follower_joint_6",
+            "main_follower_joint_7",
+        ]
+        source["features"]["action"]["names"] = names
+        source["features"]["observation.state"]["names"] = names
+        self.fixture.candidate.info_path.write_text(json.dumps(source), encoding="utf-8")
+        vlm = self._success_vlm()
+
+        result = self._normalize(vlm)[0]
+
+        self.assertEqual(result.status, DatasetStatus.BLOCKED)
+        self.assertEqual((vlm.research_calls, vlm.mapping_calls), (0, 0))
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertIn(
+            "ANNOTATION_MAIN_ARM_LAYOUT_INVALID",
+            {item["code"] for item in review["issues"]},
+        )
         self.assertFalse(
             (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").exists()
         )

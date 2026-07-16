@@ -114,6 +114,54 @@ class AnnotationFixture:
         )
 
     @staticmethod
+    def main_follower_evidence(
+        *,
+        state_names: tuple[str, ...] | None = None,
+        action_names: tuple[str, ...] | None = None,
+    ) -> DatasetEvidence:
+        """A single raw arm whose side is confirmed only by the mapping."""
+
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        names = (
+            "main_follower_joint_1",
+            "main_follower_joint_2",
+            "main_follower_pose_x",
+            "main_follower_pose_y",
+            "main_follower_pose_z",
+            "main_follower_pose_rx",
+            "main_follower_pose_ry",
+            "main_follower_pose_rz",
+            "main_follower_gripper",
+        )
+        replacements = {
+            "observation.state": state_names or names,
+            "action": action_names or names,
+        }
+        return replace(
+            evidence,
+            source_info={
+                **evidence.source_info,
+                "features": {
+                    **evidence.source_info["features"],
+                    **{
+                        source_key: {"names": list(source_names)}
+                        for source_key, source_names in replacements.items()
+                    },
+                },
+            },
+            machines=tuple(
+                replace(
+                    machine,
+                    schema=replace(
+                        machine.schema,
+                        names=replacements[machine.schema.source_key],
+                    ),
+                )
+                for machine in evidence.machines
+            ),
+        )
+
+    @staticmethod
     def profile(*, sides: tuple[str, ...] = ("left", "right")) -> HardwareProfile:
         components = tuple(
             component
@@ -343,6 +391,159 @@ class AnnotationCompilerTest(unittest.TestCase):
             yaml.safe_load(yaml.safe_dump(result.document, sort_keys=False)),
             result.document,
         )
+
+    def test_compiles_confirmed_main_follower_single_arm_channels(self) -> None:
+        result = compile_annotation(
+            AnnotationFixture.main_follower_evidence(),
+            AnnotationFixture.profile(sides=("left",)),
+            AnnotationFixture.mapping(sides=("left",)),
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertEqual(result.issues, ())
+        channels = result.document["robot_channel_schema"]["channels"]
+        self.assertEqual(
+            list(channels),
+            ["arm.main.joint", "arm.main.eef", "gripper.main"],
+        )
+        self.assertEqual(channels["arm.main.joint"]["slice"], [0, 2])
+        self.assertEqual(channels["arm.main.eef"]["slice"], [2, 8])
+        self.assertEqual(channels["gripper.main"]["slice"], [8, 9])
+
+    def test_rejects_main_follower_when_profile_has_two_arms(self) -> None:
+        result = compile_annotation(
+            AnnotationFixture.main_follower_evidence(),
+            AnnotationFixture.profile(),
+            AnnotationFixture.mapping(sides=("left",)),
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertIsNone(result.document)
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
+        self.assertEqual(result.issues[0].severity, "review")
+
+    def test_rejects_main_follower_when_mapping_is_missing(self) -> None:
+        result = compile_annotation(
+            AnnotationFixture.main_follower_evidence(),
+            AnnotationFixture.profile(sides=("left",)),
+            None,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertIsNone(result.document)
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
+        self.assertEqual(result.issues[0].severity, "review")
+
+    def test_rejects_main_follower_when_camera_mapping_is_unconfirmed(self) -> None:
+        mapping = AnnotationFixture.mapping(sides=("left",))
+        unconfirmed_mapping = replace(
+            mapping,
+            cameras=(replace(mapping.cameras[0], ambiguous=True),),
+        )
+
+        result = compile_annotation(
+            AnnotationFixture.main_follower_evidence(),
+            AnnotationFixture.profile(sides=("left",)),
+            unconfirmed_mapping,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertIsNone(result.document)
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
+        self.assertEqual(result.issues[0].severity, "review")
+
+    def test_rejects_main_follower_when_machine_layout_is_missing(self) -> None:
+        mapping = AnnotationFixture.mapping(sides=("left",))
+        incomplete_mapping = DatasetMapping(
+            cameras=mapping.cameras,
+            machines=(),
+        )
+
+        result = compile_annotation(
+            AnnotationFixture.main_follower_evidence(),
+            AnnotationFixture.profile(sides=("left",)),
+            incomplete_mapping,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertIsNone(result.document)
+        self.assertEqual(result.issues[0].code, "ANNOTATION_MAIN_ARM_UNCONFIRMED")
+        self.assertEqual(result.issues[0].severity, "review")
+
+    def test_preflight_blocks_gapped_main_follower_joints_with_source_file(self) -> None:
+        state = list(AnnotationFixture.main_follower_evidence().machines[0].schema.names)
+        state[1] = "main_follower_joint_3"
+
+        issues = preflight_annotation(
+            AnnotationFixture.main_follower_evidence(state_names=tuple(state))
+        )
+
+        self.assertEqual(issues[0].code, "ANNOTATION_MAIN_ARM_LAYOUT_INVALID")
+        self.assertEqual(issues[0].severity, "block")
+        self.assertEqual(issues[0].evidence["source_file"], "meta/info.json")
+        self.assertEqual(issues[0].evidence["source_feature"], "observation.state")
+
+    def test_preflight_blocks_main_follower_with_oversized_joint_index(self) -> None:
+        state = list(AnnotationFixture.main_follower_evidence().machines[0].schema.names)
+        state[0] = f"main_follower_joint_{'9' * 5000}"
+
+        issues = preflight_annotation(
+            AnnotationFixture.main_follower_evidence(state_names=tuple(state))
+        )
+
+        issue = next(
+            item
+            for item in issues
+            if item.code == "ANNOTATION_MAIN_ARM_LAYOUT_INVALID"
+        )
+        self.assertEqual(issue.severity, "block")
+        self.assertEqual(issue.evidence["source_file"], "meta/info.json")
+        self.assertEqual(issue.evidence["source_feature"], "observation.state")
+
+    def test_preflight_blocks_mismatched_main_follower_layouts_with_source_file(self) -> None:
+        action = list(AnnotationFixture.main_follower_evidence().machines[0].schema.names)
+        action[0] = "main_follower_joint_0"
+        action[1] = "main_follower_joint_1"
+
+        issues = preflight_annotation(
+            AnnotationFixture.main_follower_evidence(action_names=tuple(action))
+        )
+
+        self.assertEqual(issues[0].code, "ANNOTATION_MAIN_ARM_LAYOUT_INVALID")
+        self.assertEqual(issues[0].severity, "block")
+        self.assertEqual(issues[0].evidence["source_file"], "meta/info.json")
+        self.assertEqual(
+            issues[0].evidence["source_features"],
+            ["action", "observation.state"],
+        )
+
+    def test_preflight_blocks_main_follower_outside_machine_vectors(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        auxiliary = MachineEvidence(
+            schema=FeatureSchema(
+                source_key="observation.auxiliary",
+                dtype="float32",
+                shape=(1,),
+                names=("main_follower_joint_1",),
+                fps=None,
+                codec=None,
+            ),
+            episodes=(),
+            episode_lengths=(),
+        )
+
+        issues = preflight_annotation(
+            replace(evidence, machines=(*evidence.machines, auxiliary))
+        )
+
+        self.assertEqual(issues[-1].code, "ANNOTATION_JOINT_AMBIGUOUS")
+        self.assertEqual(issues[-1].severity, "block")
+        self.assertEqual(issues[-1].evidence["source_feature"], "observation.auxiliary")
 
     def test_preflight_blocks_inconsistent_sided_action_and_qpos_layouts(self) -> None:
         evidence = AnnotationFixture.evidence(sides=("left",))

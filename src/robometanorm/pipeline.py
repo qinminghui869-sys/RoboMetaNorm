@@ -9,7 +9,11 @@ import math
 from pathlib import Path
 
 from robometanorm.adapters.filesystem import discover_datasets
-from robometanorm.annotation import compile_annotation, preflight_annotation
+from robometanorm.annotation import (
+    compile_annotation,
+    has_main_follower_candidate,
+    preflight_annotation,
+)
 from robometanorm.evidence import (
     collect_dataset_evidence,
     collect_mapped_gripper_ranges,
@@ -167,8 +171,10 @@ def normalize_datasets(
                 mapping: DatasetMapping | None = None
                 extra_issues: list[Issue] = list(precondition_issues)
                 known_issue_count = len(evidence.issues) + len(extra_issues)
+                vlm_attempted = False
 
                 if not any(issue.severity == "block" for issue in precondition_issues):
+                    vlm_attempted = True
                     profile, research_issue = _research_hardware(vlm, evidence.identity)
                     if research_issue is not None:
                         extra_issues.append(research_issue)
@@ -202,7 +208,9 @@ def normalize_datasets(
                 known_changed_count = _changed_field_count(normalization)
                 status = status_from_issues(normalization.issues)
                 annotation: dict[str, object] | None = None
-                if status is DatasetStatus.PASS:
+                if status is DatasetStatus.PASS or (
+                    vlm_attempted and has_main_follower_candidate(evidence)
+                ):
                     annotation_result = compile_annotation(
                         evidence,
                         profile,
@@ -217,7 +225,7 @@ def normalize_datasets(
                         )
                         known_issue_count = len(normalization.issues)
                         status = status_from_issues(normalization.issues)
-                    else:
+                    elif status is DatasetStatus.PASS:
                         annotation = annotation_result.document
                 review = build_review_payload(
                     candidate,
