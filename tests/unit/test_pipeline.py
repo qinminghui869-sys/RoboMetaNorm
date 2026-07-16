@@ -533,7 +533,7 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertEqual((result.camera_count, result.machine_field_count), (1, 2))
         self.assertEqual((result.changed_field_count, result.issue_count), (3, 0))
         info_norm = self._read_output(self.fixture, "info_norm.json")
-        self.assertEqual(info_norm["robot_type"], "acme_robotics_testbot_one")
+        self.assertEqual(info_norm["robot_type"], "acme_testbot")
         features = info_norm["features"]
         self.assertIn("observation.images.cam_front_wrist_rgb", features)
         self.assertNotIn("observation.images.wrist", features)
@@ -1067,7 +1067,7 @@ class MiniPipelineTest(unittest.TestCase):
         self.assertEqual(result.status, DatasetStatus.ERROR)
         self.assertEqual((result.changed_field_count, result.issue_count), (3, 1))
         normalized = self._read_output(self.fixture, "info_norm.json")
-        self.assertEqual(normalized["robot_type"], "acme_robotics_testbot_one")
+        self.assertEqual(normalized["robot_type"], "acme_testbot")
         features = normalized["features"]
         self.assertIn("observation.images.cam_front_wrist_rgb", features)
         expected_names = [f"left_arm_joint_{index}_rad" for index in range(6)]

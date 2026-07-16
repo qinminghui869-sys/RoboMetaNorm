@@ -409,7 +409,7 @@ class CliIntegrationTest(unittest.TestCase):
             },
         )
         normalized = json.loads((meta / "info_norm.json").read_text(encoding="utf-8"))
-        self.assertEqual(normalized["robot_type"], "acme_robotics_testbot_one")
+        self.assertEqual(normalized["robot_type"], "acme_testbot")
         features = normalized["features"]
         self.assertIn("observation.images.cam_front_wrist_rgb", features)
         expected = [f"left_arm_joint_{index}_rad" for index in range(6)]
