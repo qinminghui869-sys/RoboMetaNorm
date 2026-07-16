@@ -6,6 +6,7 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import yaml
 
@@ -759,6 +760,52 @@ class AnnotationCompilerTest(unittest.TestCase):
             normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
         )
         self.assertEqual(invalid.document["robot_channel_schema"]["channels"], {})
+
+    def test_fallback_rejects_oversized_sided_joint_indices_without_raising(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        names = list(evidence.machines[0].schema.names)
+        names[0] = f"left_joint_{'9' * 5000}"
+        evidence = replace(
+            evidence,
+            machines=tuple(
+                replace(machine, schema=replace(machine.schema, names=tuple(names)))
+                for machine in evidence.machines
+            ),
+        )
+
+        result = compile_annotation(
+            evidence, None, None,
+            normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
+        self.assertEqual(result.issues[0].code, "ANNOTATION_JOINT_AMBIGUOUS")
+
+    def test_fallback_omits_malformed_machine_and_camera_source_keys(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        invalid_machine = replace(
+            evidence.machines[0],
+            schema=replace(evidence.machines[0].schema, source_key=cast(str, [])),
+        )
+        invalid_camera = replace(
+            evidence.cameras[0],
+            schema=replace(evidence.cameras[0].schema, source_key=cast(str, 1)),
+        )
+        evidence = replace(
+            evidence,
+            machines=(invalid_machine, evidence.machines[1]),
+            cameras=(invalid_camera,),
+        )
+
+        result = compile_annotation(
+            evidence, None, None,
+            normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(result.document["adapter"]["cameras"], {})
+        self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
 
     def test_review_issues_are_ordered_and_deduplicated(self) -> None:
         first = Issue("FIRST", "same", "one", {"a": 1})

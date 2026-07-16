@@ -1,4 +1,4 @@
-"""Compile confirmed dataset mappings into the compact YAML descriptor."""
+"""Compile confirmed and best-effort review-aware dataset descriptors."""
 
 from __future__ import annotations
 
@@ -23,7 +23,11 @@ from robometanorm.standard import parse_standard_camera_key, render_camera_key
 
 _JOINT_LABEL = re.compile(r"(?:[a-z]+_)*(?:joint|j)[_-]?\d+", re.IGNORECASE)
 _SIDED_JOINT = re.compile(
-    r"(?P<side>left|right)(?:_[a-z]+)*_(?:joint|j)[_-]?(?P<index>\d+)(?:_[a-z]+)?$",
+    r"(?P<side>left|right)(?:_[a-z]+)*_(?:joint|j)[_-]?(?P<index>\d{1,18})(?:_[a-z]+)?$",
+    re.IGNORECASE,
+)
+_SIDED_JOINT_LABEL = re.compile(
+    r"(?:left|right)(?:_[a-z]+)*_(?:joint|j)[_-]?\d+(?:_[a-z]+)?$",
     re.IGNORECASE,
 )
 _MAIN_FOLLOWER_JOINT = re.compile(
@@ -35,9 +39,17 @@ _GROUP_WEIGHTS = {"arm_motion": 0.3, "gripper": 0.45}
 
 @dataclass(frozen=True)
 class AnnotationResult:
-    """A descriptor or structured reasons why it cannot be compiled."""
+    """A public review-aware descriptor and newly discovered issues."""
 
     document: dict[str, object]
+    issues: tuple[Issue, ...]
+
+
+@dataclass(frozen=True)
+class _ConfirmedAnnotationResult:
+    """Private result from the fail-closed confirmed compiler."""
+
+    document: dict[str, object] | None
     issues: tuple[Issue, ...]
 
 
@@ -48,6 +60,11 @@ def preflight_annotation(evidence: DatasetEvidence) -> tuple[Issue, ...]:
     issues: list[Issue] = []
     for machine in evidence.machines:
         names = machine.schema.names
+        source_feature = machine.schema.source_key
+        is_machine_vector = _safe_source_key(source_feature) and source_feature in {
+            "action",
+            "observation.state",
+        }
         indices = [
             index
             for index, name in enumerate(names)
@@ -55,7 +72,7 @@ def preflight_annotation(evidence: DatasetEvidence) -> tuple[Issue, ...]:
             and _JOINT_LABEL.fullmatch(name) is not None
             and not _has_side(name)
             and (
-                machine.schema.source_key not in {"action", "observation.state"}
+                not is_machine_vector
                 or _MAIN_FOLLOWER_LABEL.fullmatch(name) is None
             )
         ]
@@ -68,7 +85,7 @@ def preflight_annotation(evidence: DatasetEvidence) -> tuple[Issue, ...]:
                     "annotation",
                     {
                         "source_file": source_file,
-                        "source_feature": machine.schema.source_key,
+                        "source_feature": source_feature,
                         "source_indices": indices,
                         "observed_names": observed,
                         "hint": "请提供 left/right 方位和连续关节顺序，或更正 info.json。",
@@ -95,8 +112,36 @@ def _joint_layout_issues(evidence: DatasetEvidence) -> tuple[Issue, ...]:
     layouts: dict[str, tuple[tuple[str, int, int], ...]] = {}
     for machine in evidence.machines:
         source_feature = machine.schema.source_key
-        if source_feature not in {"action", "observation.state"}:
+        if not _safe_source_key(source_feature) or source_feature not in {
+            "action",
+            "observation.state",
+        }:
             continue
+        oversized_indices = [
+            position
+            for position, name in enumerate(machine.schema.names)
+            if type(name) is str
+            and _SIDED_JOINT_LABEL.fullmatch(name) is not None
+            and _SIDED_JOINT.fullmatch(name) is None
+        ]
+        if oversized_indices:
+            issues.append(
+                Issue(
+                    "ANNOTATION_JOINT_AMBIGUOUS",
+                    "带方位的关节编号超出可安全解析范围",
+                    "annotation",
+                    {
+                        "source_file": _relative_info_path(evidence),
+                        "source_feature": source_feature,
+                        "source_indices": oversized_indices,
+                        "observed_names": [
+                            machine.schema.names[index] for index in oversized_indices
+                        ],
+                        "hint": "请提供不超过 18 位的连续关节编号。",
+                    },
+                    "block",
+                )
+            )
         layout = _sided_joint_layout(machine.schema.names)
         if layout is not None:
             layouts[source_feature] = layout
@@ -175,7 +220,10 @@ def _main_joint_layouts(
     layouts: dict[str, tuple[tuple[int, int], ...]] = {}
     for machine in evidence.machines:
         source_feature = machine.schema.source_key
-        if source_feature not in {"action", "observation.state"}:
+        if not _safe_source_key(source_feature) or source_feature not in {
+            "action",
+            "observation.state",
+        }:
             continue
         layout = tuple(
             (int(matched["index"]), position)
@@ -191,7 +239,10 @@ def _main_joint_layouts(
 def _main_joint_layout_issue(evidence: DatasetEvidence) -> Issue | None:
     for machine in evidence.machines:
         source_feature = machine.schema.source_key
-        if source_feature not in {"action", "observation.state"}:
+        if not _safe_source_key(source_feature) or source_feature not in {
+            "action",
+            "observation.state",
+        }:
             continue
         indices = [
             position
@@ -352,7 +403,11 @@ def _best_effort_document(
 ) -> dict[str, object]:
     robot_type = normalized_info.get("robot_type")
     safe_robot_type = robot_type if _safe_text(robot_type) else None
-    source_features = {machine.schema.source_key for machine in evidence.machines}
+    source_features = {
+        machine.schema.source_key
+        for machine in evidence.machines
+        if _safe_source_key(machine.schema.source_key)
+    }
     base: dict[str, str] = {}
     if "observation.state" in source_features:
         base["qpos"] = "observation.state"
@@ -361,7 +416,8 @@ def _best_effort_document(
     cameras = {
         camera.schema.source_key: camera.schema.source_key
         for camera in evidence.cameras
-        if parse_standard_camera_key(camera.schema.source_key) is not None
+        if _safe_source_key(camera.schema.source_key)
+        and parse_standard_camera_key(camera.schema.source_key) is not None
     }
     channels = _best_effort_channels(evidence)
     return {
@@ -381,7 +437,8 @@ def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, obje
     sided_layouts = {
         machine.schema.source_key: _sided_joint_layout(machine.schema.names)
         for machine in evidence.machines
-        if machine.schema.source_key in {"action", "observation.state"}
+        if _safe_source_key(machine.schema.source_key)
+        and machine.schema.source_key in {"action", "observation.state"}
     }
     action = sided_layouts.get("action")
     qpos = sided_layouts.get("observation.state")
@@ -433,12 +490,12 @@ def _compile_confirmed_annotation(
     *,
     normalized_info: Mapping[str, object],
     confidence_threshold: float,
-) -> AnnotationResult:
+) -> _ConfirmedAnnotationResult:
     """Compile only fully confirmed camera and machine assignments."""
 
     issues = preflight_annotation(evidence)
     if issues:
-        return AnnotationResult(None, issues)
+        return _ConfirmedAnnotationResult(None, issues)
     main_layouts = _main_joint_layouts(evidence)
     if not isinstance(profile, HardwareProfile) or not isinstance(
         mapping, DatasetMapping
@@ -458,7 +515,7 @@ def _compile_confirmed_annotation(
             evidence, profile, confidence_threshold
         )
         if main_issue is not None:
-            return AnnotationResult(None, (main_issue,))
+            return _ConfirmedAnnotationResult(None, (main_issue,))
 
     components = _unique_by_id(profile.components, "component_id")
     if components is None:
@@ -471,14 +528,14 @@ def _compile_confirmed_annotation(
     if camera_issue is not None:
         if main_layouts:
             return _main_unconfirmed(camera_issue.message, camera_issue.evidence)
-        return AnnotationResult(None, (camera_issue,))
+        return _ConfirmedAnnotationResult(None, (camera_issue,))
     state_layout, action_layout, layout_issue = _compile_machine_layouts(
         evidence, mapping, components, confidence_threshold
     )
     if layout_issue is not None:
         if main_layouts:
             return _main_unconfirmed(layout_issue.message, layout_issue.evidence)
-        return AnnotationResult(None, (layout_issue,))
+        return _ConfirmedAnnotationResult(None, (layout_issue,))
     if _layout_signature(state_layout) != _layout_signature(action_layout):
         if main_layouts:
             return _main_unconfirmed("action 与 observation.state 的已确认组件顺序不一致")
@@ -495,7 +552,7 @@ def _compile_confirmed_annotation(
     if channel_issue is not None:
         if main_component is not None:
             return _main_unconfirmed(channel_issue.message, channel_issue.evidence)
-        return AnnotationResult(None, (channel_issue,))
+        return _ConfirmedAnnotationResult(None, (channel_issue,))
     groups = {channel["group"] for channel in channels.values()}
     document: dict[str, object] = {
         "version": "dataset_annotation_config_v1",
@@ -514,7 +571,7 @@ def _compile_confirmed_annotation(
             },
         },
     }
-    return AnnotationResult(document, ())
+    return _ConfirmedAnnotationResult(document, ())
 
 
 def _relative_info_path(evidence: DatasetEvidence) -> str:
@@ -528,6 +585,10 @@ def _relative_info_path(evidence: DatasetEvidence) -> str:
 
 def _safe_text(value: object) -> bool:
     return type(value) is str and bool(value) and value == value.strip()
+
+
+def _safe_source_key(value: object) -> bool:
+    return _safe_text(value)
 
 
 def _valid_threshold(value: object) -> bool:
@@ -561,8 +622,8 @@ def _unique_by_id(
 def _unconfirmed(
     message: str,
     evidence: dict[str, object] | None = None,
-) -> AnnotationResult:
-    return AnnotationResult(
+) -> _ConfirmedAnnotationResult:
+    return _ConfirmedAnnotationResult(
         None,
         (
             Issue(
@@ -578,8 +639,8 @@ def _unconfirmed(
 def _main_unconfirmed(
     message: str,
     evidence: dict[str, object] | None = None,
-) -> AnnotationResult:
-    return AnnotationResult(
+) -> _ConfirmedAnnotationResult:
+    return _ConfirmedAnnotationResult(
         None,
         (
             Issue(
@@ -657,6 +718,8 @@ def _compile_cameras(
     mapping: DatasetMapping,
     threshold: float,
 ) -> tuple[dict[str, str], Issue | None]:
+    if any(not _safe_source_key(camera.schema.source_key) for camera in evidence.cameras):
+        return {}, _unconfirmed("相机源字段无效").issues[0]
     sources = {camera.schema.source_key for camera in evidence.cameras}
     slots = _unique_by_id(profile.cameras, "camera_id")
     if slots is None:
@@ -668,6 +731,8 @@ def _compile_cameras(
             assignment, threshold
         ):
             return {}, _unconfirmed("相机映射未确认").issues[0]
+        if not _safe_source_key(assignment.source_key):
+            return {}, _unconfirmed("相机源字段无效").issues[0]
         if (
             assignment.source_key not in sources
             or assignment.source_key in mapped_sources
@@ -704,7 +769,9 @@ def _compile_machine_layouts(
     Issue | None,
 ]:
     schemas = {
-        machine.schema.source_key: machine.schema for machine in evidence.machines
+        machine.schema.source_key: machine.schema
+        for machine in evidence.machines
+        if _safe_source_key(machine.schema.source_key)
     }
     assignments = _unique_by_id(mapping.machines, "source_feature")
     if assignments is None:
