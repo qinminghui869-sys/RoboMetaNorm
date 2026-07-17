@@ -758,8 +758,16 @@ class AnnotationCompilerTest(unittest.TestCase):
                     "source": "qpos", "field": "qpos", "slice": [0, 2], "group": "arm_motion",
                     "unit": "unknown", "norm": "robust_mad", "weight": 1.0, "optional": False,
                 },
+                "gripper.left": {
+                    "source": "qpos", "field": "qpos", "slice": [8, 9], "group": "gripper",
+                    "unit": "unknown", "norm": "robust_mad", "weight": 1.0, "optional": False,
+                },
                 "arm.right.joint": {
                     "source": "qpos", "field": "qpos", "slice": [9, 11], "group": "arm_motion",
+                    "unit": "unknown", "norm": "robust_mad", "weight": 1.0, "optional": False,
+                },
+                "gripper.right": {
+                    "source": "qpos", "field": "qpos", "slice": [17, 18], "group": "gripper",
                     "unit": "unknown", "norm": "robust_mad", "weight": 1.0, "optional": False,
                 },
             },
@@ -856,7 +864,7 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertIsNone(result.document["robot_channel_schema"]["robot_type"])
         self.assertTrue(result.document["review"]["required"])
 
-    def test_fallback_reuses_safe_source_camera_keys_and_conditional_base_fields(self) -> None:
+    def test_fallback_standardizes_safe_source_camera_keys_and_conditional_base_fields(self) -> None:
         evidence = AnnotationFixture.evidence(sides=("left",))
         canonical = replace(
             evidence.cameras[0],
@@ -875,16 +883,16 @@ class AnnotationCompilerTest(unittest.TestCase):
             result.document["adapter"]["cameras"],
             {
                 "observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb",
-                "observation.images.image_left": "observation.images.image_left",
+                "observation.images.cam_left_rgb": "observation.images.image_left",
             },
         )
 
-    def test_review_fallback_preserves_safe_source_camera_mapping_when_vlm_unavailable(self) -> None:
+    def test_review_fallback_uses_standard_camera_keys_when_vlm_unavailable(self) -> None:
         evidence = AnnotationFixture.evidence(sides=("left",))
         camera_sources = (
-            "observation.images.image_top",
-            "observation.images.image_right",
             "observation.images.image_left",
+            "observation.images.image_right",
+            "observation.images.image_wrist",
         )
         cameras = tuple(
             replace(
@@ -920,15 +928,75 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertTrue(result.document["review"]["required"])
         self.assertEqual(
             result.document["adapter"]["cameras"],
-            {source_key: source_key for source_key in camera_sources},
+            {
+                "observation.images.cam_left_rgb": "observation.images.image_left",
+                "observation.images.cam_right_rgb": "observation.images.image_right",
+                "observation.images.cam_wrist_rgb": "observation.images.image_wrist",
+            },
         )
+
+    def test_fallback_adds_matching_single_and_dual_arm_grippers(self) -> None:
+        main_names = (
+            *(f"main_follower_joint_{index}" for index in range(1, 8)),
+            "main_follower_pose_x",
+            "main_follower_pose_y",
+            "main_follower_pose_z",
+            "main_follower_rotation_euler_roll",
+            "main_follower_rotation_euler_pitch",
+            "main_follower_rotation_euler_yaw",
+            "main_follower_gripper",
+            "main_follower_gripper_open",
+        )
+        cases = (
+            (
+                AnnotationFixture.main_follower_evidence(
+                    state_names=main_names,
+                    action_names=main_names,
+                ),
+                {
+                    "arm.main.joint": [0, 7],
+                    "gripper.main": [14, 15],
+                },
+            ),
+            (
+                AnnotationFixture.evidence(),
+                {
+                    "arm.left.joint": [0, 2],
+                    "gripper.left": [8, 9],
+                    "arm.right.joint": [9, 11],
+                    "gripper.right": [17, 18],
+                },
+            ),
+        )
+
+        for evidence, expected_slices in cases:
+            with self.subTest(expected_slices=expected_slices):
+                result = compile_annotation(
+                    evidence,
+                    None,
+                    None,
+                    normalized_info=AnnotationFixture.normalized_info(),
+                    confidence_threshold=0.85,
+                )
+                channels = result.document["robot_channel_schema"]["channels"]
+                self.assertEqual(
+                    {name: channel["slice"] for name, channel in channels.items()},
+                    expected_slices,
+                )
+                self.assertEqual(
+                    result.document["robot_channel_schema"]["group_weights"],
+                    {"arm_motion": 0.3, "gripper": 0.45},
+                )
 
     def test_fallback_main_follower_requires_matching_contiguous_layouts(self) -> None:
         result = compile_annotation(
             AnnotationFixture.main_follower_evidence(), None, None,
             normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85,
         )
-        self.assertEqual(list(result.document["robot_channel_schema"]["channels"]), ["arm.main.joint"])
+        self.assertEqual(
+            list(result.document["robot_channel_schema"]["channels"]),
+            ["arm.main.joint", "gripper.main"],
+        )
 
         gapped = list(AnnotationFixture.main_follower_evidence().machines[0].schema.names)
         gapped[1] = "main_follower_joint_3"

@@ -10,6 +10,7 @@ import re
 
 from robometanorm.models import (
     CameraAssignment,
+    CameraEvidence,
     DatasetEvidence,
     DatasetMapping,
     HardwareProfile,
@@ -18,7 +19,14 @@ from robometanorm.models import (
     MachineComponent,
     MachineSlice,
 )
-from robometanorm.standard import render_camera_key
+from robometanorm.standard import (
+    BODY_PARTS,
+    DIRECTION_ORDER,
+    EXTERNAL_DIRECTIONS,
+    ON_ROBOT_DIRECTIONS,
+    parse_standard_camera_key,
+    render_camera_key,
+)
 
 
 _JOINT_LABEL = re.compile(r"(?:[a-z]+_)*(?:joint|j)[_-]?\d+", re.IGNORECASE)
@@ -425,6 +433,7 @@ def _best_effort_document(
     if "action" in source_features:
         base["action"] = "action"
     channels = _best_effort_channels(evidence)
+    groups = {channel["group"] for channel in channels.values()}
     return {
         "version": "dataset_annotation_config_v1",
         "robot_type": safe_robot_type,
@@ -433,7 +442,9 @@ def _best_effort_document(
             "version": "channel_schema_v1",
             "robot_type": safe_robot_type,
             "channels": channels,
-            "group_weights": {"arm_motion": 0.3} if channels else {},
+            "group_weights": {
+                name: weight for name, weight in _GROUP_WEIGHTS.items() if name in groups
+            },
         },
     }
 
@@ -461,12 +472,83 @@ def _review_cameras(
 
 
 def _canonical_source_cameras(evidence: DatasetEvidence) -> dict[str, str]:
-    return {
-        camera.schema.source_key: camera.schema.source_key
-        for camera in evidence.cameras
-        if _safe_source_key(camera.schema.source_key)
-        and camera.schema.source_key.startswith("observation.images.")
+    output: dict[str, str] = {}
+    collided: set[str] = set()
+    for camera in evidence.cameras:
+        source_key = camera.schema.source_key
+        target_key = _fallback_camera_key(camera)
+        if target_key is None or target_key in collided:
+            continue
+        if target_key in output:
+            output.pop(target_key)
+            collided.add(target_key)
+            continue
+        output[target_key] = source_key
+    return output
+
+
+def _fallback_camera_key(camera: CameraEvidence) -> str | None:
+    source_key = camera.schema.source_key
+    if (
+        not _safe_source_key(source_key)
+        or not source_key.startswith("observation.images.")
+    ):
+        return None
+    if parse_standard_camera_key(source_key) is not None:
+        return source_key
+
+    modality = _fallback_camera_modality(camera)
+    if modality is None:
+        return None
+    tokens = [
+        token
+        for token in re.split(r"[_-]+", source_key.rsplit(".", 1)[-1].casefold())
+        if token and token not in {"image", "images", "camera", "cam", "rgb", "depth"}
+    ]
+    body_parts = [token for token in tokens if token in BODY_PARTS]
+    if len(body_parts) > 1:
+        return None
+    if body_parts:
+        body_part = body_parts[0]
+        directions = set(tokens) - {body_part}
+        if not directions <= ON_ROBOT_DIRECTIONS:
+            return None
+        semantic_tokens = [
+            *(token for token in DIRECTION_ORDER if token in directions),
+            body_part,
+        ]
+    else:
+        directions = set(tokens)
+        if not directions or not directions <= EXTERNAL_DIRECTIONS:
+            return None
+        semantic_tokens = [token for token in DIRECTION_ORDER if token in directions]
+
+    candidate = f"observation.images.cam_{'_'.join((*semantic_tokens, modality))}"
+    return candidate if parse_standard_camera_key(candidate) == modality else None
+
+
+def _fallback_camera_modality(camera: CameraEvidence) -> str | None:
+    source_tokens = set(re.split(r"[_./-]+", camera.schema.source_key.casefold()))
+    if "depth" in source_tokens:
+        return "depth"
+    if "rgb" in source_tokens:
+        return "rgb"
+    roots = {
+        sample.relative_path.split("/", 1)[0].casefold()
+        for sample in camera.samples
+        if _safe_text(sample.relative_path)
     }
+    if roots == {"depth"}:
+        return "depth"
+    if roots == {"videos"}:
+        return "rgb"
+    if camera.schema.shape:
+        channels = camera.schema.shape[-1]
+        if type(channels) is int and channels == 1:
+            return "depth"
+        if type(channels) is int and channels in {3, 4}:
+            return "rgb"
+    return None
 
 
 def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, object]]:
@@ -482,10 +564,15 @@ def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, obje
     action = sided_layouts.get("action")
     qpos = sided_layouts.get("observation.state")
     if action is not None and qpos is not None and action == qpos and _is_contiguous(action):
-        return {
+        channels = {
             f"arm.{side}.joint": _best_effort_channel(start, end)
             for side, start, end in _sided_channel_ranges(qpos)
         }
+        return _add_best_effort_grippers(
+            evidence,
+            channels,
+            tuple(side for side, _, _ in _sided_channel_ranges(qpos)),
+        )
 
     main_layouts = _main_joint_layouts(evidence)
     if (
@@ -494,8 +581,54 @@ def _best_effort_channels(evidence: DatasetEvidence) -> dict[str, dict[str, obje
         and main_layouts["action"] == main_layouts["observation.state"]
     ):
         layout = main_layouts["observation.state"]
-        return {"arm.main.joint": _best_effort_channel(layout[0][1], layout[-1][1] + 1)}
+        return _add_best_effort_grippers(
+            evidence,
+            {"arm.main.joint": _best_effort_channel(layout[0][1], layout[-1][1] + 1)},
+            ("main",),
+        )
     return {}
+
+
+def _add_best_effort_grippers(
+    evidence: DatasetEvidence,
+    channels: dict[str, dict[str, object]],
+    sides: tuple[str, ...],
+) -> dict[str, dict[str, object]]:
+    for side in sides:
+        prefix = "main_follower" if side == "main" else side
+        index = _matching_gripper_index(evidence, prefix)
+        if index is not None:
+            channels[f"gripper.{side}"] = _best_effort_channel(
+                index,
+                index + 1,
+                group="gripper",
+            )
+    return channels
+
+
+def _matching_gripper_index(evidence: DatasetEvidence, prefix: str) -> int | None:
+    names_by_source = {
+        machine.schema.source_key: machine.schema.names
+        for machine in evidence.machines
+        if _safe_source_key(machine.schema.source_key)
+        and machine.schema.source_key in {"action", "observation.state"}
+    }
+    if set(names_by_source) != {"action", "observation.state"}:
+        return None
+    for label in (f"{prefix}_gripper_open", f"{prefix}_gripper"):
+        positions = []
+        for source_key in ("action", "observation.state"):
+            matches = [
+                index
+                for index, name in enumerate(names_by_source[source_key])
+                if type(name) is str and name.casefold() == label
+            ]
+            if len(matches) != 1:
+                break
+            positions.append(matches[0])
+        if len(positions) == 2 and positions[0] == positions[1]:
+            return positions[0]
+    return None
 
 
 def _sided_channel_ranges(
@@ -509,12 +642,17 @@ def _sided_channel_ranges(
     return tuple(ranges)
 
 
-def _best_effort_channel(start: int, end: int) -> dict[str, object]:
+def _best_effort_channel(
+    start: int,
+    end: int,
+    *,
+    group: str = "arm_motion",
+) -> dict[str, object]:
     return {
         "source": "qpos",
         "field": "qpos",
         "slice": [start, end],
-        "group": "arm_motion",
+        "group": group,
         "unit": "unknown",
         "norm": "robust_mad",
         "weight": 1.0,
