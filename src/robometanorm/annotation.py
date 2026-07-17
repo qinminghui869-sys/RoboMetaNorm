@@ -590,7 +590,17 @@ def _relative_info_path(evidence: DatasetEvidence) -> str:
 
 
 def _safe_text(value: object) -> bool:
-    return type(value) is str and bool(value) and value == value.strip()
+    return (
+        type(value) is str
+        and bool(value)
+        and value == value.strip()
+        and not any(
+            ord(character) < 32
+            or 127 <= ord(character) <= 159
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
+    )
 
 
 def _safe_source_key(value: object) -> bool:

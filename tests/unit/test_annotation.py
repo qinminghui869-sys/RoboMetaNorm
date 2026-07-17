@@ -729,6 +729,19 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertEqual(result.document["robot_channel_schema"]["channels"], {})
         self.assertEqual(result.document["review"]["issues"][0]["code"], "ANNOTATION_JOINT_AMBIGUOUS")
 
+    def test_fallback_nulls_robot_type_with_control_characters(self) -> None:
+        result = compile_annotation(
+            AnnotationFixture.evidence(),
+            None,
+            None,
+            normalized_info={"robot_type": "acme\nrobot"},
+            confidence_threshold=0.85,
+        )
+
+        self.assertIsNone(result.document["robot_type"])
+        self.assertIsNone(result.document["robot_channel_schema"]["robot_type"])
+        self.assertTrue(result.document["review"]["required"])
+
     def test_fallback_reuses_only_canonical_camera_keys_and_conditional_base_fields(self) -> None:
         evidence = AnnotationFixture.evidence(sides=("left",))
         canonical = replace(
