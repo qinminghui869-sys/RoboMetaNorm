@@ -395,6 +395,91 @@ class AnnotationCompilerTest(unittest.TestCase):
             result.document,
         )
 
+    def test_vlm_confirmed_camera_category_controls_standard_yaml_key(self) -> None:
+        cases = (
+            (
+                CameraSlot(
+                    camera_id="top_external",
+                    interface_name="observation.images.image_top",
+                    mount_type="external",
+                    direction_tokens=("top",),
+                    body_part=None,
+                    modality="rgb",
+                    confidence=1.0,
+                    ambiguous=False,
+                    reason="frame shows an external top-down camera",
+                    source_ids=(),
+                ),
+                "observation.images.cam_top_rgb",
+            ),
+            (
+                CameraSlot(
+                    camera_id="front_head",
+                    interface_name="observation.images.image_top",
+                    mount_type="on_robot",
+                    direction_tokens=("front",),
+                    body_part="head",
+                    modality="rgb",
+                    confidence=1.0,
+                    ambiguous=False,
+                    reason="frame shows a robot head camera looking forward",
+                    source_ids=(),
+                ),
+                "observation.images.cam_front_head_rgb",
+            ),
+        )
+
+        for slot, expected_key in cases:
+            with self.subTest(expected_key=expected_key):
+                evidence = AnnotationFixture.evidence()
+                camera = replace(
+                    evidence.cameras[0],
+                    schema=replace(
+                        evidence.cameras[0].schema,
+                        source_key="observation.images.image_top",
+                    ),
+                )
+                source_features = dict(evidence.source_info["features"])
+                source_features.pop("observation.images.image_left")
+                source_features["observation.images.image_top"] = {
+                    "dtype": "video",
+                    "shape": [480, 640, 3],
+                    "names": ["height", "width", "channel"],
+                    "fps": 30,
+                    "codec": "h264",
+                }
+                evidence = replace(
+                    evidence,
+                    cameras=(camera,),
+                    source_info={**evidence.source_info, "features": source_features},
+                )
+                profile = replace(AnnotationFixture.profile(), cameras=(slot,))
+                mapping = replace(
+                    AnnotationFixture.mapping(),
+                    cameras=(
+                        CameraAssignment(
+                            source_key="observation.images.image_top",
+                            camera_id=slot.camera_id,
+                            confidence=1.0,
+                            ambiguous=False,
+                            reason="confirmed by representative frame",
+                        ),
+                    ),
+                )
+
+                result = compile_annotation(
+                    evidence,
+                    profile,
+                    mapping,
+                    normalized_info=AnnotationFixture.normalized_info(),
+                    confidence_threshold=0.85,
+                )
+
+                self.assertEqual(
+                    result.document["adapter"]["cameras"],
+                    {expected_key: "observation.images.image_top"},
+                )
+
     def test_compiles_confirmed_main_follower_single_arm_channels(self) -> None:
         result = compile_annotation(
             AnnotationFixture.main_follower_evidence(),
@@ -771,7 +856,7 @@ class AnnotationCompilerTest(unittest.TestCase):
         self.assertIsNone(result.document["robot_channel_schema"]["robot_type"])
         self.assertTrue(result.document["review"]["required"])
 
-    def test_fallback_reuses_only_canonical_camera_keys_and_conditional_base_fields(self) -> None:
+    def test_fallback_reuses_safe_source_camera_keys_and_conditional_base_fields(self) -> None:
         evidence = AnnotationFixture.evidence(sides=("left",))
         canonical = replace(
             evidence.cameras[0],
@@ -786,7 +871,57 @@ class AnnotationCompilerTest(unittest.TestCase):
         result = compile_annotation(evidence, None, None, normalized_info=AnnotationFixture.normalized_info(), confidence_threshold=0.85)
 
         self.assertEqual(result.document["adapter"]["base"], {"action": "action"})
-        self.assertEqual(result.document["adapter"]["cameras"], {"observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb"})
+        self.assertEqual(
+            result.document["adapter"]["cameras"],
+            {
+                "observation.images.cam_left_wrist_rgb": "observation.images.cam_left_wrist_rgb",
+                "observation.images.image_left": "observation.images.image_left",
+            },
+        )
+
+    def test_review_fallback_preserves_safe_source_camera_mapping_when_vlm_unavailable(self) -> None:
+        evidence = AnnotationFixture.evidence(sides=("left",))
+        camera_sources = (
+            "observation.images.image_top",
+            "observation.images.image_right",
+            "observation.images.image_left",
+        )
+        cameras = tuple(
+            replace(
+                evidence.cameras[0],
+                schema=replace(evidence.cameras[0].schema, source_key=source_key),
+            )
+            for source_key in camera_sources
+        )
+        source_features = dict(evidence.source_info["features"])
+        source_features.pop("observation.images.image_left")
+        for source_key in camera_sources:
+            source_features[source_key] = {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+                "names": ["height", "width", "channel"],
+                "fps": 30,
+                "codec": "h264",
+            }
+        evidence = replace(
+            evidence,
+            cameras=cameras,
+            source_info={**evidence.source_info, "features": source_features},
+        )
+
+        result = compile_annotation(
+            evidence,
+            None,
+            None,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(
+            result.document["adapter"]["cameras"],
+            {source_key: source_key for source_key in camera_sources},
+        )
 
     def test_fallback_main_follower_requires_matching_contiguous_layouts(self) -> None:
         result = compile_annotation(

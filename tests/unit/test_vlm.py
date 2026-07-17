@@ -2918,6 +2918,13 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         self.assertIn("exactly profile and mapping", normalized)
         self.assertIn("exactly once", normalized)
         self.assertIn("ambiguous=true", normalized)
+        self.assertIn("representative frame", normalized)
+        self.assertIn("on_robot", normalized)
+        self.assertIn("external", normalized)
+        self.assertIn("rgb", normalized)
+        self.assertIn("depth", normalized)
+        self.assertIn("av1", normalized)
+        self.assertIn("ffv1", normalized)
 
     def test_parse_dataset_analysis_builds_local_profile_and_valid_mapping(self) -> None:
         analysis = vlm_module.parse_dataset_analysis(

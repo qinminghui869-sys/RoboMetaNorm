@@ -18,7 +18,7 @@ from robometanorm.models import (
     MachineComponent,
     MachineSlice,
 )
-from robometanorm.standard import parse_standard_camera_key, render_camera_key
+from robometanorm.standard import render_camera_key
 
 
 _JOINT_LABEL = re.compile(r"(?:[a-z]+_)*(?:joint|j)[_-]?\d+", re.IGNORECASE)
@@ -465,7 +465,7 @@ def _canonical_source_cameras(evidence: DatasetEvidence) -> dict[str, str]:
         camera.schema.source_key: camera.schema.source_key
         for camera in evidence.cameras
         if _safe_source_key(camera.schema.source_key)
-        and parse_standard_camera_key(camera.schema.source_key) is not None
+        and camera.schema.source_key.startswith("observation.images.")
     }
 
 
