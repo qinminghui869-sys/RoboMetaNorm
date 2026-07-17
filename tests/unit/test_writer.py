@@ -336,6 +336,16 @@ class MiniWriterTest(unittest.TestCase):
             "robot_type": "acme_robotics_testbot_one",
             "adapter": {"base_type": "LeRobot", "base": {}},
             "robot_channel_schema": {"version": "channel_schema_v1", "channels": {}},
+            "review": {
+                "required": True,
+                "issues": [
+                    {
+                        "code": "VLM_NETWORK_ERROR",
+                        "message": "offline",
+                        "source": "vlm",
+                    }
+                ],
+            },
         }
 
         paths = write_outputs(
