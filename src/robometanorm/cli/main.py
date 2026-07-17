@@ -21,6 +21,7 @@ DEFAULT_VLM_MODEL = "qwen3.7-plus"
 DEFAULT_VLM_API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 DEFAULT_DATASET_TIMEOUT_SECONDS = 180.0
+DEFAULT_VLM_MAX_TOKENS = 4096
 
 
 class _ProgressRenderer:
@@ -183,8 +184,8 @@ def _build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument(
                 "--vlm-max-tokens",
                 type=int,
-                default=1024,
-                help="VLM 最大输出 token 数，默认 1024",
+                default=DEFAULT_VLM_MAX_TOKENS,
+                help=f"VLM 最大输出 token 数，默认 {DEFAULT_VLM_MAX_TOKENS}",
             )
             command_parser.add_argument(
                 "--ignore-vlm-network-errors",

@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 from robometanorm.cli.main import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     DEFAULT_DATASET_TIMEOUT_SECONDS,
+    DEFAULT_VLM_MAX_TOKENS,
     _ProgressRenderer,
     _build_parser,
     _build_vlm,
@@ -553,6 +554,14 @@ class CliIntegrationTest(unittest.TestCase):
             max_tokens=2048,
         )
         service_type.assert_called_once_with(transport)
+
+    def test_normalize_defaults_to_4096_vlm_output_tokens(self) -> None:
+        arguments = _build_parser().parse_args(
+            ["normalize", "--root", str(self.root)]
+        )
+
+        self.assertEqual(DEFAULT_VLM_MAX_TOKENS, 4096)
+        self.assertEqual(arguments.vlm_max_tokens, 4096)
 
     def test_nonfinite_out_of_range_and_direct_bool_thresholds_are_rejected(self) -> None:
         for value in ("nan", "inf", "-inf", "-0.1", "1.1"):

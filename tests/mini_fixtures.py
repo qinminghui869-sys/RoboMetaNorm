@@ -380,6 +380,7 @@ class StubTransport:
     web_payload: dict[str, object] | None = None
     web_issue: Issue | None = None
     chat_payload: dict[str, object] | None = None
+    chat_payloads: list[dict[str, object] | None] | None = None
     chat_issue: Issue | None = None
     web_attempts: int = field(default=0, init=False)
     chat_attempts: int = field(default=0, init=False)
@@ -405,6 +406,12 @@ class StubTransport:
         *,
         deadline_monotonic: float | None = None,
     ) -> tuple[dict[str, object] | None, Issue | None]:
+        payload = (
+            self.chat_payloads[self.chat_attempts]
+            if self.chat_payloads is not None
+            and self.chat_attempts < len(self.chat_payloads)
+            else self.chat_payload
+        )
         self.chat_attempts += 1
         self.chat_deadlines.append(deadline_monotonic)
-        return self.chat_payload, self.chat_issue
+        return payload, self.chat_issue

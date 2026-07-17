@@ -224,9 +224,11 @@ class _LegacyTransport:
         *,
         web_payload: dict[str, object] | None = None,
         chat_payload: dict[str, object] | None = None,
+        chat_payloads: list[dict[str, object] | None] | None = None,
     ) -> None:
         self.web_payload = web_payload
         self.chat_payload = chat_payload
+        self.chat_payloads = chat_payloads
         self.web_attempts = 0
         self.chat_attempts = 0
 
@@ -242,8 +244,14 @@ class _LegacyTransport:
         user_prompt: str,
         image_paths: tuple[Path, ...],
     ) -> tuple[dict[str, object] | None, Issue | None]:
+        payload = (
+            self.chat_payloads[self.chat_attempts]
+            if self.chat_payloads is not None
+            and self.chat_attempts < len(self.chat_payloads)
+            else self.chat_payload
+        )
         self.chat_attempts += 1
-        return self.chat_payload, None
+        return payload, None
 
 
 class VlmTransportTest(unittest.TestCase):
@@ -258,6 +266,9 @@ class VlmTransportTest(unittest.TestCase):
         }
         arguments.update(overrides)
         return OpenAICompatibleTransport(**arguments)
+
+    def test_constructor_defaults_to_4096_output_tokens(self) -> None:
+        self.assertEqual(self.make_transport().max_tokens, 4096)
 
     def request_chat_content(
         self, content: object, *, max_retries: int = 2
@@ -2882,6 +2893,10 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
             "mapping": VlmFixture.valid_mapping_payload(),
         }
 
+    @classmethod
+    def profile_payload(cls) -> dict[str, object]:
+        return deepcopy(cls.analysis_payload()["profile"])
+
     def test_dataset_vlm_protocol_exposes_only_combined_analysis(self) -> None:
         protocol_methods = {
             name
@@ -2891,10 +2906,10 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
 
         self.assertEqual(protocol_methods, {"analyze_dataset"})
 
-    def test_builds_analysis_prompt_with_fixed_local_identity_and_no_profile(self) -> None:
+    def test_builds_profile_prompt_with_fixed_local_identity_and_full_contract(self) -> None:
         evidence = self.evidence(two_cameras=True)
 
-        system, user, image_paths = vlm_module.build_analysis_prompt(
+        system, user, image_paths = vlm_module.build_profile_prompt(
             evidence, "Fixture Robot v2"
         )
 
@@ -2915,9 +2930,7 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         self.assertIn("must not be rewritten", normalized)
         self.assertIn("no web search", normalized)
         self.assertIn("no citations", normalized)
-        self.assertIn("exactly profile and mapping", normalized)
-        self.assertIn("exactly once", normalized)
-        self.assertIn("ambiguous=true", normalized)
+        self.assertIn("exactly cameras and components", normalized)
         self.assertIn("representative frame", normalized)
         self.assertIn("on_robot", normalized)
         self.assertIn("external", normalized)
@@ -2925,6 +2938,25 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         self.assertIn("depth", normalized)
         self.assertIn("av1", normalized)
         self.assertIn("ffv1", normalized)
+        self.assertIn("arm_joint", normalized)
+        self.assertIn("joint_vector", normalized)
+        self.assertIn("position_xyz", normalized)
+        self.assertIn("euler_xyz", normalized)
+        self.assertIn("gripper_open_scale", normalized)
+        self.assertIn("open_direction", normalized)
+
+    def test_parse_dataset_profile_builds_fixed_local_identity(self) -> None:
+        profile = vlm_module.parse_dataset_profile(
+            self.profile_payload(), "Fixture Robot v2"
+        )
+
+        self.assertEqual(
+            (profile.identity.manufacturer, profile.identity.model),
+            ("Fixture Robot v2", "Fixture Robot v2"),
+        )
+        self.assertEqual(profile.sources, ())
+        self.assertTrue(all(not camera.source_ids for camera in profile.cameras))
+        self.assertTrue(all(not component.source_ids for component in profile.components))
 
     def test_parse_dataset_analysis_builds_local_profile_and_valid_mapping(self) -> None:
         analysis = vlm_module.parse_dataset_analysis(
@@ -2982,9 +3014,11 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
                         payload, self.evidence(), "Fixture Robot v2"
                     )
 
-    def test_analyze_dataset_requests_one_chat_no_web_and_forwards_deadline(self) -> None:
+    def test_analyze_dataset_requests_profile_then_mapping_and_forwards_deadline(self) -> None:
         deadline = 6789.5
-        transport = StubTransport(chat_payload=self.analysis_payload())
+        transport = StubTransport(
+            chat_payloads=[self.profile_payload(), self.payload()]
+        )
 
         analysis, issue = self.create_openai_service(transport).analyze_dataset(
             self.evidence(), "Fixture Robot v2", deadline_monotonic=deadline
@@ -2992,8 +3026,8 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
 
         self.assertIsInstance(analysis, DatasetAnalysis)
         self.assertIsNone(issue)
-        self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
-        self.assertEqual(transport.chat_deadlines, [deadline])
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (2, 0))
+        self.assertEqual(transport.chat_deadlines, [deadline, deadline])
         self.assertEqual(transport.web_deadlines, [])
 
     def test_analyze_dataset_preserves_transport_issue(self) -> None:
@@ -3008,24 +3042,39 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         self.assertIs(issue, transport_issue)
         self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
 
-    def test_analyze_dataset_invalid_payloads_fail_closed(self) -> None:
-        extra = self.analysis_payload()
-        extra["extra"] = True
-        malformed_profile = self.analysis_payload()
-        malformed_profile["profile"]["cameras"] = {}
-        malformed_mapping = self.analysis_payload()
-        malformed_mapping["mapping"]["machines"] = {}
+    def test_analyze_dataset_reports_locatable_profile_validation_error(self) -> None:
+        malformed = self.profile_payload()
+        malformed["extra"] = True
+        transport = StubTransport(chat_payloads=[malformed])
 
-        for payload in (extra, malformed_profile, malformed_mapping):
-            with self.subTest(payload=payload):
-                transport = StubTransport(chat_payload=payload)
-                analysis, issue = self.create_openai_service(
-                    transport
-                ).analyze_dataset(self.evidence(), "Fixture Robot v2")
+        analysis, issue = self.create_openai_service(transport).analyze_dataset(
+            self.evidence(), "Fixture Robot v2"
+        )
 
-                self.assertIsNone(analysis)
-                self.assertEqual(issue.code, "DATASET_ANALYSIS_INVALID")
-                self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
+        self.assertIsNone(analysis)
+        self.assertEqual(issue.code, "DATASET_PROFILE_INVALID")
+        self.assertEqual(issue.evidence["stage"], "profile_parse")
+        self.assertEqual(issue.evidence["error_type"], "ValueError")
+        self.assertIn("dataset profile", issue.evidence["validation_error"])
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
+
+    def test_analyze_dataset_reports_locatable_mapping_validation_error(self) -> None:
+        malformed = self.payload()
+        malformed["machines"] = {}
+        transport = StubTransport(
+            chat_payloads=[self.profile_payload(), malformed]
+        )
+
+        analysis, issue = self.create_openai_service(transport).analyze_dataset(
+            self.evidence(), "Fixture Robot v2"
+        )
+
+        self.assertIsNone(analysis)
+        self.assertEqual(issue.code, "DATASET_MAPPING_INVALID")
+        self.assertEqual(issue.evidence["stage"], "mapping_parse")
+        self.assertEqual(issue.evidence["error_type"], "ValueError")
+        self.assertIn("machines", issue.evidence["validation_error"])
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (2, 0))
 
     def test_analyze_dataset_rejects_unsafe_paths_before_request(self) -> None:
         evidence = self.evidence()
@@ -3036,18 +3085,21 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
             evidence,
             cameras=(replace(evidence.cameras[0], samples=(unsafe_sample,)),),
         )
-        transport = StubTransport(chat_payload=self.analysis_payload())
+        transport = StubTransport(chat_payloads=[self.profile_payload()])
 
         analysis, issue = self.create_openai_service(transport).analyze_dataset(
             evidence, "Fixture Robot v2"
         )
 
         self.assertIsNone(analysis)
-        self.assertEqual(issue.code, "DATASET_ANALYSIS_INVALID")
+        self.assertEqual(issue.code, "DATASET_PROFILE_INVALID")
+        self.assertEqual(issue.evidence["stage"], "profile_prompt")
         self.assertEqual((transport.chat_attempts, transport.web_attempts), (0, 0))
 
     def test_analysis_without_deadline_supports_legacy_transport(self) -> None:
-        transport = _LegacyTransport(chat_payload=self.analysis_payload())
+        transport = _LegacyTransport(
+            chat_payloads=[self.profile_payload(), self.payload()]
+        )
 
         analysis, issue = self.create_openai_service(transport).analyze_dataset(
             self.evidence(), "Fixture Robot v2"
@@ -3055,7 +3107,7 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
 
         self.assertIsInstance(analysis, DatasetAnalysis)
         self.assertIsNone(issue)
-        self.assertEqual((transport.chat_attempts, transport.web_attempts), (1, 0))
+        self.assertEqual((transport.chat_attempts, transport.web_attempts), (2, 0))
 
     def test_analyze_dataset_contains_expected_errors_and_propagates_failures(self) -> None:
         expected_errors = (
@@ -3067,21 +3119,23 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         for error in expected_errors:
             with self.subTest(stage="prompt", error=type(error).__name__):
                 transport = StubTransport()
-                with patch("robometanorm.vlm.build_analysis_prompt", side_effect=error):
+                with patch("robometanorm.vlm.build_profile_prompt", side_effect=error):
                     analysis, issue = self.create_openai_service(
                         transport
                     ).analyze_dataset(self.evidence(), "Fixture Robot v2")
                 self.assertIsNone(analysis)
-                self.assertEqual(issue.code, "DATASET_ANALYSIS_INVALID")
+                self.assertEqual(issue.code, "DATASET_PROFILE_INVALID")
+                self.assertEqual(issue.evidence["stage"], "profile_prompt")
                 self.assertEqual(transport.chat_attempts, 0)
             with self.subTest(stage="parse", error=type(error).__name__):
-                transport = StubTransport(chat_payload=self.analysis_payload())
-                with patch("robometanorm.vlm.parse_dataset_analysis", side_effect=error):
+                transport = StubTransport(chat_payload=self.profile_payload())
+                with patch("robometanorm.vlm.parse_dataset_profile", side_effect=error):
                     analysis, issue = self.create_openai_service(
                         transport
                     ).analyze_dataset(self.evidence(), "Fixture Robot v2")
                 self.assertIsNone(analysis)
-                self.assertEqual(issue.code, "DATASET_ANALYSIS_INVALID")
+                self.assertEqual(issue.code, "DATASET_PROFILE_INVALID")
+                self.assertEqual(issue.evidence["stage"], "profile_parse")
                 self.assertEqual(transport.chat_attempts, 1)
 
         missing = StubTransport()
@@ -3089,16 +3143,17 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
             self.evidence(), "Fixture Robot v2"
         )
         self.assertIsNone(analysis)
-        self.assertEqual(issue.code, "DATASET_ANALYSIS_INVALID")
+        self.assertEqual(issue.code, "DATASET_PROFILE_INVALID")
+        self.assertEqual(issue.evidence["stage"], "profile_parse")
 
         for error in (MemoryError("memory"), RuntimeError("bug"), KeyboardInterrupt()):
             with self.subTest(propagated=type(error).__name__):
                 with patch(
-                    "robometanorm.vlm.parse_dataset_analysis", side_effect=error
+                    "robometanorm.vlm.parse_dataset_profile", side_effect=error
                 ):
                     with self.assertRaises(type(error)):
                         self.create_openai_service(
-                            StubTransport(chat_payload=self.analysis_payload())
+                            StubTransport(chat_payload=self.profile_payload())
                         ).analyze_dataset(self.evidence(), "Fixture Robot v2")
 
     def test_builds_safe_whole_dataset_prompt_with_global_image_order(self) -> None:
@@ -3214,6 +3269,12 @@ class DatasetMappingTest(unittest.TestCase, VlmFixture):
         self.assertIn("assignment-only", normalized)
         self.assertIn("existing camera_id/component_id", normalized)
         self.assertIn("supplied camera/component assignments", normalized)
+        self.assertIn("non-negative", normalized)
+        self.assertIn("end must be greater than start", normalized)
+        self.assertIn("element_order length", normalized)
+        self.assertIn("known profile id", normalized)
+        self.assertIn("resolved camera_id values must be unique", normalized)
+        self.assertIn("exactly once", normalized)
         for excluded_topic in ("urdf", "tactile", "audio"):
             self.assertNotIn(excluded_topic, normalized)
 
