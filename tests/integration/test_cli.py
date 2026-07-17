@@ -272,8 +272,12 @@ class CliIntegrationTest(unittest.TestCase):
         )
 
     def test_normalize_forwards_dataset_timeout_and_stage_callback(self) -> None:
-        cases = (((), 180.0), (("--dataset-timeout-seconds", "45"), 45.0))
-        for option, expected in cases:
+        cases = (
+            ((), 180.0, False),
+            (("--dataset-timeout-seconds", "45"), 45.0, False),
+            (("--ignore-vlm-network-errors",), 180.0, True),
+        )
+        for option, expected_timeout, expected_ignore_network_errors in cases:
             with self.subTest(option=option):
                 stderr = _InteractiveStderr()
                 stdout = io.StringIO()
@@ -292,7 +296,12 @@ class CliIntegrationTest(unittest.TestCase):
 
                 self.assertEqual(exit_code, 0)
                 self.assertEqual(
-                    normalize.call_args.kwargs["dataset_timeout_seconds"], expected
+                    normalize.call_args.kwargs["dataset_timeout_seconds"],
+                    expected_timeout,
+                )
+                self.assertEqual(
+                    normalize.call_args.kwargs["tolerate_vlm_network_errors"],
+                    expected_ignore_network_errors,
                 )
                 self.assertIsNotNone(normalize.call_args.kwargs["stage"])
                 self.assertEqual(

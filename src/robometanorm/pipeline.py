@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from http.client import IncompleteRead
 import importlib.metadata
 import math
 from pathlib import Path
 import time
+from urllib import error as url_error
 
 from robometanorm.adapters.filesystem import discover_datasets
 from robometanorm.annotation import (
@@ -44,6 +46,13 @@ _LOCAL_ROBOT_TYPE_UNAVAILABLE = Issue(
     code="LOCAL_ROBOT_TYPE_UNAVAILABLE",
     message="The local robot_type was not a safe non-empty string.",
     scope="robot_type",
+)
+_VLM_NETWORK_EXCEPTION_TYPES = (
+    url_error.HTTPError,
+    url_error.URLError,
+    TimeoutError,
+    OSError,
+    IncompleteRead,
 )
 
 
@@ -155,11 +164,13 @@ def normalize_datasets(
     progress: ProgressCallback | None = None,
     stage: StageCallback | None = None,
     dataset_timeout_seconds: float | None = None,
+    tolerate_vlm_network_errors: bool = False,
 ) -> list[DatasetResult]:
     """Normalize every discovered dataset independently and conservatively."""
 
     _validate_confidence_threshold(confidence_threshold)
     _validate_dataset_timeout_seconds(dataset_timeout_seconds)
+    _validate_bool("tolerate_vlm_network_errors", tolerate_vlm_network_errors)
     generator = _generator_identity()
     candidates = list(discover_datasets(root, layout))
     results: list[DatasetResult] = []
@@ -203,6 +214,7 @@ def normalize_datasets(
                         evidence,
                         robot_type,
                         deadline_monotonic=deadline_monotonic,
+                        tolerate_network_errors=tolerate_vlm_network_errors,
                     )
                     if analysis_issue is not None:
                         extra_issues.append(analysis_issue)
@@ -302,15 +314,21 @@ def _analyze_dataset(
     robot_type: str,
     *,
     deadline_monotonic: float | None = None,
+    tolerate_network_errors: bool = False,
 ) -> tuple[DatasetAnalysis | None, Issue | None]:
-    if deadline_monotonic is None:
-        raw_result = vlm.analyze_dataset(evidence, robot_type)
-    else:
-        raw_result = vlm.analyze_dataset(
-            evidence,
-            robot_type,
-            deadline_monotonic=deadline_monotonic,
-        )
+    try:
+        if deadline_monotonic is None:
+            raw_result = vlm.analyze_dataset(evidence, robot_type)
+        else:
+            raw_result = vlm.analyze_dataset(
+                evidence,
+                robot_type,
+                deadline_monotonic=deadline_monotonic,
+            )
+    except _VLM_NETWORK_EXCEPTION_TYPES as network_error:
+        if not tolerate_network_errors:
+            raise
+        return None, _vlm_network_exception_issue(network_error)
     if type(raw_result) is not tuple or len(raw_result) != 2:
         return None, _ANALYSIS_INVALID
     value, issue = raw_result
@@ -357,6 +375,20 @@ def _validate_dataset_timeout_seconds(dataset_timeout_seconds: object) -> None:
         or dataset_timeout_seconds <= 0
     ):
         raise ValueError("dataset_timeout_seconds must be a finite positive number")
+
+
+def _validate_bool(name: str, value: object) -> None:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a bool")
+
+
+def _vlm_network_exception_issue(error: BaseException) -> Issue:
+    return Issue(
+        code="VLM_NETWORK_ERROR",
+        message="The VLM service could not be reached.",
+        scope="vlm",
+        evidence={"error_type": type(error).__name__},
+    )
 
 
 def _generator_identity() -> dict[str, object]:

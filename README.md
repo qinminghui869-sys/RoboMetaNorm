@@ -122,9 +122,12 @@ robometanorm --help
 - `--vlm-endpoint`、`--vlm-model`、`--vlm-api-key-env`；
 - `--confidence-threshold`；
 - `--vlm-timeout-seconds`、`--vlm-max-retries`；
-- `--vlm-retry-backoff-seconds`、`--vlm-max-tokens`。
+- `--vlm-retry-backoff-seconds`、`--vlm-max-tokens`；
+- `--ignore-vlm-network-errors`：VLM 联网异常转为 REVIEW 输出，而不是将该数据集标记为
+  ERROR。
 
-缺少 API key 或 VLM 调用失败时，程序保持原值并输出可复核原因，不会回退到硬编码型号规则。
+缺少 API key、VLM 返回可分类失败，或开启上述开关后的联网异常，程序保持原值并输出可
+复核原因，不会回退到硬编码型号规则。
 
 ## 当前边界
 

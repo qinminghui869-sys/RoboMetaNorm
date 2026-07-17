@@ -98,6 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 progress=progress.update if progress else None,
                 stage=progress.stage if progress else None,
                 dataset_timeout_seconds=arguments.dataset_timeout_seconds,
+                tolerate_vlm_network_errors=arguments.ignore_vlm_network_errors,
             )
     except ValueError as error:
         parser.error(str(error))
@@ -184,6 +185,13 @@ def _build_parser() -> argparse.ArgumentParser:
                 type=int,
                 default=1024,
                 help="VLM 最大输出 token 数，默认 1024",
+            )
+            command_parser.add_argument(
+                "--ignore-vlm-network-errors",
+                action="store_true",
+                help=(
+                    "VLM 联网异常直接转为 REVIEW 输出，不把该数据集标记为 ERROR"
+                ),
             )
     return parser
 

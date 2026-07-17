@@ -161,6 +161,17 @@ class MiniPipelineTest(unittest.TestCase):
                 confidence_threshold=0.85,
             )
 
+    def _normalize_tolerating_vlm_network_errors(self, vlm: object):
+        from robometanorm.pipeline import normalize_datasets
+
+        with self._media_stubs():
+            return normalize_datasets(
+                self.root,
+                vlm=vlm,
+                confidence_threshold=0.85,
+                tolerate_vlm_network_errors=True,
+            )
+
     def _scan(self):
         from robometanorm.pipeline import scan_datasets
 
@@ -794,6 +805,22 @@ class MiniPipelineTest(unittest.TestCase):
         review = self._read_output(self.fixture, "info_norm_review.json")
         self.assertIn("DATASET_ANALYSIS_INVALID", {item["code"] for item in review["issues"]})
         self.assertTrue((self.fixture.candidate.info_path.parent / "robo_annotation.yaml").is_file())
+
+    def test_vlm_network_exception_can_be_tolerated_as_review(self) -> None:
+        result = self._normalize_tolerating_vlm_network_errors(
+            _RaisingVlm(TimeoutError("network timeout"))
+        )[0]
+
+        self.assertEqual(result.status, DatasetStatus.REVIEW)
+        self.assertEqual(self._read_output(self.fixture, "info_norm.json"), self._source_info())
+        review = self._read_output(self.fixture, "info_norm_review.json")
+        self.assertIn("VLM_NETWORK_ERROR", {item["code"] for item in review["issues"]})
+        annotation = yaml.safe_load(
+            (self.fixture.candidate.info_path.parent / "robo_annotation.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(annotation["review"]["required"])
 
     def test_analysis_with_invalid_nested_models_fails_closed_without_range_collection(self) -> None:
         malformed = DatasetAnalysis(
