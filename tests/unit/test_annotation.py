@@ -687,6 +687,35 @@ class AnnotationCompilerTest(unittest.TestCase):
             ],
         )
 
+    def test_fallback_preserves_confirmed_cameras_when_machine_mapping_fails(self) -> None:
+        mapping = AnnotationFixture.mapping()
+        incomplete_machine_mapping = DatasetMapping(
+            cameras=mapping.cameras,
+            machines=mapping.machines[:1],
+        )
+
+        result = compile_annotation(
+            AnnotationFixture.evidence(),
+            AnnotationFixture.profile(),
+            incomplete_machine_mapping,
+            normalized_info=AnnotationFixture.normalized_info(),
+            confidence_threshold=0.85,
+        )
+
+        self.assertTrue(result.document["review"]["required"])
+        self.assertEqual(
+            result.document["adapter"]["cameras"],
+            {
+                "observation.images.cam_left_wrist_rgb": (
+                    "observation.images.image_left"
+                ),
+            },
+        )
+        self.assertEqual(
+            result.document["review"]["issues"][0]["code"],
+            "ANNOTATION_MAPPING_UNCONFIRMED",
+        )
+
     def test_fallback_does_not_return_annotation_issue_already_seen_by_pipeline(self) -> None:
         existing = Issue(
             "ANNOTATION_MAPPING_UNCONFIRMED",

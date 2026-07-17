@@ -358,7 +358,16 @@ def compile_annotation(
     else:
         if not existing_issues and not confirmed.issues:
             confirmed = _unconfirmed("缺少已确认的硬件画像或数据映射")
-        document = _best_effort_document(evidence, normalized_info)
+        document = _best_effort_document(
+            evidence,
+            normalized_info,
+            cameras=_review_cameras(
+                evidence,
+                profile,
+                mapping,
+                confidence_threshold,
+            ),
+        )
     review_issues = _deduplicated_review_issues(
         (*existing_issues, *confirmed.issues)
     )
@@ -400,6 +409,8 @@ def _new_annotation_issues(
 def _best_effort_document(
     evidence: DatasetEvidence,
     normalized_info: Mapping[str, object],
+    *,
+    cameras: Mapping[str, str],
 ) -> dict[str, object]:
     robot_type = normalized_info.get("robot_type")
     safe_robot_type = robot_type if _safe_text(robot_type) else None
@@ -413,12 +424,6 @@ def _best_effort_document(
         base["qpos"] = "observation.state"
     if "action" in source_features:
         base["action"] = "action"
-    cameras = {
-        camera.schema.source_key: camera.schema.source_key
-        for camera in evidence.cameras
-        if _safe_source_key(camera.schema.source_key)
-        and parse_standard_camera_key(camera.schema.source_key) is not None
-    }
     channels = _best_effort_channels(evidence)
     return {
         "version": "dataset_annotation_config_v1",
@@ -430,6 +435,37 @@ def _best_effort_document(
             "channels": channels,
             "group_weights": {"arm_motion": 0.3} if channels else {},
         },
+    }
+
+
+def _review_cameras(
+    evidence: DatasetEvidence,
+    profile: HardwareProfile | None,
+    mapping: DatasetMapping | None,
+    confidence_threshold: float,
+) -> dict[str, str]:
+    if (
+        isinstance(profile, HardwareProfile)
+        and isinstance(mapping, DatasetMapping)
+        and _valid_threshold(confidence_threshold)
+    ):
+        confirmed, issue = _compile_cameras(
+            evidence,
+            profile,
+            mapping,
+            confidence_threshold,
+        )
+        if issue is None:
+            return confirmed
+    return _canonical_source_cameras(evidence)
+
+
+def _canonical_source_cameras(evidence: DatasetEvidence) -> dict[str, str]:
+    return {
+        camera.schema.source_key: camera.schema.source_key
+        for camera in evidence.cameras
+        if _safe_source_key(camera.schema.source_key)
+        and parse_standard_camera_key(camera.schema.source_key) is not None
     }
 
 
