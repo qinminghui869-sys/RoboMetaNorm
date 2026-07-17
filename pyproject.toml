@@ -8,12 +8,9 @@ version = "0.1.0"
 description = "机器人数据集规范化建议工具"
 requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.23",
     "pyarrow>=14.0",
+    "PyYAML>=6.0",
 ]
-
-[project.optional-dependencies]
-depth = ["opencv-python>=4.5"]
 
 [project.scripts]
 robometanorm = "robometanorm.cli.main:main"

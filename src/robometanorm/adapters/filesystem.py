@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from robometanorm.domain.models import DatasetCandidate, LayoutType
+from robometanorm.models import DatasetCandidate, LayoutType
 
 
 EXCLUDED_DIRECTORY_NAMES = {".git", ".cache", "__pycache__"}
@@ -13,6 +13,8 @@ EXCLUDED_DIRECTORY_NAMES = {".git", ".cache", "__pycache__"}
 
 def discover_datasets(root: Path, layout: LayoutType = LayoutType.AUTO) -> list[DatasetCandidate]:
     """递归发现以 ``meta/info.json`` 标识的数据集。"""
+    # The explicit CLI root is the user's trust anchor. Resolve it before
+    # traversal; links discovered inside that root remain untrusted.
     root = root.resolve()
     if not root.is_dir():
         raise ValueError(f"输入根目录不存在或不是目录: {root}")
@@ -43,7 +45,7 @@ def _build_candidate(root: Path, dataset_path: Path) -> DatasetCandidate | None:
         return None
 
     relative_path = dataset_path.relative_to(root)
-    if len(relative_path.parts) == 1:
+    if len(relative_path.parts) <= 1:
         layout_type = LayoutType.FLAT
         task_name = None
     else:
@@ -64,4 +66,4 @@ def _build_candidate(root: Path, dataset_path: Path) -> DatasetCandidate | None:
 
 def _matches_requested_layout(candidate: DatasetCandidate, layout: LayoutType) -> bool:
     """在显式布局模式下仅保留对应候选。"""
-    return layout is LayoutType.AUTO or candidate.layout_type is layout
+    return layout == LayoutType.AUTO or candidate.layout_type == layout

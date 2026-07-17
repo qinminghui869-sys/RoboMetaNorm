@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[2] / "src"))
 
 from robometanorm.adapters.filesystem import discover_datasets
-from robometanorm.domain.models import LayoutType
+from robometanorm.models import LayoutType
 
 
 class DatasetDiscoveryTest(unittest.TestCase):
@@ -50,6 +50,20 @@ class DatasetDiscoveryTest(unittest.TestCase):
         self.assertEqual(candidates[1].source_path, grouped_path)
         self.assertEqual(candidates[1].layout_type, LayoutType.TASK_GROUPED)
         self.assertEqual(candidates[1].task_name, "pick_task")
+
+    def test_discovers_the_explicit_root_when_it_is_a_dataset(self) -> None:
+        (self.root / "meta").mkdir()
+        (self.root / "data").mkdir()
+        (self.root / "meta" / "info.json").write_text(
+            json.dumps({"features": {}}), encoding="utf-8"
+        )
+
+        candidates = discover_datasets(self.root)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source_path, self.root)
+        self.assertEqual(candidates[0].layout_type, LayoutType.FLAT)
+        self.assertIsNone(candidates[0].task_name)
 
 
 if __name__ == "__main__":

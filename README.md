@@ -1,253 +1,161 @@
-# RoboMetaNorm
+# RoboMetaNorm mini
 
-RoboMetaNorm 是面向机器人数据集的非破坏性元数据规范化工具。它扫描数据集，结合有限的 Parquet 样本和视频证据生成规范化建议与人工复核清单，不直接修改任何源数据。
+RoboMetaNorm mini 读取机器人数据集的本地元数据与有限代表证据，生成符合
+《数据转换标准》的命名建议。流程以保守、可复核为原则：只有证据完整且通过本地
+确定性校验的字段才会修改；未确认字段保持原名，并在复核文件中记录原因。
 
-## 设计原则
+## 工作流程
 
-- **源数据只读**：不修改 `info.json`、Parquet、视频、图像或 Depth 文件。
-- **规范内置**：相机类别、位置词表、字段模板和编码要求固化在代码中，运行时不依赖外部标准文件。
-- **多证据推理**：机器人型号的标准相机配置、本地画面、同数据集其他相机和元数据共同决定相机名称；VLM 不直接输出最终字段名。
-- **兼容推理**：强证据不足但存在唯一兼容结论时生成可复核建议；只有真正无法区分或命名冲突时保留源字段。
-- **结果可追溯**：规范建议、复核原因、候选项和证据分别写入数据集的 `meta/` 目录。
-- **批处理隔离**：单个数据集失败不会中断同一批次中的其他数据集。
+机器人身份仅取自 `meta/info.json` 的 `robot_type`，并原样保留。当前流程暂时跳过远程
+硬件画像查询和联网研究，不会用其他元数据推断、补全或改写机器人型号。
 
-## 处理流程
+每个数据集最多执行一次 VLM 操作：在同一次请求中完成数据结构理解，以及相机、
+`action` 和 `observation.state` 字段映射。最终名称、置信度、媒体属性、字段形状和机器
+组件顺序仍由本地代码按《数据转换标准》确定性校验。映射失败、置信度不足或存在歧义
+时，不修改源字段，并将数据集标记为需要复核。
 
-`scan` 只读取并汇总状态；`normalize` 在同一套前置检查之后执行多证据规范化，并生成建议文件。联网查询的标准相机配置只用于限定候选槽位，不能单独触发改名。
+本地证据保持有界：
 
-```mermaid
-flowchart TD
-    A["数据集根目录"] --> B["发现数据集并读取 meta/info.json"]
-    B --> C["前置检查并记录状态"]
-    C --> D{"执行命令"}
+- 机器人身份只读取 `meta/info.json` 的 `robot_type`；
+- Parquet 只采集排序后的首、末 episode 代表证据；
+- 每个相机只采集排序后的首、末媒体代表证据；
+- 抽取的临时帧在单次处理结束后删除。
 
-    D -->|scan| E["输出只读状态汇总<br/>不写入数据集"]
-    D -->|normalize| F["解析机器人身份"]
+## 输入与输出
 
-    F --> G["按型号联网查询标准相机配置<br/>含本体和平台固定外部相机"]
-    F --> H["按需探测媒体并抽取本地代表帧"]
-    F --> I["读取源字段、媒体元数据<br/>和同数据集其他相机"]
+### 输入
 
-    F --> J["相机多证据联合推理"]
-    G --> J
-    H --> J
-    I --> J
-    J --> K{"相机命名结论"}
+每个数据集必须包含 `meta/info.json`，并至少包含 `data/` 或 `videos/` 之一。`--root`
+既可指向单个数据集，也可指向包含多个数据集的根目录；目录布局支持平铺、任务分组和
+自动识别。
 
-    K -->|拓扑与本地画面一致| L["CONFIRMED<br/>生成标准名称"]
-    K -->|形成唯一兼容结论| M["INFERRED<br/>生成名称并进入复核"]
-    K -->|仍有歧义或目标冲突| N["UNRESOLVED<br/>保留源名并进入复核"]
+程序仅采集有限的本地证据：
 
-    L --> O["合并相机规范建议"]
-    M --> O
-    N --> O
-    O --> P["画像首、末 Episode 的 Parquet<br/>检查机器字段与夹爪语义"]
-    P --> Q["写入 info_norm.json<br/>和 info_norm_review.json"]
-```
+- 从 `meta/info.json` 读取数据集元信息；机器人身份仅采用其中的 `robot_type`；
+- 从排序后的首、末 episode 采集 Parquet 代表证据；
+- 从每个相机排序后的首、末媒体采集代表证据。
 
-流程中的 `INFERRED` 始终需要人工复核；只有完整有效的拓扑与本地画面证据共同支持时才标记为 `CONFIRMED`。拓扑局部不合法时保留合法槽位用于兼容推理，同时把被拒绝槽位的字段、原值和原因写入审计证据。若最终仍无法区分相机位置，则以 `UNRESOLVED` 保留源名，避免错误改名。
+该策略用于控制证据规模，不执行全量数据扫描。媒体分析产生的临时帧会在当前数据集
+处理结束后删除。
 
-## 支持范围
+### 输出
 
-| 能力 | 说明 |
-| --- | --- |
-| 数据集发现 | 支持平铺和任务分组目录，可自动识别或显式指定布局 |
-| 前置检查 | 检查 RGB、action、observation、主摄像头等必要证据 |
-| 相机字段 | 规范 RGB/Depth 字段名，检查媒体 FPS 与 shape，建议 AV1/FFV1 编码 |
-| 机器字段 | 检查维度、跨 Episode 布局、父子切片、action/state 一致性及夹爪量程 |
-| 机器人身份 | 合并机器人型号元数据，为相机拓扑和机器结构提供可追溯的强证据 |
-| 默认 VLM | 默认使用 DashScope `qwen3.7-plus`，为相机拓扑、本地画面、机器字段和夹爪方向提供受约束的结构化判断 |
-| 审核输出 | 生成规范化元数据建议和结构化人工复核清单 |
+`normalize` 在每个数据集的 `meta/` 目录生成三个文件：
 
-机器字段规范仅适用于末端执行器为夹爪的机械臂。数据集包含灵巧手、手指关节、骨架或关键点字段时，机器字段阶段保留整组源字段，不调用机器字段 VLM，并生成一条通用人工复核项。
+- `info_norm.json`：保留源元信息，仅更新已确认的规范名称；
+- `info_norm_review.json`：记录身份、字段映射、证据、处理决定和详细问题，并保存
+  `info_norm.json` 的 SHA-256 摘要；
+- `robo_annotation.yaml`：描述适配器、相机和机器通道，同时标记结果是否需要人工复核。
 
-本工具不改写数值，不推断未知单位，不依赖 URDF，也不执行四元数转欧拉角、骨架或关键点转换。需要夹爪数值归一化时，仅输出可审计的转换建议，源 Parquet 和源字段保持不变。
+正常处理以及可控的复核、预检阻断、API key 缺失和 VLM 调用失败路径均会生成上述
+产物。证据采集、程序执行或文件写入发生异常时，数据集状态为 `ERROR`，输出可能不完整。
 
-## 环境要求
+程序不会改写源 `info.json`、Parquet 或媒体文件，也不会创建持久缓存、预览、日志或
+汇总文件。`scan` 始终只读，不生成任何输出。
 
-- Python 3.10+
-- NumPy 与 PyArrow：随主依赖安装，用于 Parquet 有限样本画像
-- FFprobe 与 FFmpeg：用于视频探测和抽帧
-- DashScope API Key：建议通过 `DASHSCOPE_API_KEY` 配置；缺少密钥时不会发送无认证请求，无法完成的语义判断会进入兼容推理或人工复核
+## 输出语义与校验规则
 
-安装项目：
+`robo_annotation.yaml` 包含固定顶层字段 `version`、`robot_type`、`adapter`、
+`robot_channel_schema` 和 `review`。其中：
+
+- `review.required: false` 表示结果通过 VLM 语义判断和本地确定性校验；
+- `review.required: true` 表示结果仍需人工复核；
+- `review.issues` 提供紧凑的问题摘要，完整诊断记录在 `info_norm_review.json`；
+- `robot_type` 缺失或非法时写为 `null`，并将结果标记为需要复核。
+
+VLM 确认相机类别和位置时，YAML 使用标准相机键；VLM 不可用或映射未确认时，
+REVIEW YAML 仅保留安全的源相机身份映射，不声称已经完成标准相机命名。复核状态下还
+可保留根据 `action` 与 `observation.state` 的一致、连续结构得到的本地尽力推导
+（best-effort）机器通道。这些通道仅用于支持后续复核，不代表已经 VLM 确认。
+
+标准相机键采用 `observation.images.cam_<位置>_<rgb|depth>`，并由 VLM 结合抽帧图像
+判断本体相机或外部相机类别；其 YAML 值保留原始相机字段。`videos/` 下 RGB 图像使用
+`_rgb` 后缀并对应目标编码 `av1`，`depth/` 下深度图使用 `_depth` 后缀并对应目标编码
+`ffv1`。机器
+通道采用 `arm.left/right.joint`、`arm.left/right.eef` 和
+`gripper.left/right`。对于同序、连续的 `main_follower_joint_*` 向量，仅在映射完整且
+`robot_type` 安全非空时使用 `arm.main.*` 与 `gripper.main`；双臂结构仍使用
+`left/right`。
+
+关节预检在 VLM 调用前执行。无侧别的泛化名称、索引不连续或 `action` 与
+`observation.state` 布局不一致时，数据集将被阻断并记录源文件、字段、索引和原始名称。
+无效路径不会写入 YAML；满足结构约束的本地尽力推导通道可写入 REVIEW YAML，并明确
+标记为需要复核。
+
+## 安装
+
+需要 Python 3.10 或更高版本。
 
 ```bash
 python3 -m pip install -e .
 ```
 
-如需 Depth 预览能力，可安装可选依赖：
+运行时依赖为 `pyarrow>=14.0` 和 `PyYAML>=6.0`。媒体证据采集需要系统可执行的
+`ffprobe` 与 `ffmpeg`。
+
+## CLI
+
+只读扫描：
 
 ```bash
-python3 -m pip install -e '.[depth]'
+python3 -m robometanorm scan --root /path/to/datasets
+# 或只扫描一个数据集
+python3 -m robometanorm scan --root /path/to/dataset
 ```
 
-## 输入目录
-
-扫描入口固定为每个数据集的 `meta/info.json`。支持两种布局：
-
-```text
-# 平铺布局
-/path/to/datasets/
-└── <dataset>/
-    ├── meta/info.json
-    ├── data/
-    ├── videos/
-    └── depth/                 # 可选
-
-# 任务分组布局
-/path/to/datasets/
-└── <task>/
-    └── <dataset>/
-        ├── meta/info.json
-        ├── data/
-        ├── videos/
-        └── depth/             # 可选
-```
-
-数据集至少需要 `data/` 或 `videos/` 目录。扫描会忽略 `.git`、`.cache` 和 `__pycache__`。
-
-规范化阶段还会按以下优先级读取可选身份元数据：
-
-1. `meta/info.json` 的 `robot_type`，并兼容 `root_type`。
-2. `meta/common_record.json` 的 `machine_id` 型号后缀。
-3. `meta/tasks.jsonl` 中明确的机器人型号标识。
-
-弱证据不能覆盖强证据；同一机器人系列的低优先级证据可以补充更具体的型号。不同系列发生冲突时采用高优先级结果，并生成 `ROBOT_IDENTITY_CONFLICT` 人工复核项。任务自然语言不会因包含 `hand`、`aloha` 等普通词而被当成机器人型号。
-
-## 快速开始
-
-先执行只读扫描，检查数据集状态和复核数量：
+生成规范化结果：
 
 ```bash
-robometanorm scan --root /path/to/datasets
+export DASHSCOPE_API_KEY='...'
+python3 -m robometanorm normalize --root /path/to/datasets
 ```
 
-生成规范化建议：
+使用本地示例数据集快速验证：
 
 ```bash
-robometanorm normalize --root /path/to/datasets
+cd /home/baai/qmh/RoboMetaNorm-mini-implementation
+
+python3 -m robometanorm scan \
+  --root /home/baai/qmh/dataset/collect_data \
+  --layout auto
+
+export DASHSCOPE_API_KEY='你的 API Key'
+python3 -m robometanorm normalize \
+  --root /home/baai/qmh/dataset/collect_data \
+  --layout auto \
+  --ignore-vlm-network-errors
 ```
 
-使用 `--layout auto|flat|task_grouped` 指定目录布局，默认值为 `auto`。如果尚未安装命令行入口，可直接从源码运行：
+处理完成后，每个数据集的 `meta/` 目录应包含 `info_norm.json`、
+`info_norm_review.json` 和 `robo_annotation.yaml`。
+
+安装后也可使用同名控制台命令：
 
 ```bash
-PYTHONPATH=src python3 -m robometanorm scan --root /path/to/datasets
+robometanorm --help
 ```
 
-### 默认 VLM
+两条子命令都接受：
 
-`normalize` 默认使用以下配置：
+- `--root`：数据集根目录；
+- `--layout {auto,flat,task_grouped}`：目录布局。
 
-- endpoint：`https://dashscope.aliyuncs.com/compatible-mode/v1`
-- model：`qwen3.7-plus`
-- API Key 环境变量：`DASHSCOPE_API_KEY`
+`normalize` 还接受：
 
-API Key 通过环境变量注入后可直接运行：
+- `--vlm-endpoint`、`--vlm-model`、`--vlm-api-key-env`；
+- `--confidence-threshold`；
+- `--vlm-timeout-seconds`、`--vlm-max-retries`；
+- `--vlm-retry-backoff-seconds`、`--vlm-max-tokens`；
+- `--ignore-vlm-network-errors`：VLM 联网异常转为 REVIEW 输出，而不是将该数据集标记为
+  ERROR。
 
-```bash
-export DASHSCOPE_API_KEY="<secret>"
+缺少 API key、VLM 返回可分类失败，或开启上述开关后的联网异常，程序保持原值并输出可
+复核原因，不会回退到硬编码型号规则。
 
-robometanorm normalize --root /path/to/datasets
-```
+## 当前边界
 
-命令行参数用于覆盖默认连接，例如：
-
-```bash
-export CUSTOM_VLM_API_KEY="<secret>"
-
-robometanorm normalize \
-  --root /path/to/datasets \
-  --vlm-endpoint https://vlm.example.com/v1 \
-  --vlm-model your-model \
-  --vlm-api-key-env CUSTOM_VLM_API_KEY
-```
-
-不要将密钥写入命令、配置文件或版本库。缺少密钥时，程序不会发送外部请求；确定性检查仍会执行，其他字段会结合现有证据推理，最终无法区分时保留源名并进入人工复核。可按需设置以下参数：
-
-| 参数 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `--vlm-endpoint` | DashScope compatible-mode URL | VLM 服务地址 |
-| `--vlm-model` | `qwen3.7-plus` | VLM 模型名称 |
-| `--vlm-api-key-env` | `DASHSCOPE_API_KEY` | 保存 API Key 的环境变量名 |
-| `--confidence-threshold` | `0.85` | 相机 VLM 结果的自动采纳阈值 |
-| `--vlm-timeout-seconds` | `120` | 单次请求超时秒数 |
-| `--vlm-max-retries` | `2` | 网络异常、HTTP 429 和 5xx 的最大重试次数 |
-| `--vlm-retry-backoff-seconds` | `1.0` | 指数退避的初始等待秒数 |
-| `--vlm-max-tokens` | `1024` | 非特定兼容端点的最大输出 token 数 |
-
-机器字段自动采纳使用更严格的固定门槛：置信度不低于 `0.92`、结果无歧义、无需数值转换且维度一致；有量纲字段还必须在源元数据中明确单位。复合字段必须由连续分段完整覆盖，任一分段不满足要求时保留整个源字段。
-
-相机命名先区分本体相机与外部相机，再判断方位、部位和模态。`image_left`、`image_top`、`cam_high_rgb` 等源字段字符串只作为弱提示，不能单独决定最终名称：`left` 可能表示外部左侧，也可能表示左腕、左臂或机器人左侧的其他本体相机。
-
-机器人型号明确时，程序通过 DashScope Responses API 的 `web_search` 查询该型号的标准相机配置；同一型号在单次运行中只查询一次。配置可以包含机器人本体集成相机，以及厂商标准平台中的固定外部相机，但不包含采集现场临时架设的任意相机。联网结果只限定候选槽位，不能直接确认改名。本地代表帧会独立判断相机类别、方位和部位，随后与同数据集的其他相机执行一对一约束推理：
-
-- `CONFIRMED`：完整有效的联网拓扑与本地画面高置信一致，目标名合法且无冲突。
-- `INFERRED`：本地画面已支持相机类别，但强证据仍不完整；结合源字段、媒体元数据、已确认相机和唯一剩余拓扑槽位形成唯一兼容结论后，生成标准名称并进入人工复核。联网拓扑本身不能触发改名。
-- `UNRESOLVED`：全部证据不足、多个候选无法区分或目标冲突；保留源字段并进入人工复核。
-
-外部相机的标准结构为 `cam_<方位>_<rgb|depth>`，且只能选择一个主方位。`cam_third_view`、`third_person` 明确约束为外部相机类别，但不携带具体方位；程序必须从本地画面判断其主方位，且拒绝把这类字段改成本体相机。不会生成 `cam_top_side_rgb` 这类复合方位名称，无法选出唯一方位时保留源名复核。
-
-`cam_high_rgb` 中的 `high` 同样只是弱提示，不能全局硬映射。对于 `airbot_mmk2`，拓扑与本地画面共同指向头部时可确认为 `observation.images.cam_head_rgb`；若左右腕相机已可靠占用对应槽位，剩余字段也可推断为头部相机，但等级为 `INFERRED`。对于标准配置含固定俯视相机的机器人（例如 `agilex_cobot_magic`），本地画面与拓扑共同支持外部俯视时命名为 `observation.images.cam_top_rgb`。相机位置无法确认不影响独立的模态与编码判断：可确认的 RGB 仍建议 AV1，Depth 仍建议 FFV1。
-
-夹爪方向按以下顺序判定：明确表示开度或开口宽度的源名称、Parquet 低值/高值时刻对应的同侧视频帧、人工复核。同步视频结果置信度低于 `0.85`、夹爪被遮挡或两帧差异不足时不会自动采纳。
-
-对于 DashScope compatible-mode endpoint，本地图片和其他结构化判断使用 Chat Completions 的非思考模式与 JSON Mode，并省略 `max_tokens`，避免结构化结果被截断；机器人标准相机配置查询使用 Responses API 的内置 `web_search`。其他 OpenAI-compatible endpoint 使用相同接口路径，服务不支持 Responses API 时记录为拓扑查询失败并继续兼容推理。
-
-## Episode 采样策略
-
-为控制大规模数据集的分析开销，规范化过程对每类数据最多读取 2 个 Episode：
-
-- 文件按路径稳定排序；只有一个 Episode 时读取该文件，两个及以上时读取首个和末个。
-- 普通机器字段仅对入选 Parquet 读取 schema、文件元数据和首个 batch；每个 batch 最多 `512` 行。
-- 夹爪量程只投影 `action`、`observation.state` 中声明为 gripper 的目标维度，并扫描入选 Episode 的该维度；不会加载其他 Parquet 列。
-- 视频探测、抽帧和 VLM 判断最多接收首、末两个 Episode；第一阶段证据充分时可提前结束，只读取首个视频。
-- 每个待判定夹爪维度最多额外抽取两帧：接近 5% 与 95% 分位值的同步帧。优先使用 Parquet 时间戳，否则使用帧序号和 `fps` 换算。
-- Parquet 缓存指纹只包含入选文件。未参与分析的中间 Episode 发生变化时不会重建缓存。
-- 为确定末个 Episode，程序仍需遍历目录项；未入选文件不会进入 Parquet 内容读取、FFprobe、视频抽帧或 VLM 判断。
-
-该策略以固定、可复现的有限样本换取更低的 I/O 成本。跨 Episode 一致性结论仅代表本次选中的首、末样本。
-
-## 输出与复核
-
-`normalize` 在每个数据集的 `meta/` 目录生成：
-
-```text
-<dataset>/meta/
-├── info.json                    # 源元数据，保持不变
-├── info_norm.json               # 规范化建议
-├── info_norm_review.json        # 人工复核项与运行信息
-└── .robometanorm_cache/         # 可删除的 Parquet 画像缓存
-```
-
-相机建议使用 `observation.images.cam_<位置>_<rgb|depth>` 格式。机器字段仅在声明、实测结构和语义证据全部满足要求时生成新名称。FPS、dtype、shape、数值内容和未覆盖字段保持原值。
-
-`info_norm_review.json` 的 `robot_identity` 保存最终型号、选用来源、全部候选证据和冲突。相机复核项保存推理等级、规范化机器人拓扑、本地画面语义、候选项和未采纳原因；不会保存 API Key、Authorization 请求头或完整服务端错误响应。只有 `UNRESOLVED` 才保留源相机字段。
-
-命令行汇总中的 `Cam C/I/U` 依次表示 `CONFIRMED`、`INFERRED`、`UNRESOLVED` 相机数；`Topology Errors` 表示本次数据集是否出现拓扑查询、整体校验或局部槽位校验异常。具体错误字段、原始值和原因保存在复核文件中。
-
-### 夹爪转换建议
-
-标准目标字段为 `{left|right}_gripper_open`，目标范围为 `[0, 1]`，`0` 表示完全闭合，`1` 表示完全打开。
-
-- 源数据已是 `[0, 1]`、数值增大表示打开且无需裁剪时，`info_norm.json` 可直接使用标准字段名。
-- 源量程不同、方向相反或存在轻微越界时，`info_norm.json` 保留源字段名，`info_norm_review.json` 的 `gripper_transform_proposals` 给出 `source_closed`、`source_open`、归一化公式、裁剪策略和证据。
-- 量程或方向无法确认时不生成转换建议，只生成定位到具体向量切片的人工复核项。
-- 工具不会自动生成 `{dir}_gripper_open_scale`，也不会以样本最小值和最大值直接拉伸数据。
-
-状态按严重程度排序为 `ERROR > BLOCKED > REVIEW > PASS`：
-
-- `PASS`：检查通过，无待处理项。
-- `REVIEW`：已生成可用建议，但存在需要人工确认的内容。
-- `BLOCKED`：缺少继续判断所需的必要命名或结构证据。
-- `ERROR`：元数据读取、输出或运行过程发生错误。
-
-建议先运行 `scan`，处理 `BLOCKED` 项并确认 `REVIEW` 原因，再对生产数据运行 `normalize`。
-
-## 验证
-
-运行完整测试：
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+- 完整 URDF 不是转换前置条件，也不参与当前判断；
+- 当前不处理触觉、声音或音频字段的命名；
+- 不执行数值变换或媒体转码；
+- 无法确认的字段始终保持源值。
+- 恢复远程硬件画像后，同型号只查询一次并供后续数据集复用，是计划中的长期缓存方案，当前尚未实现。
